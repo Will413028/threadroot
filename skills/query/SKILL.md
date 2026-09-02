@@ -8,6 +8,11 @@ description: Use when a user asks a question that should be answered from a Thre
 extends=../README.md
 -->
 
+<!-- threadroot-commands
+threadroot --version
+threadroot doctor --json
+-->
+
 Read and follow the [shared skill contract](../README.md) before proceeding. This workflow is read-only and starts with the smallest relevant configured area.
 
 ## Inputs
@@ -17,8 +22,8 @@ Read and follow the [shared skill contract](../README.md) before proceeding. Thi
 
 ## Procedure
 
-1. Run `threadroot --version`. If it is unavailable, stop, point to the repository installation instructions, and do not install it.
-2. Run `threadroot doctor --json` and require exit 0. Use its `vault` field as the resolved root. If the host denies access to an external vault, stop and ask the user to add it as an approved working directory.
+1. Run the version-check entry from the command inventory. If it is unavailable, stop, point to the repository installation instructions, and do not install it.
+2. Run the doctor entry from the command inventory and require exit 0. Use its `vault` field as the resolved root. If the host denies access to an external vault, stop and ask the user to add it as an approved working directory.
 3. Record the metadata of that root's `.second-brain/config.json`, read that exact marker once, and immediately record its metadata again. If the metadata changed or the document no longer has the diagnosed shape, stop and rerun doctor before searching. Take the four configured path strings from its `paths` object; do not duplicate schema, root, or path validation in prompt logic.
 4. Choose the single configured area most relevant to the question. Search filenames and headings there before reading content.
 5. Read only matched sections and their explicit links. Follow a link only when it stays inside the diagnosed vault and outside `secrets`.

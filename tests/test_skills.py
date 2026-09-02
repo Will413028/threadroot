@@ -87,6 +87,10 @@ secrets=never-read
 -->
 """
 
+SYNTHETIC_COMMAND_INVENTORY = """<!-- threadroot-commands
+threadroot --version
+-->"""
+
 SYNTHETIC_SKILL = """---
 name: synthetic
 description: Use when testing a synthetic contract.
@@ -97,7 +101,9 @@ description: Use when testing a synthetic contract.
 extends=../README.md
 -->
 
-Run `threadroot --version`.
+""" + SYNTHETIC_COMMAND_INVENTORY + """
+
+Run the version-check command from the command inventory.
 
 Threadroot is the product name. The standalone option `--set-default` is not a
 command invocation.
@@ -244,69 +250,19 @@ class EffectiveSkillContractTests(unittest.TestCase):
             dict(contract.invariants),
         )
 
-    def test_valid_multiline_inline_command_is_normalized(self) -> None:
-        load_effective_contract = self._loader()
-        skill = SYNTHETIC_SKILL.replace(
-            "`threadroot --version`",
-            "``threadroot\n--version``",
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            path = self._write_fixture(directory, skill=skill)
-
-            contract = load_effective_contract(
-                path,
-                frozenset({"threadroot --version"}),
-            )
-
-        self.assertEqual(frozenset({"threadroot --version"}), contract.commands)
-
-    def test_valid_fences_accept_longer_matching_closers(self) -> None:
-        load_effective_contract = self._loader()
-        fences = {
-            "backtick": "   ```sh\nthreadroot --version\n   ````\n",
-            "tilde": "   ~~~sh\nthreadroot --version\n   ~~~~\n",
-        }
-
-        for name, fence in fences.items():
-            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
-                path = self._write_fixture(
-                    directory,
-                    skill=SYNTHETIC_SKILL + "\n" + fence,
-                )
-                contract = load_effective_contract(
-                    path,
-                    frozenset({"threadroot --version"}),
-                )
-                self.assertEqual(
-                    frozenset({"threadroot --version"}),
-                    contract.commands,
-                )
-
-    def test_malformed_or_unaccounted_command_syntax_is_rejected(self) -> None:
+    def test_noncanonical_command_containers_are_rejected(self) -> None:
         load_effective_contract = self._loader()
         mutations = {
-            "multiline inline unknown command": (
-                SYNTHETIC_SKILL + "\nRun ``threadroot\nmigrate``.\n"
+            "escaped opening backtick": (
+                SYNTHETIC_SKILL + "\nRun \\`threadroot --version`.\n"
             ),
-            "unclosed inline span": (
-                SYNTHETIC_SKILL + "\nRun ``threadroot --version.\n"
+            "backticks in four-space indented code": (
+                SYNTHETIC_SKILL + "\n    `threadroot --version`\n"
             ),
-            "mismatched inline delimiter": (
-                SYNTHETIC_SKILL + "\nRun ``threadroot --version`.\n"
+            "backtick in fenced info string": (
+                SYNTHETIC_SKILL
+                + "\n```sh`\nthreadroot --version\n```\n"
             ),
-            "unclosed backtick fence": (
-                SYNTHETIC_SKILL + "\n```sh\nthreadroot --version\n"
-            ),
-            "unclosed tilde fence": (
-                SYNTHETIC_SKILL + "\n~~~sh\nthreadroot --version\n"
-            ),
-            "mixed fence closing character": (
-                SYNTHETIC_SKILL + "\n```sh\nthreadroot --version\n~~~\n"
-            ),
-            "four-space indented code block": (
-                SYNTHETIC_SKILL + "\n    threadroot migrate\n"
-            ),
-            "bare executable command": SYNTHETIC_SKILL + "\nRun `threadroot`.\n",
         }
 
         for name, skill in mutations.items():
@@ -318,7 +274,50 @@ class EffectiveSkillContractTests(unittest.TestCase):
                         frozenset({"threadroot --version"}),
                     )
 
-    def test_synthetic_contract_mutations_are_rejected(self) -> None:
+    def test_command_inventory_mutations_are_rejected(self) -> None:
+        load_effective_contract = self._loader()
+        mutations = {
+            "missing inventory": SYNTHETIC_SKILL.replace(
+                SYNTHETIC_COMMAND_INVENTORY + "\n\n",
+                "",
+            ),
+            "unclosed inventory": SYNTHETIC_SKILL.replace(
+                SYNTHETIC_COMMAND_INVENTORY,
+                "<!-- threadroot-commands\nthreadroot --version",
+            ),
+            "duplicate inventory": SYNTHETIC_SKILL.replace(
+                SYNTHETIC_COMMAND_INVENTORY,
+                SYNTHETIC_COMMAND_INVENTORY
+                + "\n\n"
+                + SYNTHETIC_COMMAND_INVENTORY,
+            ),
+            "empty command": SYNTHETIC_SKILL.replace(
+                "threadroot --version\n-->",
+                "threadroot --version\n\n-->",
+            ),
+            "duplicate command": SYNTHETIC_SKILL.replace(
+                "threadroot --version\n-->",
+                "threadroot --version\nthreadroot --version\n-->",
+            ),
+            "allowed prefix with extra arguments": SYNTHETIC_SKILL.replace(
+                "threadroot --version\n-->",
+                "threadroot --version --verbose\n-->",
+            ),
+            "lowercase command in prose": (
+                SYNTHETIC_SKILL + "\nRun threadroot --version here.\n"
+            ),
+        }
+
+        for name, skill in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                path = self._write_fixture(directory, skill=skill)
+                with self.assertRaisesRegex(AssertionError, "command inventory"):
+                    load_effective_contract(
+                        path,
+                        frozenset({"threadroot --version"}),
+                    )
+
+    def test_safety_contract_mutations_are_rejected(self) -> None:
         load_effective_contract = self._loader()
         mutations = {
             "missing secrets rule": (
@@ -330,44 +329,6 @@ class EffectiveSkillContractTests(unittest.TestCase):
                 SYNTHETIC_SHARED_CONTRACT.replace("drift=stop", "drift=continue"),
                 SYNTHETIC_SKILL,
                 "drift=stop",
-            ),
-            "extra command": (
-                SYNTHETIC_SHARED_CONTRACT,
-                SYNTHETIC_SKILL + "\nRun `threadroot migrate`.\n",
-                "command inventory",
-            ),
-            "extra fenced command": (
-                SYNTHETIC_SHARED_CONTRACT,
-                SYNTHETIC_SKILL + "\n```sh\nthreadroot migrate\n```\n",
-                "command inventory",
-            ),
-            "extra tilde-fenced command": (
-                SYNTHETIC_SHARED_CONTRACT,
-                SYNTHETIC_SKILL + "\n~~~sh\nthreadroot migrate\n~~~\n",
-                "command inventory",
-            ),
-            "extra indented backtick-fenced command": (
-                SYNTHETIC_SHARED_CONTRACT,
-                SYNTHETIC_SKILL + "\n   ```sh\nthreadroot migrate\n   ```\n",
-                "command inventory",
-            ),
-            "extra indented tilde-fenced command": (
-                SYNTHETIC_SHARED_CONTRACT,
-                SYNTHETIC_SKILL + "\n   ~~~sh\nthreadroot migrate\n   ~~~\n",
-                "command inventory",
-            ),
-            "extra double-backtick command": (
-                SYNTHETIC_SHARED_CONTRACT,
-                SYNTHETIC_SKILL + "\nRun ``threadroot migrate``.\n",
-                "command inventory",
-            ),
-            "allowed command with extra arguments": (
-                SYNTHETIC_SHARED_CONTRACT,
-                SYNTHETIC_SKILL.replace(
-                    "`threadroot --version`",
-                    "`threadroot --version --verbose`",
-                ),
-                "command inventory",
             ),
         }
 
