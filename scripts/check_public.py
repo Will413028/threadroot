@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import bz2
 from dataclasses import dataclass
+import gzip
 import io
+import lzma
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -26,7 +29,17 @@ WINDOWS_ABSOLUTE_PATTERN = re.compile(r"^[A-Za-z]:/")
 EMPTY_SCALAR_PATTERN = re.compile(
     r"(?i)(?:\"\"|''|null(?![\w-])|none(?![\w-])|unset(?![\w-])|~)"
 )
-ZIP_STRUCTURAL_SIGNATURES = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+ZIP_STRUCTURAL_SIGNATURES = (
+    b"PK\x03\x04",
+    b"PK\x01\x02",
+    b"PK\x05\x06",
+    b"PK\x07\x08",
+)
+COMPRESSION_DECODERS = (
+    (b"\x1f\x8b", gzip.decompress),
+    (b"BZh", bz2.decompress),
+    (b"\xfd7zXZ\x00", lzma.decompress),
+)
 READ_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
 DIRECTORY_FLAGS = READ_FLAGS | os.O_DIRECTORY
 
@@ -268,6 +281,24 @@ def _scan_open_tar(
     return findings
 
 
+def _has_tar_structure(payload: bytes) -> bool:
+    return any(
+        payload[offset + 257 : offset + 262] == b"ustar"
+        for offset in range(0, len(payload) - 261, 512)
+    )
+
+
+def _decompress_archive_envelope(payload: bytes) -> bytes | None:
+    for signature, decompress in COMPRESSION_DECODERS:
+        if not payload.startswith(signature):
+            continue
+        try:
+            return decompress(payload)
+        except Exception:
+            raise PublicScanError() from None
+    return None
+
+
 def _scan_regular_payload(
     payload: bytes,
     display_path: str,
@@ -280,7 +311,10 @@ def _scan_regular_payload(
     try:
         archive = tarfile.open(fileobj=io.BytesIO(payload), mode="r:*")
     except tarfile.ReadError:
-        if len(payload) >= 262 and payload[257:262] == b"ustar":
+        expanded = _decompress_archive_envelope(payload)
+        if _has_tar_structure(payload) or (
+            expanded is not None and _has_tar_structure(expanded)
+        ):
             raise PublicScanError() from None
         return _scan_text(payload, display_path, denied_terms)
     except Exception:

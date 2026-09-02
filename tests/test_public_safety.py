@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import ast
+import bz2
 from dataclasses import FrozenInstanceError
+import gzip
 import io
+import lzma
 import os
 from pathlib import Path
 import stat
@@ -56,6 +59,24 @@ def damage_tar_header_checksum(path: Path) -> None:
         raise AssertionError("ustar signature was not found")
     payload[148:156] = b"000000\0 "
     path.write_bytes(payload)
+
+
+def damage_compressed_tar_header_checksum(path: Path, compression: str) -> None:
+    decompressors = {
+        "gzip": gzip.decompress,
+        "bzip2": bz2.decompress,
+        "xz": lzma.decompress,
+    }
+    compressors = {
+        "gzip": lambda payload: gzip.compress(payload, mtime=0),
+        "bzip2": bz2.compress,
+        "xz": lzma.compress,
+    }
+    payload = bytearray(decompressors[compression](path.read_bytes()))
+    if payload[257:262] != b"ustar":
+        raise AssertionError("ustar signature was not found")
+    payload[148:156] = b"000000\0 "
+    path.write_bytes(compressors[compression](bytes(payload)))
 
 
 class PublicSafetyTests(unittest.TestCase):
@@ -295,6 +316,15 @@ class PublicSafetyTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, "public scan failed"):
                         scan_path(artifact)
 
+    def test_central_directory_zip_structure_fails_closed(self) -> None:
+        with TemporaryDirectory() as directory:
+            artifact = Path(directory) / "central.data"
+            artifact.write_bytes(b"PK\x01\x02" + b"\x00" * 42)
+            self.assertFalse(zipfile.is_zipfile(artifact))
+
+            with self.assertRaisesRegex(RuntimeError, "public scan failed"):
+                scan_path(artifact)
+
     def test_non_utf8_zip_symlink_target_fails_closed(self) -> None:
         with TemporaryDirectory() as directory:
             artifact = Path(directory) / "link.data"
@@ -353,6 +383,62 @@ class PublicSafetyTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "public scan failed"):
                 scan_path(artifact)
+
+    def test_damaged_compressed_tar_fails_closed(self) -> None:
+        cases = (
+            ("gzip", "w:gz"),
+            ("bzip2", "w:bz2"),
+            ("xz", "w:xz"),
+        )
+        with TemporaryDirectory() as directory:
+            artifact = Path(directory) / "damaged.data"
+            for compression, mode in cases:
+                with self.subTest(compression=compression):
+                    payload = (credential_line() + "\n").encode()
+                    with tarfile.open(artifact, mode) as archive:
+                        info = tarfile.TarInfo("payload.txt")
+                        info.size = len(payload)
+                        archive.addfile(info, io.BytesIO(payload))
+                    damage_compressed_tar_header_checksum(artifact, compression)
+                    with self.assertRaises(tarfile.ReadError):
+                        tarfile.open(artifact, "r:*")
+
+                    with self.assertRaisesRegex(RuntimeError, "public scan failed"):
+                        scan_path(artifact)
+
+    def test_corrupt_compression_envelopes_fail_closed(self) -> None:
+        envelopes = {
+            "gzip": b"\x1f\x8b",
+            "bzip2": b"BZh",
+            "xz": b"\xfd7zXZ\x00",
+        }
+        with TemporaryDirectory() as directory:
+            artifact = Path(directory) / "corrupt.data"
+            for compression, signature in envelopes.items():
+                with self.subTest(compression=compression):
+                    artifact.write_bytes(signature + b"not-an-archive")
+                    with self.assertRaisesRegex(RuntimeError, "public scan failed"):
+                        scan_path(artifact)
+
+    def test_valid_compressed_and_empty_archives_are_clean(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index, mode in enumerate(("w:gz", "w:bz2", "w:xz")):
+                artifact = root / f"valid-{index}.data"
+                with tarfile.open(artifact, mode) as archive:
+                    info = tarfile.TarInfo("safe.txt")
+                    info.size = len(b"safe\n")
+                    archive.addfile(info, io.BytesIO(b"safe\n"))
+                self.assertEqual(scan_path(artifact), [])
+
+            empty_zip = root / "empty-zip.data"
+            with zipfile.ZipFile(empty_zip, "w"):
+                pass
+            empty_tar = root / "empty-tar.data"
+            with tarfile.open(empty_tar, "w"):
+                pass
+            self.assertEqual(scan_path(empty_zip), [])
+            self.assertEqual(scan_path(empty_tar), [])
 
     def test_zip_reports_unsafe_names_and_escaping_symlink_without_following(self) -> None:
         with TemporaryDirectory() as directory:
@@ -621,6 +707,50 @@ class PublicSafetyTests(unittest.TestCase):
                     self.assertEqual(completed.returncode, 2)
                     self.assertEqual(completed.stdout, "")
                     self.assertEqual(completed.stderr, "public scan failed\n")
+
+    def test_cli_damaged_compressed_tar_is_generic_and_exit_two(self) -> None:
+        with TemporaryDirectory() as directory:
+            artifact = Path(directory) / "damaged.data"
+            payload = (credential_line() + "\n").encode()
+            with tarfile.open(artifact, "w:gz") as archive:
+                info = tarfile.TarInfo("payload.txt")
+                info.size = len(payload)
+                archive.addfile(info, io.BytesIO(payload))
+            damage_compressed_tar_header_checksum(artifact, "gzip")
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).parents[1] / "scripts/check_public.py"),
+                    str(artifact),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stdout, "")
+        self.assertEqual(completed.stderr, "public scan failed\n")
+
+    def test_cli_central_directory_zip_error_is_generic_and_exit_two(self) -> None:
+        with TemporaryDirectory() as directory:
+            artifact = Path(directory) / "central.data"
+            artifact.write_bytes(b"PK\x01\x02" + b"\x00" * 42)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).parents[1] / "scripts/check_public.py"),
+                    str(artifact),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stdout, "")
+        self.assertEqual(completed.stderr, "public scan failed\n")
 
     def test_scanner_cannot_follow_file_swap_to_symlink(self) -> None:
         with TemporaryDirectory() as directory:
