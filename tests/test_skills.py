@@ -98,6 +98,9 @@ extends=../README.md
 -->
 
 Run `threadroot --version`.
+
+Threadroot is the product name. The standalone option `--set-default` is not a
+command invocation.
 """
 
 
@@ -264,6 +267,34 @@ class EffectiveSkillContractTests(unittest.TestCase):
                 SYNTHETIC_SKILL + "\n```sh\nthreadroot migrate\n```\n",
                 "command inventory",
             ),
+            "extra tilde-fenced command": (
+                SYNTHETIC_SHARED_CONTRACT,
+                SYNTHETIC_SKILL + "\n~~~sh\nthreadroot migrate\n~~~\n",
+                "command inventory",
+            ),
+            "extra indented backtick-fenced command": (
+                SYNTHETIC_SHARED_CONTRACT,
+                SYNTHETIC_SKILL + "\n   ```sh\nthreadroot migrate\n   ```\n",
+                "command inventory",
+            ),
+            "extra indented tilde-fenced command": (
+                SYNTHETIC_SHARED_CONTRACT,
+                SYNTHETIC_SKILL + "\n   ~~~sh\nthreadroot migrate\n   ~~~\n",
+                "command inventory",
+            ),
+            "extra double-backtick command": (
+                SYNTHETIC_SHARED_CONTRACT,
+                SYNTHETIC_SKILL + "\nRun ``threadroot migrate``.\n",
+                "command inventory",
+            ),
+            "allowed command with extra arguments": (
+                SYNTHETIC_SHARED_CONTRACT,
+                SYNTHETIC_SKILL.replace(
+                    "`threadroot --version`",
+                    "`threadroot --version --verbose`",
+                ),
+                "command inventory",
+            ),
         }
 
         for name, (shared, skill, message) in mutations.items():
@@ -274,6 +305,69 @@ class EffectiveSkillContractTests(unittest.TestCase):
                         path,
                         frozenset({"threadroot --version"}),
                     )
+
+    def test_absolute_shared_contract_path_is_rejected(self) -> None:
+        load_effective_contract = self._loader()
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_fixture(directory)
+            shared_path = (path.parent.parent / "README.md").resolve()
+            path.write_text(
+                SYNTHETIC_SKILL.replace(
+                    "extends=../README.md",
+                    f"extends={shared_path}",
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(AssertionError, "relative"):
+                load_effective_contract(
+                    path,
+                    frozenset({"threadroot --version"}),
+                )
+
+    def test_shared_contract_resolution_remains_fail_closed(self) -> None:
+        load_effective_contract = self._loader()
+        invalid_shared_contracts = {
+            "outside traversal": "../../README.md",
+            "cycle": "../README.md",
+            "duplicate key": "../README.md",
+        }
+
+        for name, extends in invalid_shared_contracts.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                shared = SYNTHETIC_SHARED_CONTRACT
+                if name == "cycle":
+                    shared = shared.replace(
+                        "drift=stop",
+                        "extends=other.md\ndrift=stop",
+                    )
+                elif name == "duplicate key":
+                    shared = shared.replace("drift=stop", "drift=stop\ndrift=stop")
+                skill = SYNTHETIC_SKILL.replace("../README.md", extends)
+                path = self._write_fixture(directory, shared=shared, skill=skill)
+
+                with self.assertRaises(AssertionError):
+                    load_effective_contract(
+                        path,
+                        frozenset({"threadroot --version"}),
+                    )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_fixture(directory)
+            outside = Path(directory) / "outside.md"
+            outside.write_text(SYNTHETIC_SHARED_CONTRACT, encoding="utf-8")
+            linked = path.parent.parent / "linked.md"
+            linked.symlink_to(outside)
+            path.write_text(
+                SYNTHETIC_SKILL.replace("../README.md", "../linked.md"),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(AssertionError):
+                load_effective_contract(
+                    path,
+                    frozenset({"threadroot --version"}),
+                )
 
 
 if __name__ == "__main__":

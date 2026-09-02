@@ -67,18 +67,36 @@ def _contract_fields(path: Path, text: str) -> dict[str, str]:
 
 
 def _threadroot_commands(text: str) -> frozenset[str]:
-    commands = set(re.findall(r"(?<!`)`(threadroot [^`\n]+)`(?!`)", text))
-    fenced_blocks = re.findall(
-        r"^```[^\n]*\n(.*?)^```[ \t]*$",
+    commands: set[str] = set()
+    inline_spans = re.finditer(
+        r"(?<!`)(?P<fence>`+)(?!`)(?P<code>[^\n]*?)(?<!`)(?P=fence)(?!`)",
         text,
-        re.MULTILINE | re.DOTALL,
     )
-    for block in fenced_blocks:
-        commands.update(
-            line.strip()
-            for line in block.splitlines()
-            if line.strip().startswith("threadroot ")
+    for match in inline_spans:
+        code = match.group("code").strip()
+        if code.startswith("threadroot "):
+            commands.add(code)
+
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        opener = re.match(r"^ {0,3}(?P<fence>`{3,}|~{3,})", lines[index])
+        if opener is None:
+            index += 1
+            continue
+
+        fence = opener.group("fence")
+        closer = re.compile(
+            rf"^ {{0,3}}{re.escape(fence[0])}{{{len(fence)},}}[ \t]*$"
         )
+        index += 1
+        while index < len(lines) and closer.fullmatch(lines[index]) is None:
+            code = lines[index].strip()
+            if code.startswith("threadroot "):
+                commands.add(code)
+            index += 1
+        index += 1
+
     return frozenset(commands)
 
 
@@ -92,9 +110,12 @@ def load_effective_contract(
     extends = local.pop("extends", None)
     if extends is None:
         raise AssertionError(f"{path} contract must extend a shared contract")
+    extends_path = Path(extends)
+    if extends_path.is_absolute():
+        raise AssertionError(f"{path} shared contract path must be relative")
 
     skills_root = path.parent.parent.resolve()
-    shared_path = (path.parent / extends).resolve()
+    shared_path = (path.parent / extends_path).resolve()
     try:
         shared_path.relative_to(skills_root)
     except ValueError:
