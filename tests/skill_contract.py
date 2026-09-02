@@ -5,6 +5,22 @@ from pathlib import Path
 import re
 
 
+CONTRACT_KEYS = {
+    "extends",
+    "drift",
+    "secrets",
+    "confirmation-order",
+    "confirmation-cadence",
+    "local-adapter",
+    "write-gate",
+    "decision-gate",
+    "draft-gate",
+    "followup-routing",
+    "project-backlink",
+    "supersession",
+}
+
+
 @dataclass(frozen=True)
 class SkillDocument:
     name: str
@@ -58,7 +74,7 @@ def _contract_fields(path: Path, text: str) -> dict[str, str]:
         value = value.strip()
         if not separator or not key or not value:
             raise AssertionError(f"invalid contract line in {path}: {line}")
-        if key not in {"extends", "drift", "secrets"}:
+        if key not in CONTRACT_KEYS:
             raise AssertionError(f"unknown contract key in {path}: {key}")
         if key in fields:
             raise AssertionError(f"duplicate contract key in {path}: {key}")

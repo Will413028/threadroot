@@ -96,6 +96,27 @@ CORE_COMMANDS = {
     ),
 }
 
+BASE_INVARIANTS = {"drift": "stop", "secrets": "never-read"}
+
+WORKFLOW_INVARIANTS = {
+    "project-kickoff": {
+        "confirmation-order": (
+            "identity,purpose,repository-visibility,target-user,"
+            "public-private-boundary"
+        ),
+        "confirmation-cadence": "one-per-turn",
+        "local-adapter": "host-native-auto-loaded-and-already-git-ignored",
+        "write-gate": "complete-preview-and-explicit-approval",
+    },
+    "decision-log": {
+        "decision-gate": "two-or-more-real-alternatives-and-actual-trade-off",
+        "draft-gate": "complete-draft-and-explicit-approval",
+        "followup-routing": "deduplicate-into-project-pending",
+        "project-backlink": "key-decisions",
+        "supersession": "bidirectional",
+    },
+}
+
 DAILY_LIFECYCLE_CONTRACT = {
     "name": "daily-lifecycle",
     "request": "Record a completed parser task and prepare tomorrow's focus.",
@@ -384,7 +405,7 @@ class ProjectKickoffSkillContractTests(unittest.TestCase):
         )
         self.assertEqual(CORE_COMMANDS["project-kickoff"], contract.commands)
         self.assertEqual(
-            {"drift": "stop", "secrets": "never-read"},
+            BASE_INVARIANTS | WORKFLOW_INVARIANTS["project-kickoff"],
             dict(contract.invariants),
         )
 
@@ -412,7 +433,7 @@ class DecisionLogSkillContractTests(unittest.TestCase):
         )
         self.assertEqual(CORE_COMMANDS["decision-log"], contract.commands)
         self.assertEqual(
-            {"drift": "stop", "secrets": "never-read"},
+            BASE_INVARIANTS | WORKFLOW_INVARIANTS["decision-log"],
             dict(contract.invariants),
         )
 
@@ -463,9 +484,10 @@ class EffectiveSkillContractTests(unittest.TestCase):
         *,
         shared: str = SYNTHETIC_SHARED_CONTRACT,
         skill: str = SYNTHETIC_SKILL,
+        skill_name: str = "synthetic",
     ) -> Path:
         skills = Path(directory) / "skills"
-        skill_directory = skills / "synthetic"
+        skill_directory = skills / skill_name
         skill_directory.mkdir(parents=True)
         (skills / "README.md").write_text(shared, encoding="utf-8")
         path = skill_directory / "SKILL.md"
@@ -473,11 +495,13 @@ class EffectiveSkillContractTests(unittest.TestCase):
         return path
 
     def test_core_effective_contracts_have_exact_commands_and_safety(self) -> None:
-        expected_invariants = {"drift": "stop", "secrets": "never-read"}
         load_effective_contract = self._loader()
 
         for name, allowed_commands in CORE_COMMANDS.items():
             with self.subTest(name=name):
+                expected_invariants = BASE_INVARIANTS | WORKFLOW_INVARIANTS.get(
+                    name, {}
+                )
                 contract = load_effective_contract(
                     Path("skills") / name / "SKILL.md",
                     allowed_commands,
@@ -497,9 +521,53 @@ class EffectiveSkillContractTests(unittest.TestCase):
 
         self.assertEqual(frozenset({"threadroot --version"}), contract.commands)
         self.assertEqual(
-            {"drift": "stop", "secrets": "never-read"},
+            BASE_INVARIANTS,
             dict(contract.invariants),
         )
+
+    def test_project_workflow_contract_mutations_are_rejected(self) -> None:
+        load_effective_contract = self._loader()
+
+        for skill_name, local_invariants in WORKFLOW_INVARIANTS.items():
+            skill = (Path("skills") / skill_name / "SKILL.md").read_text(
+                encoding="utf-8"
+            )
+            expected_invariants = BASE_INVARIANTS | local_invariants
+            for key, value in local_invariants.items():
+                contract_line = f"{key}={value}\n"
+                with self.subTest(skill=skill_name, invariant=key, mutation="source"):
+                    self.assertEqual(1, skill.count(contract_line))
+
+                mutations = {
+                    "missing": skill.replace(contract_line, ""),
+                    "inverted": skill.replace(
+                        contract_line,
+                        f"{key}=inverted\n",
+                    ),
+                }
+                for mutation, mutated_skill in mutations.items():
+                    with (
+                        self.subTest(
+                            skill=skill_name,
+                            invariant=key,
+                            mutation=mutation,
+                        ),
+                        tempfile.TemporaryDirectory() as directory,
+                    ):
+                        path = self._write_fixture(
+                            directory,
+                            skill=mutated_skill,
+                            skill_name=skill_name,
+                        )
+                        with self.assertRaises(AssertionError):
+                            contract = load_effective_contract(
+                                path,
+                                CORE_COMMANDS[skill_name],
+                            )
+                            self.assertEqual(
+                                expected_invariants,
+                                dict(contract.invariants),
+                            )
 
     def test_noncanonical_command_containers_are_rejected(self) -> None:
         load_effective_contract = self._loader()

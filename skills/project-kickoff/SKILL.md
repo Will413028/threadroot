@@ -6,6 +6,10 @@ description: Use when a user explicitly starts a new software, client, or produc
 
 <!-- threadroot-contract
 extends=../README.md
+confirmation-order=identity,purpose,repository-visibility,target-user,public-private-boundary
+confirmation-cadence=one-per-turn
+local-adapter=host-native-auto-loaded-and-already-git-ignored
+write-gate=complete-preview-and-explicit-approval
 -->
 
 <!-- threadroot-commands
@@ -35,16 +39,16 @@ Read and follow the [shared skill contract](../README.md) before proceeding. Thi
    Propose the local adapter only when both facts are verified. Otherwise state `No safe local adapter discovered` and omit it from the write set. Do not invent an inert instruction filename, edit an ignore file, or add a rule to manufacture eligibility.
 7. Draft the project page from `templates/vault/project.md`, replacing every placeholder while preserving its section structure. Put concrete next actions under `Pending`. If an adapter is eligible, draft only the private project context needed locally. Apply the confirmed public/private boundary to every draft: private paths, private identities, personal workflows, and company context must not enter tracked public files.
 8. Show one complete preview covering every proposed path: each directory to create, each file's exact path, its tracked/public or ignored/private status, and the complete file content. Include no unpreviewed path. Ask for explicit confirmation of that exact write set and wait; urgency or earlier general permission is not confirmation of the preview.
-9. Immediately before writing, re-read the target, tracked instructions, ignore state, and every existing target used for the preview. Stop and rebuild the preview on drift. Recheck that every new file is absent, then use the host's exclusive-create operation. Create only the project page, the confirmed eligible adapter, and their currently required parent directories.
+9. Immediately before the first write, re-read the target, tracked instructions, ignore state, and every existing target used for the preview. On drift or a collision, stop before mutation, report that nothing was created, and rebuild the preview. Otherwise recheck every new file's absence and apply the previewed actions one at a time in their displayed order, using exclusive creation for files. Record each created path. If an action fails, stop the remaining actions, preserve every completed action, and report each unexecuted path and pending repair; never roll back a completed action. Create only the project page, the confirmed eligible adapter, and their currently required parent directories.
 10. Treat repository initialization, publication, commit, and push as separate actions requiring separate authorization. They are never part of kickoff confirmation.
 
 ## Safety
 
 - Never guess, defer as a batch, or silently default the five confirmed inputs.
-- Never create files before the complete preview is explicitly confirmed. Never overwrite a collision or continue after drift.
+- Never create files before the complete preview is explicitly confirmed. Never overwrite a collision, continue after drift, hide partial state, or roll back a completed action.
 - Never invent a local adapter, change ignore rules to permit one, initialize or publish a repository, read `secrets`, expose secret payloads, or copy private context into tracked public files.
 - Do not create speculative directories or files, commit, or push.
 
 ## Output
 
-Before confirmation, report the exact project-page path, adapter eligibility with its evidence or `No safe local adapter discovered`, and the complete proposed write set. After creation, report each verifiable created path and its status, then list concrete `Pending` work. On any stop condition, report that nothing was created and give the single next action needed from the user.
+Before confirmation, report the exact project-page path, adapter eligibility with its evidence or `No safe local adapter discovered`, and the complete proposed write set. A pre-write stop reports that nothing was created and gives the next action. Once apply starts, report every completed path, every unexecuted path, and each pending repair, then list concrete `Pending` work; never claim that nothing was created when an earlier action succeeded.
