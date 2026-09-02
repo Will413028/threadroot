@@ -4,6 +4,10 @@ description: Use when a user wants to connect Threadroot to a missing, empty, or
 ---
 # Second Brain Setup
 
+<!-- threadroot-contract
+extends=../README.md
+-->
+
 Read and follow the [shared skill contract](../README.md) before proceeding.
 
 ## Inputs

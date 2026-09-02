@@ -4,6 +4,10 @@ description: Use when a user asks to inspect, diagnose, health-check, or explain
 ---
 # Second Brain Doctor
 
+<!-- threadroot-contract
+extends=../README.md
+-->
+
 Read and follow the [shared skill contract](../README.md) before proceeding. This workflow is diagnosis only and ends after reporting findings.
 
 ## Inputs

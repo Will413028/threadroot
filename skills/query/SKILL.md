@@ -4,6 +4,10 @@ description: Use when a user asks a question that should be answered from a Thre
 ---
 # Query
 
+<!-- threadroot-contract
+extends=../README.md
+-->
+
 Read and follow the [shared skill contract](../README.md) before proceeding. This workflow is read-only and starts with the smallest relevant configured area.
 
 ## Inputs

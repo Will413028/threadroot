@@ -1,5 +1,10 @@
 # Shared Skill Contract
 
+<!-- threadroot-contract
+drift=stop
+secrets=never-read
+-->
+
 These public skills are provider-neutral and use `the agent`, `the model`, and `the host` for shared roles.
 
 ## Skill format
