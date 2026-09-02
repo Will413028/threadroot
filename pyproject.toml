@@ -15,5 +15,8 @@ dependencies = []
 [project.scripts]
 threadroot = "threadroot.cli:main"
 
+[tool.setuptools]
+include-package-data = false
+
 [tool.setuptools.packages.find]
 where = ["src"]
