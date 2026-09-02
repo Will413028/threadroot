@@ -11,6 +11,86 @@ def load_json(path: str) -> dict[str, object]:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+EXPECTED_CLAUDE_MANIFEST = {
+    "name": "threadroot",
+    "version": "0.1.0",
+    "description": "Local-first second-brain workflows for coding agents",
+    "author": {
+        "name": "Threadroot contributors",
+    },
+    "license": "Apache-2.0",
+    "keywords": [
+        "second-brain",
+        "agent-skills",
+        "local-first",
+        "developer-tools",
+    ],
+}
+
+EXPECTED_CODEX_MANIFEST = {
+    "name": "threadroot",
+    "version": "0.1.0",
+    "description": "Local-first second-brain workflows for coding agents",
+    "author": {
+        "name": "Threadroot contributors",
+    },
+    "license": "Apache-2.0",
+    "keywords": [
+        "second-brain",
+        "agent-skills",
+        "local-first",
+        "developer-tools",
+    ],
+    "skills": "./skills/",
+    "interface": {
+        "displayName": "Threadroot",
+        "shortDescription": "Local-first second-brain workflows",
+        "longDescription": (
+            "Set up, query, and maintain a user-owned Markdown vault across "
+            "coding-agent sessions."
+        ),
+        "developerName": "Threadroot contributors",
+        "category": "Developer Tools",
+        "capabilities": [
+            "Interactive",
+            "Read",
+            "Write",
+        ],
+        "defaultPrompt": [
+            "Set up a user-owned second-brain vault.",
+            "Review today's work from my second brain.",
+            "Record this work in my second brain.",
+        ],
+    },
+}
+
+EXPECTED_MARKETPLACE_CATALOG = {
+    "name": "threadroot",
+    "description": "Threadroot local and repository installations",
+    "owner": {
+        "name": "Threadroot contributors",
+    },
+    "plugins": [
+        {
+            "name": "threadroot",
+            "description": "Local-first second-brain workflows for coding agents",
+            "version": "0.1.0",
+            "source": "./",
+            "author": {
+                "name": "Threadroot contributors",
+            },
+            "license": "Apache-2.0",
+            "keywords": [
+                "second-brain",
+                "agent-skills",
+                "local-first",
+                "developer-tools",
+            ],
+        },
+    ],
+}
+
+
 class ManifestTests(unittest.TestCase):
     def test_version_matches_python_package_metadata(self) -> None:
         project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]
@@ -28,65 +108,23 @@ class ManifestTests(unittest.TestCase):
             {"0.1.0"},
         )
 
-    def test_native_manifests_share_public_metadata(self) -> None:
-        claude = load_json(".claude-plugin/plugin.json")
-        codex = load_json(".codex-plugin/plugin.json")
-        common_keys = {
-            "name",
-            "version",
-            "description",
-            "author",
-            "license",
-            "keywords",
-        }
-        self.assertEqual(set(claude), common_keys)
-        self.assertEqual(set(codex), common_keys | {"skills", "interface"})
-        for key in common_keys:
-            self.assertEqual(claude[key], codex[key])
-        self.assertEqual(codex["skills"], "./skills/")
-
-    def test_codex_manifest_has_complete_interface_metadata(self) -> None:
-        interface = load_json(".codex-plugin/plugin.json")["interface"]
+    def test_claude_manifest_matches_exact_contract(self) -> None:
         self.assertEqual(
-            set(interface),
-            {
-                "displayName",
-                "shortDescription",
-                "longDescription",
-                "developerName",
-                "category",
-                "capabilities",
-                "defaultPrompt",
-            },
+            load_json(".claude-plugin/plugin.json"),
+            EXPECTED_CLAUDE_MANIFEST,
         )
-        self.assertEqual(interface["displayName"], "Threadroot")
-        self.assertEqual(interface["developerName"], "Threadroot contributors")
-        self.assertEqual(interface["category"], "Developer Tools")
-        self.assertEqual(interface["capabilities"], ["Interactive", "Read", "Write"])
-        self.assertLessEqual(len(interface["defaultPrompt"]), 3)
-        self.assertTrue(interface["defaultPrompt"])
-        self.assertTrue(all(prompt.strip() for prompt in interface["defaultPrompt"]))
-        self.assertTrue(all(len(prompt) <= 128 for prompt in interface["defaultPrompt"]))
 
-    def test_marketplace_points_to_the_repository_plugin(self) -> None:
-        marketplace = load_json(".claude-plugin/marketplace.json")
-        self.assertEqual(marketplace["name"], "threadroot")
-        self.assertEqual(len(marketplace["plugins"]), 1)
-        plugin = marketplace["plugins"][0]
-        self.assertEqual(plugin["name"], "threadroot")
-        self.assertEqual(plugin["version"], "0.1.0")
-        self.assertEqual(plugin["source"], "./")
-        claude = load_json(".claude-plugin/plugin.json")
-        common_keys = {
-            "name",
-            "version",
-            "description",
-            "author",
-            "license",
-            "keywords",
-        }
-        self.assertEqual(set(plugin), common_keys | {"source"})
-        self.assertEqual({key: plugin[key] for key in common_keys}, claude)
+    def test_codex_manifest_matches_exact_contract(self) -> None:
+        self.assertEqual(
+            load_json(".codex-plugin/plugin.json"),
+            EXPECTED_CODEX_MANIFEST,
+        )
+
+    def test_marketplace_catalog_matches_exact_contract(self) -> None:
+        self.assertEqual(
+            load_json(".claude-plugin/marketplace.json"),
+            EXPECTED_MARKETPLACE_CATALOG,
+        )
 
     def test_every_manifest_skill_exists(self) -> None:
         expected = {
