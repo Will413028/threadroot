@@ -10,7 +10,13 @@ import stat
 import tempfile
 
 from .config import config_text, load_config
-from .paths import MARKER_RELATIVE, default_pointer_path, ensure_within, normalized_absolute
+from .paths import (
+    MARKER_RELATIVE,
+    default_pointer_path,
+    ensure_within,
+    normalized_absolute,
+    resolve_path,
+)
 from .results import (
     ActionName,
     Change,
@@ -579,7 +585,15 @@ def _doctor_result(
 
 
 def run_doctor(vault: Path) -> CommandResult:
-    root = Path(vault).resolve(strict=False)
+    root = normalized_absolute(vault)
+    try:
+        root = resolve_path(root)
+    except ThreadrootError as error:
+        return _doctor_result(
+            root,
+            (Issue("error", error.code, error.message, "."),),
+            unsafe=error.exit_code == ExitCode.UNSAFE_PATH,
+        )
     issues: list[Issue] = []
 
     if not root.exists():

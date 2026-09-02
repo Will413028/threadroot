@@ -606,6 +606,19 @@ class DoctorTests(unittest.TestCase):
             self.assertFalse(result.applied)
             self.assertEqual(result.changes, ())
 
+    def test_vault_symlink_loop_is_an_unsafe_result(self) -> None:
+        with TemporaryDirectory() as directory:
+            loop = Path(directory) / "loop"
+            loop.symlink_to(loop.name)
+
+            result = run_doctor(loop)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.exit_code, ExitCode.UNSAFE_PATH)
+            self.assertEqual(result.issues[0].code, "path.unsafe")
+            self.assertFalse(result.applied)
+            self.assertEqual(result.changes, ())
+
     def test_missing_root_and_marker_are_config_errors(self) -> None:
         with TemporaryDirectory() as directory:
             base = Path(directory)

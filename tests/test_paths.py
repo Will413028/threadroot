@@ -116,3 +116,27 @@ class PathTests(unittest.TestCase):
                 with self.subTest(value=value), self.assertRaises(ThreadrootError) as raised:
                     ensure_within(root, value)
                 self.assertEqual(raised.exception.exit_code, ExitCode.UNSAFE_PATH)
+
+    def test_explicit_symlink_loop_is_unsafe(self) -> None:
+        with TemporaryDirectory() as directory:
+            base = Path(directory)
+            loop = base / "loop"
+            loop.symlink_to(loop.name)
+
+            with self.assertRaises(ThreadrootError) as raised:
+                resolve_vault(loop, base, {}, base / "home")
+
+            self.assertEqual(raised.exception.exit_code, ExitCode.UNSAFE_PATH)
+            self.assertEqual(raised.exception.code, "path.unsafe")
+
+    def test_containment_symlink_loop_is_unsafe(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            loop = root / "loop"
+            loop.symlink_to(loop.name)
+
+            with self.assertRaises(ThreadrootError) as raised:
+                ensure_within(root, "loop")
+
+            self.assertEqual(raised.exception.exit_code, ExitCode.UNSAFE_PATH)
+            self.assertEqual(raised.exception.code, "path.unsafe")

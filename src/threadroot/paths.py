@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 from collections.abc import Mapping
 from pathlib import Path
@@ -20,24 +21,45 @@ def _invalid_config(message: str) -> ThreadrootError:
     return ThreadrootError(ExitCode.CONFIG, "config.invalid", message)
 
 
+def _unsafe_path() -> ThreadrootError:
+    return ThreadrootError(ExitCode.UNSAFE_PATH, "path.unsafe", "Path escapes the vault.")
+
+
+def resolve_path(path: str | Path, *, strict: bool = False) -> Path:
+    candidate = Path(path)
+    try:
+        resolved = candidate.resolve(strict=strict)
+    except RuntimeError:
+        raise _unsafe_path() from None
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise _unsafe_path() from None
+        raise
+
+    try:
+        candidate.stat()
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise _unsafe_path() from None
+    return resolved
+
+
 def ensure_within(root: Path, relative: str | Path) -> Path:
     candidate = Path(relative)
     if candidate.is_absolute() or ".." in candidate.parts:
-        raise ThreadrootError(ExitCode.UNSAFE_PATH, "path.unsafe", "Path escapes the vault.")
+        raise _unsafe_path()
 
-    resolved_root = Path(root).resolve(strict=False)
-    resolved_candidate = (resolved_root / candidate).resolve(strict=False)
+    resolved_root = resolve_path(root)
+    resolved_candidate = resolve_path(resolved_root / candidate)
     try:
         resolved_candidate.relative_to(resolved_root)
     except ValueError as error:
-        raise ThreadrootError(
-            ExitCode.UNSAFE_PATH, "path.unsafe", "Path escapes the vault."
-        ) from error
+        raise _unsafe_path() from error
     return resolved_candidate
 
 
 def find_upward(start: Path) -> Path | None:
-    current = Path(start).resolve(strict=False)
+    current = resolve_path(start)
     while True:
         marker = current / MARKER_RELATIVE
         if marker.is_file():
@@ -73,7 +95,7 @@ def read_default_pointer(path: Path) -> Path | None:
     value = document["default_vault"]
     if not isinstance(value, str) or not value or not Path(value).is_absolute():
         raise _invalid_config("Default vault pointer is invalid.")
-    return Path(value).resolve(strict=False)
+    return resolve_path(value)
 
 
 def _normalize_root(value: str | Path, cwd: Path) -> Path:
@@ -83,7 +105,7 @@ def _normalize_root(value: str | Path, cwd: Path) -> Path:
         raise _invalid_config("Vault path is invalid.") from None
     if not candidate.is_absolute():
         candidate = Path(cwd) / candidate
-    return candidate.resolve(strict=False)
+    return resolve_path(candidate)
 
 
 def resolve_vault(

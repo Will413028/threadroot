@@ -209,6 +209,21 @@ class CommandLineTests(unittest.TestCase):
 
             self.assertEqual((config_code, unsafe_code, conflict_code, io_code), (3, 4, 5, 6))
 
+    def test_explicit_symlink_loop_is_json_unsafe_without_traceback(self) -> None:
+        with TemporaryDirectory() as directory:
+            loop = Path(directory) / "loop"
+            loop.symlink_to(loop.name)
+
+            code, stdout, stderr = self.call(
+                ["doctor", "--vault", str(loop), "--json"]
+            )
+
+            payload = json.loads(stdout)
+            self.assertEqual(code, ExitCode.UNSAFE_PATH)
+            self.assertEqual(stderr, "")
+            self.assertFalse(payload["ok"])
+            self.assertEqual(payload["issues"][0]["code"], "path.unsafe")
+
     def test_human_output_uses_stdout_for_success_and_stderr_for_error(self) -> None:
         with TemporaryDirectory() as directory:
             base = Path(directory)
