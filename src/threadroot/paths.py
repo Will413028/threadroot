@@ -11,6 +11,11 @@ from .results import ExitCode, ThreadrootError
 MARKER_RELATIVE = Path(".second-brain/config.json")
 
 
+def normalized_absolute(path: str | Path) -> Path:
+    """Return an absolute lexical path without following symlinks."""
+    return Path(os.path.abspath(path))
+
+
 def _invalid_config(message: str) -> ThreadrootError:
     return ThreadrootError(ExitCode.CONFIG, "config.invalid", message)
 
