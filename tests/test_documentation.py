@@ -63,6 +63,58 @@ def _inline_matrix_values(workflow: str, key: str) -> list[str]:
     return [value.strip().strip('"\'') for value in match.group(1).split(",")]
 
 
+def _non_overwrite_contract_errors(section: str) -> list[str]:
+    errors: list[str] = []
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", " ".join(section.split()))
+        if sentence.strip()
+    ]
+    vault_guarantee = any(
+        re.search(
+            r"(?i)(?:"
+            r"never overwrites?\s+existing vault (?:files|content|data)"
+            r"|existing vault (?:files|content|data)[^.]*is never overwritten"
+            r")",
+            sentence,
+        )
+        for sentence in sentences
+    )
+    if not vault_guarantee:
+        errors.append("vault_no_overwrite_scope")
+
+    pointer_relation = any(
+        re.search(r"`--apply(?:`|\s)", sentence)
+        and re.search(r"--set-default`", sentence)
+        and re.search(
+            r"(?i)atomic(?:ally)? replace\w* the machine-local default-vault pointer"
+            r"[^.]*only after the vault operation succeeds",
+            sentence,
+        )
+        for sentence in sentences
+    )
+    if not pointer_relation:
+        errors.append("pointer_gate_and_order")
+
+    pointer_is_vault_neutral = any(
+        re.search(
+            r"(?i)replac\w*[^.]*does not modify vault content",
+            sentence,
+        )
+        for sentence in sentences
+    )
+    if not pointer_is_vault_neutral:
+        errors.append("pointer_vault_separation")
+
+    for claim in (
+        r"\bdoes not overwrite existing files\b",
+        r"\bexisting content is never overwritten\b",
+    ):
+        if re.search(rf"(?i){claim}", section):
+            errors.append("unscoped_no_overwrite_claim")
+    return sorted(set(errors))
+
+
 class DocumentationTests(unittest.TestCase):
     def test_non_overwrite_contract_distinguishes_vault_from_default_pointer(self) -> None:
         sections = {
@@ -74,20 +126,67 @@ class DocumentationTests(unittest.TestCase):
                 "Non-overwriting writes",
             ),
         }
-        overly_broad_claims = (
-            r"\bdoes not overwrite existing files\b",
-            r"\bexisting content is never overwritten\b",
-        )
-
         for name, section in sections.items():
             with self.subTest(section=name):
-                self.assertRegex(section, r"(?i)vault (?:files|content|data)")
-                self.assertIn("--set-default", section)
-                self.assertRegex(section, r"(?i)machine-local default-vault pointer")
-                self.assertRegex(section, r"(?i)atomic(?:ally)? replace")
-                self.assertRegex(section, r"(?i)vault operation (?:has )?succeed")
-                for claim in overly_broad_claims:
-                    self.assertNotRegex(section, rf"(?i){claim}")
+                self.assertEqual(_non_overwrite_contract_errors(section), [])
+
+    def test_non_overwrite_contract_rejects_relational_mutations(self) -> None:
+        sections = {
+            "README Safety": _section(
+                Path("README.md").read_text(encoding="utf-8"), "Safety"
+            ),
+            "SECURITY Non-overwriting writes": _section(
+                Path("SECURITY.md").read_text(encoding="utf-8"),
+                "Non-overwriting writes",
+            ),
+        }
+        mutations = {
+            "pointer before vault success": (
+                "only after the vault operation succeeds",
+                "before the vault operation succeeds",
+                "pointer_gate_and_order",
+            ),
+            "pointer replacement modifies vault": (
+                "does not modify vault content",
+                "does modify vault content",
+                "pointer_vault_separation",
+            ),
+            "apply gate omitted": (
+                "--apply --set-default",
+                "--set-default",
+                "pointer_gate_and_order",
+            ),
+        }
+
+        for section_name, section in sections.items():
+            for mutation_name, (correct, incorrect, expected_error) in mutations.items():
+                with self.subTest(section=section_name, mutation=mutation_name):
+                    self.assertIn(correct, section)
+                    mutated = section.replace(correct, incorrect)
+                    self.assertNotEqual(mutated, section)
+                    self.assertIn(
+                        expected_error,
+                        _non_overwrite_contract_errors(mutated),
+                    )
+
+    def test_design_goal_scopes_non_overwrite_to_vault_data(self) -> None:
+        design = Path(
+            "docs/superpowers/specs/2026-09-02-threadroot-v0-design.md"
+        ).read_text(encoding="utf-8")
+        goals = _section(design, "Goals")
+        write_contracts = [
+            bullet
+            for bullet in re.findall(r"^- (.+)$", goals, re.MULTILINE)
+            if "deterministic" in bullet
+            and "write" in bullet
+            and "non-overwriting" in bullet
+        ]
+
+        self.assertEqual(len(write_contracts), 1)
+        self.assertRegex(
+            write_contracts[0],
+            r"(?i)\bevery deterministic vault-data write\b",
+        )
 
     def test_public_document_links_resolve_and_fences_are_balanced(self) -> None:
         for source in PUBLIC_DOCUMENTS:

@@ -21,7 +21,7 @@ Coding-agent context is usually scoped to one session or one provider. Developer
 - Keep workflow behavior in a single provider-neutral `skills/` source of truth.
 - Store all user knowledge in a user-owned Markdown and Git vault.
 - Support safe setup through `init`, minimal adoption through `adopt`, and read-only diagnosis through `doctor`.
-- Make every deterministic write previewable, non-overwriting, path-contained, and inspectable with Git.
+- Make every deterministic vault-data write previewable, non-overwriting, path-contained, and inspectable with Git.
 - Support a useful end-to-end daily and project workflow without a server, database, or background process.
 
 ## Non-goals
