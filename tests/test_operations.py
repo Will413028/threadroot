@@ -3,12 +3,14 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
+from threadroot.config import config_text
 from threadroot.operations import (
     PlannedChange,
     apply_plan,
     plan_adopt,
     plan_init,
     run_adopt,
+    run_doctor,
     run_init,
 )
 from threadroot.results import ExitCode
@@ -550,3 +552,119 @@ class ApplyPlanTests(unittest.TestCase):
             self.assertFalse(result.ok)
             self.assertEqual(result.exit_code, ExitCode.IO_OR_DRIFT)
             self.assertEqual(result.issues[0].code, "filesystem.failed")
+
+
+class DoctorTests(unittest.TestCase):
+    def test_valid_vault_is_not_modified(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "vault"
+            init_result = run_init(
+                root,
+                apply=True,
+                set_default=False,
+                environ={},
+                home=Path(directory) / "home",
+            )
+            self.assertTrue(init_result.ok)
+            before = {
+                path.relative_to(root): (path.stat().st_mtime_ns, path.read_bytes())
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+
+            result = run_doctor(root)
+
+            after = {
+                path.relative_to(root): (path.stat().st_mtime_ns, path.read_bytes())
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+            self.assertTrue(result.ok)
+            self.assertFalse(result.applied)
+            self.assertEqual(result.changes, ())
+            self.assertEqual(before, after)
+            self.assertEqual([issue.code for issue in result.issues], ["git.not_found"])
+
+    def test_escaping_symlink_is_an_error(self) -> None:
+        with TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "vault"
+            outside = base / "outside"
+            root.mkdir()
+            outside.mkdir()
+            for relative in ("wiki/projects", "wiki/tech", "wiki/reviews"):
+                (root / relative).mkdir(parents=True)
+            (root / "daily").symlink_to(outside, target_is_directory=True)
+            marker = root / ".second-brain/config.json"
+            marker.parent.mkdir()
+            marker.write_text(config_text(), encoding="utf-8")
+
+            result = run_doctor(root)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.exit_code, ExitCode.UNSAFE_PATH)
+            self.assertFalse(result.applied)
+            self.assertEqual(result.changes, ())
+
+    def test_missing_root_and_marker_are_config_errors(self) -> None:
+        with TemporaryDirectory() as directory:
+            base = Path(directory)
+            for root in (base / "missing", base):
+                with self.subTest(root=root):
+                    result = run_doctor(root)
+                    self.assertFalse(result.ok)
+                    self.assertEqual(result.exit_code, ExitCode.CONFIG)
+                    self.assertEqual(result.issues[0].level, "error")
+
+    def test_findings_are_sorted_by_severity_code_and_path(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            for relative in ("daily", "wiki/projects", "wiki/reviews"):
+                (root / relative).mkdir(parents=True)
+            (root / "wiki/tech").write_text("not a directory\n", encoding="utf-8")
+            marker = root / ".second-brain/config.json"
+            marker.parent.mkdir()
+            marker.write_text(config_text(), encoding="utf-8")
+            (root / "daily").chmod(0o500)
+            try:
+                result = run_doctor(root)
+            finally:
+                (root / "daily").chmod(0o700)
+
+            ordering = {"error": 0, "warning": 1, "info": 2}
+            observed = [
+                (ordering[issue.level], issue.code, issue.path or "")
+                for issue in result.issues
+            ]
+            self.assertFalse(result.ok)
+            self.assertEqual(result.exit_code, ExitCode.CONFIG)
+            self.assertEqual(observed, sorted(observed))
+            self.assertTrue(any(issue.level == "warning" for issue in result.issues))
+            self.assertEqual(result.issues[-1].code, "git.not_found")
+
+    def test_unreadable_and_unwritable_directory_reports_both_checks(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "vault"
+            initialized = run_init(
+                root,
+                apply=True,
+                set_default=False,
+                environ={},
+                home=Path(directory) / "home",
+            )
+            self.assertTrue(initialized.ok)
+            daily = root / "daily"
+            daily.chmod(0)
+            try:
+                result = run_doctor(root)
+            finally:
+                daily.chmod(0o700)
+
+            daily_issues = [issue for issue in result.issues if issue.path == "daily"]
+            self.assertEqual(
+                [(issue.level, issue.code) for issue in daily_issues],
+                [
+                    ("error", "path.not_readable"),
+                    ("warning", "path.not_writable"),
+                ],
+            )

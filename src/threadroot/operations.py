@@ -538,3 +538,149 @@ def run_adopt(
         changes=result.changes
         + (Change("write_default_pointer", "machine-default-pointer", "completed"),),
     )
+
+
+_ISSUE_SEVERITY = {"error": 0, "warning": 1, "info": 2}
+
+
+def _doctor_result(
+    root: Path,
+    issues: Sequence[Issue],
+    *,
+    unsafe: bool = False,
+) -> CommandResult:
+    ordered = tuple(
+        sorted(
+            issues,
+            key=lambda issue: (
+                _ISSUE_SEVERITY[issue.level],
+                issue.code,
+                issue.path or "",
+            ),
+        )
+    )
+    has_errors = any(issue.level == "error" for issue in ordered)
+    exit_code = (
+        ExitCode.UNSAFE_PATH
+        if unsafe
+        else ExitCode.CONFIG
+        if has_errors
+        else ExitCode.OK
+    )
+    return CommandResult(
+        ok=not has_errors,
+        command="doctor",
+        applied=False,
+        vault=str(root),
+        changes=(),
+        issues=ordered,
+        exit_code=exit_code,
+    )
+
+
+def run_doctor(vault: Path) -> CommandResult:
+    root = Path(vault).resolve(strict=False)
+    issues: list[Issue] = []
+
+    if not root.exists():
+        issues.append(
+            Issue("error", "vault.not_found", "Vault root does not exist.", ".")
+        )
+        return _doctor_result(root, issues)
+    if not root.is_dir():
+        issues.append(
+            Issue(
+                "error",
+                "vault.not_directory",
+                "Vault root is not a directory.",
+                ".",
+            )
+        )
+        return _doctor_result(root, issues)
+
+    marker = root / MARKER_RELATIVE
+    try:
+        ensure_within(root, MARKER_RELATIVE)
+    except ThreadrootError as error:
+        issues.append(
+            Issue("error", error.code, error.message, MARKER_RELATIVE.as_posix())
+        )
+        if not (root / ".git").exists():
+            issues.append(Issue("info", "git.not_found", "Git metadata was not found.", ".git"))
+        return _doctor_result(root, issues, unsafe=error.exit_code == ExitCode.UNSAFE_PATH)
+
+    if not marker.is_file() or not os.access(marker, os.R_OK):
+        issues.append(
+            Issue(
+                "error",
+                "config.invalid",
+                "Vault config is not a readable file.",
+                MARKER_RELATIVE.as_posix(),
+            )
+        )
+        if not (root / ".git").exists():
+            issues.append(Issue("info", "git.not_found", "Git metadata was not found.", ".git"))
+        return _doctor_result(root, issues)
+
+    try:
+        config = load_config(root)
+    except ThreadrootError as error:
+        issues.append(Issue("error", error.code, error.message, error.path))
+        if not (root / ".git").exists():
+            issues.append(Issue("info", "git.not_found", "Git metadata was not found.", ".git"))
+        return _doctor_result(root, issues, unsafe=error.exit_code == ExitCode.UNSAFE_PATH)
+
+    unsafe = False
+    for relative in (
+        config.paths.daily,
+        config.paths.projects,
+        config.paths.knowledge,
+        config.paths.reviews,
+    ):
+        try:
+            target = ensure_within(root, relative)
+        except ThreadrootError as error:
+            issues.append(Issue("error", error.code, error.message, relative))
+            unsafe = unsafe or error.exit_code == ExitCode.UNSAFE_PATH
+            continue
+        if not target.exists():
+            issues.append(
+                Issue(
+                    "error",
+                    "path.not_found",
+                    "Configured directory does not exist.",
+                    relative,
+                )
+            )
+        elif not target.is_dir():
+            issues.append(
+                Issue(
+                    "error",
+                    "path.not_directory",
+                    "Configured path is not a directory.",
+                    relative,
+                )
+            )
+        else:
+            if not os.access(target, os.R_OK):
+                issues.append(
+                    Issue(
+                        "error",
+                        "path.not_readable",
+                        "Configured directory is not readable.",
+                        relative,
+                    )
+                )
+            if not os.access(target, os.W_OK):
+                issues.append(
+                    Issue(
+                        "warning",
+                        "path.not_writable",
+                        "Configured directory is not writable.",
+                        relative,
+                    )
+                )
+
+    if not (root / ".git").exists():
+        issues.append(Issue("info", "git.not_found", "Git metadata was not found.", ".git"))
+    return _doctor_result(root, issues, unsafe=unsafe)
