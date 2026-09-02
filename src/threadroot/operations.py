@@ -6,6 +6,7 @@ import errno
 import json
 import os
 from pathlib import Path
+import stat
 import tempfile
 
 from .config import config_text, load_config
@@ -129,28 +130,59 @@ def _changes_with_status(
     )
 
 
-def _validate_root_creation(vault: Path, change: PlannedChange) -> None:
-    if change.public_path != "." or change.target.resolve(strict=False) != vault:
-        raise ValueError("planned vault root changed")
-    if not change.target.parent.is_dir():
-        raise ValueError("vault parent changed")
-
-
-def _validate_descendant(vault: Path, change: PlannedChange) -> None:
-    if not vault.is_dir() or vault.resolve(strict=True) != vault:
-        raise ValueError("vault root changed")
+def _safe_resolve(path: Path, *, strict: bool) -> Path:
     try:
-        relative = change.target.relative_to(vault).as_posix()
-        parent = change.target.parent.resolve(strict=True)
-        parent.relative_to(vault)
-    except (FileNotFoundError, NotADirectoryError, RuntimeError, ValueError):
+        return path.resolve(strict=strict)
+    except RuntimeError as error:
+        raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), path) from error
+
+
+def _resolve_precondition(path: Path, *, strict: bool) -> Path:
+    try:
+        return _safe_resolve(path, strict=strict)
+    except (FileNotFoundError, NotADirectoryError):
         raise ValueError("planned path changed") from None
     except OSError as error:
         if error.errno == errno.ELOOP:
             raise ValueError("planned path changed") from None
         raise
-    if relative != change.public_path or not parent.is_dir():
+
+
+def _require_directory(path: Path) -> None:
+    try:
+        mode = path.stat().st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        raise ValueError("planned directory changed") from None
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise ValueError("planned directory changed") from None
+        raise
+    if not stat.S_ISDIR(mode):
+        raise ValueError("planned directory changed")
+
+
+def _validate_root_creation(vault: Path, change: PlannedChange) -> None:
+    if (
+        change.public_path != "."
+        or _resolve_precondition(change.target, strict=False) != vault
+    ):
+        raise ValueError("planned vault root changed")
+    _require_directory(change.target.parent)
+
+
+def _validate_descendant(vault: Path, change: PlannedChange) -> None:
+    _require_directory(vault)
+    if _resolve_precondition(vault, strict=True) != vault:
+        raise ValueError("vault root changed")
+    relative = change.target.relative_to(vault).as_posix()
+    parent = _resolve_precondition(change.target.parent, strict=True)
+    try:
+        parent.relative_to(vault)
+    except ValueError:
+        raise ValueError("planned path changed") from None
+    if relative != change.public_path:
         raise ValueError("planned path changed")
+    _require_directory(parent)
 
 
 def _planned_root(vault: Path, plan: Sequence[PlannedChange]) -> Path:
@@ -239,7 +271,7 @@ def write_default_pointer(
     pointer = default_pointer_path(environ, home)
     pointer.parent.mkdir(parents=True, exist_ok=True)
     content = json.dumps(
-        {"default_vault": str(Path(vault).resolve())},
+        {"default_vault": str(_safe_resolve(Path(vault), strict=True))},
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),

@@ -311,3 +311,83 @@ class InitTests(unittest.TestCase):
             self.assertFalse(result.ok)
             self.assertEqual(result.exit_code, ExitCode.IO_OR_DRIFT)
             self.assertEqual(result.issues[0].code, "target.drifted")
+
+    def test_root_action_symlink_loop_is_reported_as_drift(self) -> None:
+        with TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            vault = base / "vault"
+            plan = plan_init(vault)
+            vault.symlink_to("vault")
+
+            try:
+                result = apply_plan("init", vault, plan)
+            except RuntimeError as error:
+                self.fail(f"root-action symlink loop escaped as RuntimeError: {error}")
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.exit_code, ExitCode.IO_OR_DRIFT)
+            self.assertEqual(result.issues[0].code, "target.drifted")
+            self.assertTrue(all(change.status == "unexecuted" for change in result.changes))
+
+    def test_pointer_stage_symlink_loop_is_a_filesystem_failure(self) -> None:
+        with TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            vault = base / "vault"
+            preserved = base / "completed-vault"
+            loop_peer = base / "vault-loop"
+            xdg = base / "machine-config"
+
+            class LoopVaultOnSecondLookup(dict[str, str]):
+                def __init__(self) -> None:
+                    super().__init__(XDG_CONFIG_HOME=str(xdg))
+                    self.lookups = 0
+
+                def get(self, key: str, default: str | None = None) -> str | None:
+                    if key == "XDG_CONFIG_HOME":
+                        self.lookups += 1
+                        if self.lookups == 2:
+                            self.assert_vault_completed()
+                            vault.rename(preserved)
+                            vault.symlink_to(loop_peer.name)
+                            loop_peer.symlink_to(vault.name)
+                    return super().get(key, default)
+
+                @staticmethod
+                def assert_vault_completed() -> None:
+                    if not (vault / ".second-brain/config.json").is_file():
+                        raise AssertionError("pointer stage started before vault completion")
+
+            try:
+                result = run_init(
+                    vault,
+                    apply=True,
+                    set_default=True,
+                    environ=LoopVaultOnSecondLookup(),
+                    home=base,
+                )
+            except RuntimeError as error:
+                self.fail(f"pointer-stage symlink loop escaped as RuntimeError: {error}")
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.exit_code, ExitCode.IO_OR_DRIFT)
+            self.assertEqual(result.issues[0].code, "filesystem.failed")
+            self.assertTrue(all(change.status == "completed" for change in result.changes[:-1]))
+            self.assertEqual(result.changes[-1].status, "unexecuted")
+            self.assertTrue((preserved / ".second-brain/config.json").is_file())
+            self.assertFalse((xdg / "threadroot/config.json").exists())
+
+    def test_descendant_vault_stat_error_is_a_filesystem_failure(self) -> None:
+        with TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            vault = base / "vault"
+            vault.mkdir()
+            plan = plan_init(vault)
+            base.chmod(0)
+            try:
+                result = apply_plan("init", vault, plan)
+            finally:
+                base.chmod(0o700)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.exit_code, ExitCode.IO_OR_DRIFT)
+            self.assertEqual(result.issues[0].code, "filesystem.failed")
