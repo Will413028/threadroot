@@ -1,0 +1,15 @@
+{
+  "name": "threadroot",
+  "version": "0.1.0",
+  "description": "Local-first second-brain workflows for coding agents",
+  "author": {
+    "name": "Threadroot contributors"
+  },
+  "license": "Apache-2.0",
+  "keywords": [
+    "second-brain",
+    "agent-skills",
+    "local-first",
+    "developer-tools"
+  ]
+}

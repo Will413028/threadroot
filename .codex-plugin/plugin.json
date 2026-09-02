@@ -1,0 +1,33 @@
+{
+  "name": "threadroot",
+  "version": "0.1.0",
+  "description": "Local-first second-brain workflows for coding agents",
+  "author": {
+    "name": "Threadroot contributors"
+  },
+  "license": "Apache-2.0",
+  "keywords": [
+    "second-brain",
+    "agent-skills",
+    "local-first",
+    "developer-tools"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Threadroot",
+    "shortDescription": "Local-first second-brain workflows",
+    "longDescription": "Set up, query, and maintain a user-owned Markdown vault across coding-agent sessions.",
+    "developerName": "Threadroot contributors",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Set up a user-owned second-brain vault.",
+      "Review today's work from my second brain.",
+      "Record this work in my second brain."
+    ]
+  }
+}
