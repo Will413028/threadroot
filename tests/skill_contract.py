@@ -91,7 +91,10 @@ def _threadroot_commands(text: str) -> frozenset[str]:
         raise AssertionError("command inventory entries must be unique")
 
     outside_inventory = text[: match.start()] + text[match.end() :]
-    if re.search(r"(?<![\w-])threadroot(?![\w-])", outside_inventory):
+    lowercase_command = re.compile(
+        r"(?<![\w-])(?:threadroot|_+threadroot_+)(?![\w-])"
+    )
+    if lowercase_command.search(outside_inventory):
         raise AssertionError("lowercase threadroot token outside command inventory")
 
     return frozenset(lines)

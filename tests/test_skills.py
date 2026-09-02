@@ -106,7 +106,7 @@ extends=../README.md
 Run the version-check command from the command inventory.
 
 Threadroot is the product name. The standalone option `--set-default` is not a
-command invocation.
+command invocation. The `my_threadroot_helper` identifier is not a command.
 """
 
 
@@ -262,6 +262,13 @@ class EffectiveSkillContractTests(unittest.TestCase):
             "backtick in fenced info string": (
                 SYNTHETIC_SKILL
                 + "\n```sh`\nthreadroot --version\n```\n"
+            ),
+            "emphasized command in prose": (
+                SYNTHETIC_SKILL + "\nRun _threadroot_ migrate.\n"
+            ),
+            "emphasized command after inventory": SYNTHETIC_SKILL.replace(
+                SYNTHETIC_COMMAND_INVENTORY,
+                SYNTHETIC_COMMAND_INVENTORY + "_threadroot_ migrate",
             ),
         }
 
