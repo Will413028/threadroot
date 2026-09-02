@@ -42,6 +42,22 @@ def damage_first_zip_member(path: Path) -> None:
     path.write_bytes(payload)
 
 
+def truncate_zip_end_record(path: Path) -> None:
+    payload = path.read_bytes()
+    end_record = payload.rfind(b"PK\x05\x06")
+    if end_record < 0:
+        raise AssertionError("ZIP end record was not found")
+    path.write_bytes(payload[:end_record])
+
+
+def damage_tar_header_checksum(path: Path) -> None:
+    payload = bytearray(path.read_bytes())
+    if payload[257:262] != b"ustar":
+        raise AssertionError("ustar signature was not found")
+    payload[148:156] = b"000000\0 "
+    path.write_bytes(payload)
+
+
 class PublicSafetyTests(unittest.TestCase):
     def test_finding_is_frozen(self) -> None:
         finding = Finding("code", "path", None, "message")
@@ -111,6 +127,43 @@ class PublicSafetyTests(unittest.TestCase):
         lines = [f"{name} = {value}" for name in names for value in empty_values]
         with TemporaryDirectory() as directory:
             target = Path(directory) / "empty.txt"
+            target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            self.assertEqual(scan_path(target), [])
+
+    def test_delimiter_only_credential_values_are_findings(self) -> None:
+        names = ("pass" + "word", "sec" + "ret", "api" + "_key")
+        lines = tuple(
+            f"{name} = {value}" for name, value in zip(names, ("}", "]", ","))
+        )
+        with TemporaryDirectory() as directory:
+            target = Path(directory) / "delimiters.txt"
+            target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            findings = scan_path(target)
+
+        self.assertEqual(
+            [(finding.code, finding.line) for finding in findings],
+            [
+                ("credential_assignment", 1),
+                ("credential_assignment", 2),
+                ("credential_assignment", 3),
+            ],
+        )
+
+    def test_comment_only_and_structurally_empty_credentials_are_clean(self) -> None:
+        empty_values = (
+            "# blank",
+            "{ }",
+            "[ ]",
+            "[{ }, [ ]]",
+            "{[ ], { }}",
+            '\"\"}, # blank',
+            "null]}, # blank",
+            "unset, } # blank",
+        )
+        name = "pass" + "word"
+        lines = [f"{name} = {value}" for value in empty_values]
+        with TemporaryDirectory() as directory:
+            target = Path(directory) / "structurally-empty.txt"
             target.write_text("\n".join(lines) + "\n", encoding="utf-8")
             self.assertEqual(scan_path(target), [])
 
@@ -220,6 +273,28 @@ class PublicSafetyTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "public scan failed"):
                 scan_path(artifact)
 
+    def test_truncated_zip_structure_fails_closed(self) -> None:
+        with TemporaryDirectory() as directory:
+            artifact = Path(directory) / "truncated.data"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("payload.txt", credential_line() + "\n")
+            truncate_zip_end_record(artifact)
+            self.assertFalse(zipfile.is_zipfile(artifact))
+
+            with self.assertRaisesRegex(RuntimeError, "public scan failed"):
+                scan_path(artifact)
+
+    def test_incomplete_zip_structural_signatures_fail_closed(self) -> None:
+        signatures = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+        with TemporaryDirectory() as directory:
+            artifact = Path(directory) / "incomplete.data"
+            for signature in signatures:
+                with self.subTest(signature=signature.hex()):
+                    artifact.write_bytes(signature + b"\x00" * 2)
+                    self.assertFalse(zipfile.is_zipfile(artifact))
+                    with self.assertRaisesRegex(RuntimeError, "public scan failed"):
+                        scan_path(artifact)
+
     def test_non_utf8_zip_symlink_target_fails_closed(self) -> None:
         with TemporaryDirectory() as directory:
             artifact = Path(directory) / "link.data"
@@ -262,6 +337,21 @@ class PublicSafetyTests(unittest.TestCase):
                 patch.object(tarfile.TarFile, "extractfile", side_effect=OSError("read failed")),
                 self.assertRaisesRegex(RuntimeError, "public scan failed"),
             ):
+                scan_path(artifact)
+
+    def test_damaged_tar_header_fails_closed(self) -> None:
+        with TemporaryDirectory() as directory:
+            artifact = Path(directory) / "damaged.payload"
+            payload = (credential_line() + "\n").encode()
+            with tarfile.open(artifact, "w") as archive:
+                info = tarfile.TarInfo("payload.txt")
+                info.size = len(payload)
+                archive.addfile(info, io.BytesIO(payload))
+            damage_tar_header_checksum(artifact)
+            with self.assertRaises(tarfile.ReadError):
+                tarfile.open(artifact, "r:*")
+
+            with self.assertRaisesRegex(RuntimeError, "public scan failed"):
                 scan_path(artifact)
 
     def test_zip_reports_unsafe_names_and_escaping_symlink_without_following(self) -> None:
@@ -499,6 +589,38 @@ class PublicSafetyTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 2)
         self.assertEqual(completed.stdout, "")
         self.assertEqual(completed.stderr, "public scan failed\n")
+
+    def test_cli_damaged_archive_structure_is_generic_and_exit_two(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            zip_path = root / "truncated.data"
+            with zipfile.ZipFile(zip_path, "w") as archive:
+                archive.writestr("payload.txt", credential_line() + "\n")
+            truncate_zip_end_record(zip_path)
+
+            tar_path = root / "damaged.payload"
+            payload = (credential_line() + "\n").encode()
+            with tarfile.open(tar_path, "w") as archive:
+                info = tarfile.TarInfo("payload.txt")
+                info.size = len(payload)
+                archive.addfile(info, io.BytesIO(payload))
+            damage_tar_header_checksum(tar_path)
+
+            for artifact in (zip_path, tar_path):
+                with self.subTest(kind=artifact.suffix):
+                    completed = subprocess.run(
+                        [
+                            sys.executable,
+                            str(Path(__file__).parents[1] / "scripts/check_public.py"),
+                            str(artifact),
+                        ],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(completed.returncode, 2)
+                    self.assertEqual(completed.stdout, "")
+                    self.assertEqual(completed.stderr, "public scan failed\n")
 
     def test_scanner_cannot_follow_file_swap_to_symlink(self) -> None:
         with TemporaryDirectory() as directory:

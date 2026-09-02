@@ -20,9 +20,13 @@ PRIVATE_KEY_PATTERN = re.compile(
 CREDENTIAL_PATTERN = re.compile(
     r"(?i)(?<!\w)[\"']?"
     r"(?:api_key|access_token|client_secret|password|secret)"
-    r"[\"']?\s*[:=]\s*(?P<value>.+)$"
+    r"[\"']?\s*[:=](?P<value>.*)$"
 )
 WINDOWS_ABSOLUTE_PATTERN = re.compile(r"^[A-Za-z]:/")
+EMPTY_SCALAR_PATTERN = re.compile(
+    r"(?i)(?:\"\"|''|null(?![\w-])|none(?![\w-])|unset(?![\w-])|~)"
+)
+ZIP_STRUCTURAL_SIGNATURES = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
 READ_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
 DIRECTORY_FLAGS = READ_FLAGS | os.O_DIRECTORY
 
@@ -75,17 +79,40 @@ def _finding(
     )
 
 
+def _empty_container_end(value: str) -> int | None:
+    expected_closers: list[str] = []
+    pairs = {"{": "}", "[": "]"}
+    if not value or value[0] not in pairs:
+        return None
+    for index, character in enumerate(value):
+        if character in pairs:
+            expected_closers.append(pairs[character])
+        elif character in "}]":
+            if not expected_closers or character != expected_closers.pop():
+                return None
+            if not expected_closers:
+                return index + 1
+        elif not character.isspace() and character != ",":
+            return None
+    return None
+
+
 def _nonempty_assignment(match: re.Match[str]) -> bool:
-    value = match.group("value").strip()
-    value = re.sub(r"\s+#.*$", "", value).strip()
-    empty_values = {"", '""', "''", "null", "none", "unset", "~", "{}", "[]"}
-    if value.casefold() in empty_values:
+    value = re.sub(r"\s+#.*$", "", match.group("value")).strip()
+    if value == "":
         return False
-    while value.endswith((",", "}", "]")):
-        value = value[:-1].rstrip()
-        if value.casefold() in empty_values:
-            return False
-    return True
+    empty_scalar = EMPTY_SCALAR_PATTERN.match(value)
+    empty_end = (
+        empty_scalar.end()
+        if empty_scalar is not None
+        else _empty_container_end(value)
+    )
+    if empty_end is None:
+        return True
+    return any(
+        not character.isspace() and character not in ",}]"
+        for character in value[empty_end:]
+    )
 
 
 def _scan_text(
@@ -248,9 +275,13 @@ def _scan_regular_payload(
 ) -> list[Finding]:
     if zipfile.is_zipfile(io.BytesIO(payload)):
         return _scan_zip(payload, display_path, denied_terms)
+    if payload.startswith(ZIP_STRUCTURAL_SIGNATURES):
+        raise PublicScanError()
     try:
         archive = tarfile.open(fileobj=io.BytesIO(payload), mode="r:*")
     except tarfile.ReadError:
+        if len(payload) >= 262 and payload[257:262] == b"ustar":
+            raise PublicScanError() from None
         return _scan_text(payload, display_path, denied_terms)
     except Exception:
         raise PublicScanError() from None
