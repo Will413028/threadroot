@@ -2,7 +2,7 @@
 
 ## Threat model
 
-Threadroot treats the vault as user-owned, potentially sensitive data and its configuration as untrusted input. v0 aims to prevent accidental overwrite, path escape, unintended publication, and ordinary concurrent drift during deterministic CLI operations.
+Threadroot treats the vault as user-owned, potentially sensitive data and its configuration as untrusted input. v0 aims to prevent accidental vault-content overwrite, path escape, unintended publication, and ordinary concurrent drift during deterministic CLI operations.
 
 Threadroot does not defend against a malicious or privileged local process that can replace filesystem entries between validation and use. Operating-system access controls and host isolation remain part of the user's security boundary.
 
@@ -18,7 +18,9 @@ Configuration paths must be relative and must remain within the resolved vault a
 
 ## Non-overwriting writes
 
-`init` and `adopt` preview changes by default and write only with explicit `--apply` intent. Planned files use exclusive creation and are rechecked immediately before use. Existing content is never overwritten, and `doctor` is always read-only.
+`init` and `adopt` preview changes by default and write vault data only with explicit `--apply` intent. Planned vault files use exclusive creation and are rechecked immediately before use. Existing vault content is never overwritten, and `doctor` is always read-only.
+
+With `--apply --set-default`, `init` and `adopt` atomically replace the machine-local default-vault pointer only after the vault operation succeeds. That pointer stores the selected vault location; replacing it does not modify vault content.
 
 ## Partial failures
 

@@ -10,7 +10,7 @@ Your Markdown, Git history, and private context stay in a vault you own. Threadr
 
 | What Threadroot owns | What you own |
 | --- | --- |
-| CLI validation, previews, non-overwriting setup, and structured results | The Markdown vault, its contents, location, permissions, and Git history |
+| CLI validation, previews, non-overwriting vault setup, and structured results | The Markdown vault, its contents, location, permissions, and Git history |
 | One provider-neutral `skills/` tree and thin host manifests | Host account, model, workspace approvals, and data-policy choices |
 | Public source and release artifacts | Backups, review of proposed edits, and publication decisions |
 
@@ -145,7 +145,9 @@ Removing a marketplace entry is optional and separate. None of these uninstall c
 
 ## Safety
 
-No telemetry. The Threadroot runtime makes no network requests, background uploads, or model calls. It previews setup changes, rejects unsafe configured paths, does not overwrite existing files, and leaves partial failures visible for inspection.
+No telemetry. The Threadroot runtime makes no network requests, background uploads, or model calls. It previews setup changes, rejects unsafe configured paths, never overwrites existing vault files or content, and leaves partial failures visible for inspection.
+
+When `init` or `adopt` runs with `--apply --set-default`, Threadroot atomically replaces the machine-local default-vault pointer only after the vault operation succeeds. The pointer stores the selected vault location; replacing it does not modify vault content.
 
 The host model or service may read files you approve and is governed by that host's own data-handling policy. Threadroot's no-network runtime does not change that policy. See [Security](SECURITY.md) for the threat model and reporting guidance.
 

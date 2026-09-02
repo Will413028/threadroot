@@ -64,6 +64,31 @@ def _inline_matrix_values(workflow: str, key: str) -> list[str]:
 
 
 class DocumentationTests(unittest.TestCase):
+    def test_non_overwrite_contract_distinguishes_vault_from_default_pointer(self) -> None:
+        sections = {
+            "README Safety": _section(
+                Path("README.md").read_text(encoding="utf-8"), "Safety"
+            ),
+            "SECURITY Non-overwriting writes": _section(
+                Path("SECURITY.md").read_text(encoding="utf-8"),
+                "Non-overwriting writes",
+            ),
+        }
+        overly_broad_claims = (
+            r"\bdoes not overwrite existing files\b",
+            r"\bexisting content is never overwritten\b",
+        )
+
+        for name, section in sections.items():
+            with self.subTest(section=name):
+                self.assertRegex(section, r"(?i)vault (?:files|content|data)")
+                self.assertIn("--set-default", section)
+                self.assertRegex(section, r"(?i)machine-local default-vault pointer")
+                self.assertRegex(section, r"(?i)atomic(?:ally)? replace")
+                self.assertRegex(section, r"(?i)vault operation (?:has )?succeed")
+                for claim in overly_broad_claims:
+                    self.assertNotRegex(section, rf"(?i){claim}")
+
     def test_public_document_links_resolve_and_fences_are_balanced(self) -> None:
         for source in PUBLIC_DOCUMENTS:
             with self.subTest(document=source.as_posix()):
