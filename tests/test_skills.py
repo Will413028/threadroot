@@ -88,6 +88,12 @@ CORE_COMMANDS = {
     "weekly-review": frozenset(
         {"threadroot --version", "threadroot doctor --json"}
     ),
+    "project-kickoff": frozenset(
+        {"threadroot --version", "threadroot doctor --json"}
+    ),
+    "decision-log": frozenset(
+        {"threadroot --version", "threadroot doctor --json"}
+    ),
 }
 
 DAILY_LIFECYCLE_CONTRACT = {
@@ -112,6 +118,55 @@ DAILY_LIFECYCLE_CONTRACT = {
         "push",
         "bulk rewrite",
     ],
+}
+
+PROJECT_DECISION_CONTRACT = {
+    "name": "project-decision",
+    "request": "Record the decision to use JSON files instead of SQLite or hosted storage for orchard-cli.",
+    "allowed_reads": [
+        "wiki/projects/orchard-cli/index.md",
+    ],
+    "expected_writes": [
+        "wiki/projects/orchard-cli/index.md",
+        "wiki/projects/orchard-cli/decisions/2042-04-03-json-storage.md",
+    ],
+    "required_headings": {
+        "wiki/projects/orchard-cli/index.md": [
+            "Key Decisions",
+        ],
+        "wiki/projects/orchard-cli/decisions/2042-04-03-json-storage.md": [
+            "Options Considered",
+            "Decision",
+            "Rationale",
+        ],
+    },
+    "required_links": {
+        "wiki/projects/orchard-cli/index.md": [
+            "decisions/2042-04-03-json-storage",
+        ],
+        "wiki/projects/orchard-cli/decisions/2042-04-03-json-storage.md": [
+            "../index",
+        ],
+    },
+    "forbidden_actions": [
+        "read secrets",
+        "publish repository",
+        "delete files",
+        "commit",
+        "push",
+    ],
+}
+
+EXPECTED_SKILLS = {
+    "second-brain-setup",
+    "second-brain-doctor",
+    "query",
+    "recording",
+    "morning-review",
+    "daily-wrap-up",
+    "weekly-review",
+    "project-kickoff",
+    "decision-log",
 }
 
 SYNTHETIC_SHARED_CONTRACT = """# Shared Contract
@@ -306,6 +361,62 @@ class WeeklyReviewSkillContractTests(unittest.TestCase):
         self.assertTrue((skill_path.parent / "../README.md").resolve().is_file())
 
 
+class ProjectKickoffSkillContractTests(unittest.TestCase):
+    def test_project_kickoff_structure_and_effective_contract(self) -> None:
+        skill_path = Path("skills/project-kickoff/SKILL.md")
+
+        self.assertTrue(skill_path.is_file(), "project-kickoff skill must exist")
+        skill = load_skill("project-kickoff")
+        self.assertEqual("project-kickoff", skill.name)
+        self.assertTrue(skill.description.startswith("Use when "))
+        self.assertNotRegex(skill.description, r"threadroot\s+doctor")
+        self.assertEqual(
+            ["Inputs", "Procedure", "Safety", "Output"],
+            re.findall(r"^## (.+)$", skill.body, re.MULTILINE),
+        )
+        links = re.findall(r"\[[^]]+\]\(([^)]+)\)", skill.body)
+        self.assertIn("../README.md", links)
+        self.assertTrue((skill_path.parent / "../README.md").resolve().is_file())
+
+        contract = skill_contract.load_effective_contract(
+            skill_path,
+            CORE_COMMANDS["project-kickoff"],
+        )
+        self.assertEqual(CORE_COMMANDS["project-kickoff"], contract.commands)
+        self.assertEqual(
+            {"drift": "stop", "secrets": "never-read"},
+            dict(contract.invariants),
+        )
+
+
+class DecisionLogSkillContractTests(unittest.TestCase):
+    def test_decision_log_structure_and_effective_contract(self) -> None:
+        skill_path = Path("skills/decision-log/SKILL.md")
+
+        self.assertTrue(skill_path.is_file(), "decision-log skill must exist")
+        skill = load_skill("decision-log")
+        self.assertEqual("decision-log", skill.name)
+        self.assertTrue(skill.description.startswith("Use when "))
+        self.assertNotRegex(skill.description, r"threadroot\s+doctor")
+        self.assertEqual(
+            ["Inputs", "Procedure", "Safety", "Output"],
+            re.findall(r"^## (.+)$", skill.body, re.MULTILINE),
+        )
+        links = re.findall(r"\[[^]]+\]\(([^)]+)\)", skill.body)
+        self.assertIn("../README.md", links)
+        self.assertTrue((skill_path.parent / "../README.md").resolve().is_file())
+
+        contract = skill_contract.load_effective_contract(
+            skill_path,
+            CORE_COMMANDS["decision-log"],
+        )
+        self.assertEqual(CORE_COMMANDS["decision-log"], contract.commands)
+        self.assertEqual(
+            {"drift": "stop", "secrets": "never-read"},
+            dict(contract.invariants),
+        )
+
+
 class DailyLifecycleFixtureContractTests(unittest.TestCase):
     def test_daily_lifecycle_fixture_has_exact_serialized_contract(self) -> None:
         path = Path("tests/fixtures/contracts/daily-lifecycle.json")
@@ -317,6 +428,26 @@ class DailyLifecycleFixtureContractTests(unittest.TestCase):
             text,
         )
         self.assertEqual(DAILY_LIFECYCLE_CONTRACT, json.loads(text))
+
+
+class ProjectDecisionFixtureContractTests(unittest.TestCase):
+    def test_project_decision_fixture_has_exact_serialized_contract(self) -> None:
+        path = Path("tests/fixtures/contracts/project-decision.json")
+
+        self.assertTrue(path.is_file(), "project decision fixture must exist")
+        text = path.read_text(encoding="utf-8")
+        self.assertEqual(
+            json.dumps(PROJECT_DECISION_CONTRACT, indent=2) + "\n",
+            text,
+        )
+        self.assertEqual(PROJECT_DECISION_CONTRACT, json.loads(text))
+
+
+class CompleteSkillSetTests(unittest.TestCase):
+    def test_exact_v0_skill_set(self) -> None:
+        actual = {path.parent.name for path in Path("skills").glob("*/SKILL.md")}
+
+        self.assertEqual(EXPECTED_SKILLS, actual)
 
 
 

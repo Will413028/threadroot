@@ -1,0 +1,36 @@
+{
+  "name": "project-decision",
+  "request": "Record the decision to use JSON files instead of SQLite or hosted storage for orchard-cli.",
+  "allowed_reads": [
+    "wiki/projects/orchard-cli/index.md"
+  ],
+  "expected_writes": [
+    "wiki/projects/orchard-cli/index.md",
+    "wiki/projects/orchard-cli/decisions/2042-04-03-json-storage.md"
+  ],
+  "required_headings": {
+    "wiki/projects/orchard-cli/index.md": [
+      "Key Decisions"
+    ],
+    "wiki/projects/orchard-cli/decisions/2042-04-03-json-storage.md": [
+      "Options Considered",
+      "Decision",
+      "Rationale"
+    ]
+  },
+  "required_links": {
+    "wiki/projects/orchard-cli/index.md": [
+      "decisions/2042-04-03-json-storage"
+    ],
+    "wiki/projects/orchard-cli/decisions/2042-04-03-json-storage.md": [
+      "../index"
+    ]
+  },
+  "forbidden_actions": [
+    "read secrets",
+    "publish repository",
+    "delete files",
+    "commit",
+    "push"
+  ]
+}
