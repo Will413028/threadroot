@@ -3,7 +3,14 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from threadroot.operations import PlannedChange, apply_plan, plan_init, run_init
+from threadroot.operations import (
+    PlannedChange,
+    apply_plan,
+    plan_adopt,
+    plan_init,
+    run_adopt,
+    run_init,
+)
 from threadroot.results import ExitCode
 
 
@@ -292,6 +299,158 @@ class InitTests(unittest.TestCase):
             self.assertEqual(result.exit_code, ExitCode.IO_OR_DRIFT)
             self.assertEqual(result.issues[0].code, "filesystem.failed")
 
+
+class AdoptTests(unittest.TestCase):
+    def make_existing_vault(self, root: Path) -> None:
+        for relative in ("daily", "wiki/projects", "wiki/tech", "wiki/reviews"):
+            (root / relative).mkdir(parents=True, exist_ok=True)
+        (root / "wiki/projects/demo/index.md").parent.mkdir(parents=True)
+        (root / "wiki/projects/demo/index.md").write_text("# Synthetic Demo\n", encoding="utf-8")
+
+    def file_snapshot(self, root: Path) -> dict[Path, tuple[bytes, int]]:
+        return {
+            path.relative_to(root): (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in root.rglob("*")
+            if path.is_file()
+        }
+
+    def test_preview_does_not_change_existing_vault(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_existing_vault(root)
+
+            before = self.file_snapshot(root)
+            result = run_adopt(root, apply=False, set_default=False, environ={}, home=root / "home")
+            after = self.file_snapshot(root)
+
+            self.assertTrue(result.ok)
+            self.assertEqual(before, after)
+            self.assertFalse((root / ".second-brain").exists())
+
+    def test_apply_adds_only_marker_without_rewriting_existing_files(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_existing_vault(root)
+            (root / "daily/日記.md").write_text("保留這份筆記\n", encoding="utf-8")
+            (root / "extra.bin").write_bytes(b"\x00synthetic\xff")
+            (root / "AGENTS.md").write_text("unrelated instructions\n", encoding="utf-8")
+            before = self.file_snapshot(root)
+
+            result = run_adopt(root, apply=True, set_default=False, environ={}, home=root / "home")
+            after = self.file_snapshot(root)
+
+            self.assertTrue(result.ok)
+            self.assertEqual(
+                set(path.relative_to(root).as_posix() for path in root.rglob("*")),
+                {
+                    ".second-brain",
+                    ".second-brain/config.json",
+                    "AGENTS.md",
+                    "daily",
+                    "daily/日記.md",
+                    "extra.bin",
+                    "wiki",
+                    "wiki/projects",
+                    "wiki/projects/demo",
+                    "wiki/projects/demo/index.md",
+                    "wiki/reviews",
+                    "wiki/tech",
+                },
+            )
+            self.assertEqual(
+                {path: after[path] for path in before},
+                before,
+            )
+
+    def test_incomplete_layout_lists_missing_directories(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "daily").mkdir()
+
+            result = run_adopt(root, apply=True, set_default=False, environ={}, home=root / "home")
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.exit_code, ExitCode.CONFLICT)
+            self.assertIn("wiki/projects", result.issues[0].message)
+
+    def test_existing_marker_directory_plans_only_config_file(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_existing_vault(root)
+            (root / ".second-brain").mkdir()
+
+            plan = plan_adopt(root)
+            result = run_adopt(root, apply=True, set_default=False, environ={}, home=root / "home")
+
+            self.assertEqual(len(plan), 1)
+            self.assertEqual(plan[0].public_path, ".second-brain/config.json")
+            self.assertTrue(result.ok)
+            self.assertTrue((root / ".second-brain/config.json").is_file())
+
+    def test_existing_custom_marker_is_a_noop_before_default_layout_validation(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            for relative in ("journal", "content/projects", "docs/knowledge", "journal/reviews"):
+                (root / relative).mkdir(parents=True, exist_ok=True)
+            marker = root / ".second-brain/config.json"
+            marker.parent.mkdir()
+            marker.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "paths": {
+                            "daily": "journal",
+                            "projects": "content/projects",
+                            "knowledge": "docs/knowledge",
+                            "reviews": "journal/reviews",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            before = self.file_snapshot(root)
+
+            result = run_adopt(root, apply=True, set_default=False, environ={}, home=root / "home")
+
+            self.assertTrue(result.ok)
+            self.assertEqual(result.changes, ())
+            self.assertEqual(self.file_snapshot(root), before)
+            self.assertFalse((root / "daily").exists())
+
+    def test_escaping_required_directory_symlink_is_unsafe(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "vault"
+            outside = Path(directory) / "outside"
+            self.make_existing_vault(root)
+            outside.mkdir()
+            (root / "wiki/tech").rmdir()
+            (root / "wiki/tech").symlink_to(outside, target_is_directory=True)
+
+            result = run_adopt(root, apply=False, set_default=False, environ={}, home=root / "home")
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.exit_code, ExitCode.UNSAFE_PATH)
+            self.assertFalse((root / ".second-brain").exists())
+
+    def test_second_run_is_noop_without_modifying_marker(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_existing_vault(root)
+            first = run_adopt(root, apply=True, set_default=False, environ={}, home=root / "home")
+            marker = root / ".second-brain/config.json"
+            before = (marker.read_bytes(), marker.stat().st_mtime_ns)
+
+            second = run_adopt(root, apply=True, set_default=False, environ={}, home=root / "home")
+            after = (marker.read_bytes(), marker.stat().st_mtime_ns)
+
+            self.assertTrue(first.ok)
+            self.assertTrue(second.ok)
+            self.assertEqual(second.exit_code, ExitCode.OK)
+            self.assertEqual(second.changes, ())
+            self.assertEqual(after, before)
+
+
+class ApplyPlanTests(unittest.TestCase):
     def test_apply_reports_symlink_loop_as_drift_without_crashing(self) -> None:
         with TemporaryDirectory() as directory:
             vault = (Path(directory) / "vault").resolve()

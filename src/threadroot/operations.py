@@ -31,6 +31,13 @@ _DIRECTORIES = (
     "wiki/reviews",
 )
 
+REQUIRED_ADOPT_DIRECTORIES = (
+    "daily",
+    "wiki/projects",
+    "wiki/tech",
+    "wiki/reviews",
+)
+
 
 @dataclass(frozen=True)
 class PlannedChange:
@@ -110,6 +117,68 @@ def plan_init(vault: Path) -> tuple[PlannedChange, ...]:
         PlannedChange("create_directory", root / relative, relative)
         for relative in _DIRECTORIES
     )
+    changes.append(
+        PlannedChange(
+            "create_file",
+            root / MARKER_RELATIVE,
+            MARKER_RELATIVE.as_posix(),
+            config_text(),
+        )
+    )
+    return tuple(changes)
+
+
+def _validate_existing_adopt_marker(vault: Path) -> None:
+    config = load_config(vault)
+    for relative in (
+        config.paths.daily,
+        config.paths.projects,
+        config.paths.knowledge,
+        config.paths.reviews,
+    ):
+        configured = ensure_within(vault, relative)
+        if not configured.is_dir():
+            raise _config_path_invalid()
+
+
+def plan_adopt(vault: Path) -> tuple[PlannedChange, ...]:
+    root = Path(vault).resolve(strict=False)
+    marker = root / MARKER_RELATIVE
+    if os.path.lexists(marker):
+        _validate_existing_adopt_marker(root)
+        return ()
+
+    if not root.is_dir():
+        raise ThreadrootError(
+            ExitCode.CONFLICT,
+            "layout.unrecognized",
+            "Vault layout is missing or has invalid directories: .",
+        )
+
+    invalid_directories: list[str] = []
+    for relative in REQUIRED_ADOPT_DIRECTORIES:
+        configured = ensure_within(root, relative)
+        if not configured.is_dir():
+            invalid_directories.append(relative)
+    if invalid_directories:
+        raise ThreadrootError(
+            ExitCode.CONFLICT,
+            "layout.unrecognized",
+            "Vault layout is missing or has invalid directories: "
+            + ", ".join(sorted(invalid_directories)),
+        )
+
+    marker_directory = ensure_within(root, ".second-brain")
+    changes: list[PlannedChange] = []
+    if os.path.lexists(root / ".second-brain"):
+        if not marker_directory.is_dir():
+            raise ThreadrootError(
+                ExitCode.CONFLICT,
+                "target.conflict",
+                "The .second-brain marker directory is not a directory.",
+            )
+    else:
+        changes.append(PlannedChange("create_directory", root / ".second-brain", ".second-brain"))
     changes.append(
         PlannedChange(
             "create_file",
@@ -385,6 +454,85 @@ def run_init(
     return CommandResult(
         ok=True,
         command="init",
+        applied=True,
+        vault=str(root),
+        changes=result.changes
+        + (Change("write_default_pointer", "machine-default-pointer", "completed"),),
+    )
+
+
+def run_adopt(
+    vault: Path,
+    apply: bool,
+    set_default: bool,
+    environ: Mapping[str, str],
+    home: Path,
+) -> CommandResult:
+    root = Path(vault).resolve(strict=False)
+    try:
+        vault_plan = plan_adopt(root)
+        pointer_change = (
+            PlannedChange(
+                "write_default_pointer",
+                default_pointer_path(environ, home),
+                "machine-default-pointer",
+            )
+            if set_default
+            else None
+        )
+    except ThreadrootError as error:
+        return _error_result("adopt", root, error)
+
+    full_plan = vault_plan + ((pointer_change,) if pointer_change is not None else ())
+    if not apply:
+        return CommandResult(
+            ok=True,
+            command="adopt",
+            applied=False,
+            vault=str(root),
+            changes=_planned_changes(full_plan),
+        )
+
+    result = apply_plan("adopt", root, vault_plan)
+    if not result.ok:
+        if set_default:
+            return CommandResult(
+                ok=False,
+                command="adopt",
+                applied=result.applied,
+                vault=result.vault,
+                changes=result.changes
+                + (Change("write_default_pointer", "machine-default-pointer", "unexecuted"),),
+                issues=result.issues,
+                exit_code=result.exit_code,
+            )
+        return result
+
+    if not set_default:
+        return result
+    try:
+        write_default_pointer(root, environ, home)
+    except OSError:
+        return CommandResult(
+            ok=False,
+            command="adopt",
+            applied=True,
+            vault=str(root),
+            changes=result.changes
+            + (Change("write_default_pointer", "machine-default-pointer", "unexecuted"),),
+            issues=(
+                Issue(
+                    "error",
+                    "filesystem.failed",
+                    "The default vault pointer could not be written.",
+                    "machine-default-pointer",
+                ),
+            ),
+            exit_code=ExitCode.IO_OR_DRIFT,
+        )
+    return CommandResult(
+        ok=True,
+        command="adopt",
         applied=True,
         vault=str(root),
         changes=result.changes
