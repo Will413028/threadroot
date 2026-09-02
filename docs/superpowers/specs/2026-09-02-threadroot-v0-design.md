@@ -1,6 +1,6 @@
 # Threadroot v0 Design
 
-**Status:** Review requested
+**Status:** Approved
 **Date:** 2026-09-02
 **Product:** Threadroot
 **Tagline:** Root your work across sessions.
