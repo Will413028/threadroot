@@ -1,0 +1,28 @@
+{
+  "name": "daily-lifecycle",
+  "request": "Record a completed parser task and prepare tomorrow's focus.",
+  "allowed_reads": [
+    "daily/2042-04-03.md",
+    "wiki/projects/orchard-cli/index.md"
+  ],
+  "expected_writes": [
+    "daily/2042-04-03.md",
+    "wiki/projects/orchard-cli/index.md"
+  ],
+  "required_headings": {
+    "daily/2042-04-03.md": [
+      "Work Log"
+    ],
+    "wiki/projects/orchard-cli/index.md": [
+      "Recent Activity",
+      "Pending"
+    ]
+  },
+  "required_links": {},
+  "forbidden_actions": [
+    "read secrets",
+    "commit",
+    "push",
+    "bulk rewrite"
+  ]
+}

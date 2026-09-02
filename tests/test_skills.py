@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import re
 import tempfile
@@ -77,6 +78,40 @@ CORE_COMMANDS = {
         {"threadroot --version", "threadroot doctor --json"}
     ),
     "query": frozenset({"threadroot --version", "threadroot doctor --json"}),
+    "recording": frozenset({"threadroot --version", "threadroot doctor --json"}),
+    "morning-review": frozenset(
+        {"threadroot --version", "threadroot doctor --json"}
+    ),
+    "daily-wrap-up": frozenset(
+        {"threadroot --version", "threadroot doctor --json"}
+    ),
+    "weekly-review": frozenset(
+        {"threadroot --version", "threadroot doctor --json"}
+    ),
+}
+
+DAILY_LIFECYCLE_CONTRACT = {
+    "name": "daily-lifecycle",
+    "request": "Record a completed parser task and prepare tomorrow's focus.",
+    "allowed_reads": [
+        "daily/2042-04-03.md",
+        "wiki/projects/orchard-cli/index.md",
+    ],
+    "expected_writes": [
+        "daily/2042-04-03.md",
+        "wiki/projects/orchard-cli/index.md",
+    ],
+    "required_headings": {
+        "daily/2042-04-03.md": ["Work Log"],
+        "wiki/projects/orchard-cli/index.md": ["Recent Activity", "Pending"],
+    },
+    "required_links": {},
+    "forbidden_actions": [
+        "read secrets",
+        "commit",
+        "push",
+        "bulk rewrite",
+    ],
 }
 
 SYNTHETIC_SHARED_CONTRACT = """# Shared Contract
@@ -197,6 +232,91 @@ class QuerySkillContractTests(unittest.TestCase):
         links = re.findall(r"\[[^]]+\]\(([^)]+)\)", skill.body)
         self.assertIn("../README.md", links)
         self.assertTrue((skill_path.parent / "../README.md").resolve().is_file())
+
+
+class RecordingSkillContractTests(unittest.TestCase):
+    def test_recording_frontmatter_sections_and_shared_contract(self) -> None:
+        skill_path = Path("skills/recording/SKILL.md")
+
+        self.assertTrue(skill_path.is_file(), "recording skill must exist")
+        skill = load_skill("recording")
+        self.assertEqual("recording", skill.name)
+        self.assertTrue(skill.description.startswith("Use when "))
+        self.assertNotRegex(skill.description, r"threadroot\s+doctor")
+        self.assertEqual(
+            ["Inputs", "Procedure", "Safety", "Output"],
+            re.findall(r"^## (.+)$", skill.body, re.MULTILINE),
+        )
+        links = re.findall(r"\[[^]]+\]\(([^)]+)\)", skill.body)
+        self.assertIn("../README.md", links)
+        self.assertTrue((skill_path.parent / "../README.md").resolve().is_file())
+
+
+class MorningReviewSkillContractTests(unittest.TestCase):
+    def test_morning_review_frontmatter_sections_and_shared_contract(self) -> None:
+        skill_path = Path("skills/morning-review/SKILL.md")
+
+        self.assertTrue(skill_path.is_file(), "morning-review skill must exist")
+        skill = load_skill("morning-review")
+        self.assertEqual("morning-review", skill.name)
+        self.assertTrue(skill.description.startswith("Use when "))
+        self.assertNotRegex(skill.description, r"threadroot\s+doctor")
+        self.assertEqual(
+            ["Inputs", "Procedure", "Safety", "Output"],
+            re.findall(r"^## (.+)$", skill.body, re.MULTILINE),
+        )
+        links = re.findall(r"\[[^]]+\]\(([^)]+)\)", skill.body)
+        self.assertIn("../README.md", links)
+        self.assertTrue((skill_path.parent / "../README.md").resolve().is_file())
+
+
+class DailyWrapUpSkillContractTests(unittest.TestCase):
+    def test_daily_wrap_up_frontmatter_sections_and_shared_contract(self) -> None:
+        skill_path = Path("skills/daily-wrap-up/SKILL.md")
+
+        self.assertTrue(skill_path.is_file(), "daily-wrap-up skill must exist")
+        skill = load_skill("daily-wrap-up")
+        self.assertEqual("daily-wrap-up", skill.name)
+        self.assertTrue(skill.description.startswith("Use when "))
+        self.assertNotRegex(skill.description, r"threadroot\s+doctor")
+        self.assertEqual(
+            ["Inputs", "Procedure", "Safety", "Output"],
+            re.findall(r"^## (.+)$", skill.body, re.MULTILINE),
+        )
+        links = re.findall(r"\[[^]]+\]\(([^)]+)\)", skill.body)
+        self.assertIn("../README.md", links)
+        self.assertTrue((skill_path.parent / "../README.md").resolve().is_file())
+
+
+class WeeklyReviewSkillContractTests(unittest.TestCase):
+    def test_weekly_review_frontmatter_sections_and_shared_contract(self) -> None:
+        skill_path = Path("skills/weekly-review/SKILL.md")
+
+        self.assertTrue(skill_path.is_file(), "weekly-review skill must exist")
+        skill = load_skill("weekly-review")
+        self.assertEqual("weekly-review", skill.name)
+        self.assertTrue(skill.description.startswith("Use when "))
+        self.assertNotRegex(skill.description, r"threadroot\s+doctor")
+        self.assertEqual(
+            ["Inputs", "Procedure", "Safety", "Output"],
+            re.findall(r"^## (.+)$", skill.body, re.MULTILINE),
+        )
+        links = re.findall(r"\[[^]]+\]\(([^)]+)\)", skill.body)
+        self.assertIn("../README.md", links)
+        self.assertTrue((skill_path.parent / "../README.md").resolve().is_file())
+
+
+class DailyLifecycleFixtureContractTests(unittest.TestCase):
+    def test_daily_lifecycle_fixture_has_exact_serialized_contract(self) -> None:
+        path = Path("tests/fixtures/contracts/daily-lifecycle.json")
+
+        self.assertTrue(path.is_file(), "daily lifecycle fixture must exist")
+        text = path.read_text(encoding="utf-8")
+        self.assertEqual(
+            json.dumps(DAILY_LIFECYCLE_CONTRACT, indent=2) + "\n",
+            text,
+        )
+        self.assertEqual(DAILY_LIFECYCLE_CONTRACT, json.loads(text))
 
 
 
