@@ -15,6 +15,25 @@ from scripts.build_release import build_archive
 
 
 class ReleaseArchiveTests(unittest.TestCase):
+    def make_release_repository(self, root: Path) -> Path:
+        root.mkdir()
+        (root / "pyproject.toml").write_text(
+            '[project]\nversion = "0.1.0"\n', encoding="utf-8"
+        )
+        for relative in (
+            "LICENSE",
+            "README.md",
+            ".claude-plugin/plugin.json",
+            ".claude-plugin/marketplace.json",
+            ".codex-plugin/plugin.json",
+        ):
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("synthetic\n", encoding="utf-8")
+        (root / "skills").mkdir()
+        (root / "templates").mkdir()
+        return root
+
     def test_host_archives_have_exact_native_manifest_and_shared_content(self) -> None:
         common_files = {
             "LICENSE",
@@ -185,6 +204,88 @@ class ReleaseArchiveTests(unittest.TestCase):
                     "threadroot-codex-0.1.0.zip",
                 },
             )
+
+    def test_release_builder_cannot_follow_file_swap_to_symlink(self) -> None:
+        with TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = self.make_release_repository(base / "repository")
+            selected = root / "skills/item.txt"
+            selected.write_text("selected\n", encoding="utf-8")
+            outside = base / "outside.txt"
+            outside.write_text("outside\n", encoding="utf-8")
+            original_read_bytes = Path.read_bytes
+            original_open = os.open
+            swapped = False
+
+            def swap() -> None:
+                nonlocal swapped
+                if not swapped:
+                    selected.unlink()
+                    selected.symlink_to(outside)
+                    swapped = True
+
+            def pathname_read(path: Path) -> bytes:
+                if path == selected:
+                    swap()
+                return original_read_bytes(path)
+
+            def descriptor_open(file: object, flags: int, *args: object, **kwargs: object) -> int:
+                if file == selected.name and kwargs.get("dir_fd") is not None:
+                    swap()
+                return original_open(file, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+            with (
+                patch.object(Path, "read_bytes", autospec=True, side_effect=pathname_read),
+                patch.object(build_release.os, "open", side_effect=descriptor_open),
+                patch.object(build_release, "REPOSITORY_ROOT", root),
+                self.assertRaisesRegex((OSError, ValueError), "changed|symlink|unsafe"),
+            ):
+                build_archive("codex", root / "dist")
+
+            self.assertFalse((root / "dist").exists())
+
+    def test_release_builder_fails_closed_on_directory_component_swap(self) -> None:
+        with TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = self.make_release_repository(base / "repository")
+            nested = root / "skills/nested"
+            nested.mkdir()
+            selected = nested / "item.txt"
+            selected.write_text("selected\n", encoding="utf-8")
+            outside = base / "outside"
+            outside.mkdir()
+            (outside / "item.txt").write_text("outside\n", encoding="utf-8")
+            parked = root / "skills/original"
+            original_read_bytes = Path.read_bytes
+            original_open = os.open
+            swapped = False
+
+            def swap() -> None:
+                nonlocal swapped
+                if not swapped:
+                    nested.rename(parked)
+                    nested.symlink_to(outside, target_is_directory=True)
+                    swapped = True
+
+            def pathname_read(path: Path) -> bytes:
+                if path == selected:
+                    swap()
+                return original_read_bytes(path)
+
+            def descriptor_open(file: object, flags: int, *args: object, **kwargs: object) -> int:
+                if file == nested.name and kwargs.get("dir_fd") is not None:
+                    swap()
+                return original_open(file, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+            with (
+                patch.object(Path, "read_bytes", autospec=True, side_effect=pathname_read),
+                patch.object(build_release.os, "open", side_effect=descriptor_open),
+                patch.object(build_release, "REPOSITORY_ROOT", root),
+                self.assertRaisesRegex((OSError, ValueError), "changed|symlink|unsafe"),
+            ):
+                build_archive("claude", root / "dist")
+
+            self.assertFalse((root / "dist").exists())
 
 
 if __name__ == "__main__":

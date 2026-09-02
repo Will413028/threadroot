@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import io
 import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
+import sys
 import tarfile
 import zipfile
 
@@ -21,6 +23,13 @@ CREDENTIAL_PATTERN = re.compile(
     r"[\"']?\s*[:=]\s*(?P<value>.+)$"
 )
 WINDOWS_ABSOLUTE_PATTERN = re.compile(r"^[A-Za-z]:/")
+READ_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
+DIRECTORY_FLAGS = READ_FLAGS | os.O_DIRECTORY
+
+
+class PublicScanError(RuntimeError):
+    def __init__(self) -> None:
+        super().__init__("public scan failed")
 
 
 @dataclass(frozen=True)
@@ -68,7 +77,15 @@ def _finding(
 
 def _nonempty_assignment(match: re.Match[str]) -> bool:
     value = match.group("value").strip()
-    return value not in {'""', "''"}
+    value = re.sub(r"\s+#.*$", "", value).strip()
+    empty_values = {"", '""', "''", "null", "none", "unset", "~", "{}", "[]"}
+    if value.casefold() in empty_values:
+        return False
+    while value.endswith((",", "}", "]")):
+        value = value[:-1].rstrip()
+        if value.casefold() in empty_values:
+            return False
+    return True
 
 
 def _scan_text(
@@ -153,50 +170,49 @@ def _archive_display(container: str, member: str) -> str:
 
 
 def _scan_zip(
-    path: Path,
+    payload: bytes,
     display_path: str,
     denied_terms: tuple[str, ...],
 ) -> list[Finding]:
     findings: list[Finding] = []
-    with zipfile.ZipFile(path) as archive:
-        for info in sorted(archive.infolist(), key=lambda item: item.filename):
-            member_display = _archive_display(display_path, info.filename)
-            unsafe = _member_name_is_unsafe(info.filename)
-            mode = info.external_attr >> 16
-            is_link = stat.S_ISLNK(mode)
-            if unsafe:
-                findings.append(
-                    _finding("path_escape", member_display, None, denied_terms)
-                )
-            if is_link:
-                try:
-                    target = archive.read(info).decode("utf-8")
-                except (KeyError, OSError, RuntimeError, UnicodeDecodeError):
-                    target = ""
-                if not unsafe and target and _link_escapes(
-                    info.filename, target, relative_to_member=True
-                ):
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            for info in sorted(archive.infolist(), key=lambda item: item.filename):
+                member_display = _archive_display(display_path, info.filename)
+                unsafe = _member_name_is_unsafe(info.filename)
+                mode = info.external_attr >> 16
+                is_link = stat.S_ISLNK(mode)
+                if unsafe:
                     findings.append(
                         _finding("path_escape", member_display, None, denied_terms)
                     )
-                continue
-            if info.is_dir():
-                continue
-            try:
-                payload = archive.read(info)
-            except (KeyError, OSError, RuntimeError, zipfile.BadZipFile):
-                continue
-            findings.extend(_scan_text(payload, member_display, denied_terms))
+                if is_link:
+                    target = archive.read(info).decode("utf-8")
+                    if not unsafe and target and _link_escapes(
+                        info.filename, target, relative_to_member=True
+                    ):
+                        findings.append(
+                            _finding("path_escape", member_display, None, denied_terms)
+                        )
+                    continue
+                if info.is_dir():
+                    continue
+                member_payload = archive.read(info)
+                findings.extend(
+                    _scan_text(member_payload, member_display, denied_terms)
+                )
+    except Exception:
+        raise PublicScanError() from None
     return findings
 
 
-def _scan_tar(
-    path: Path,
+def _scan_open_tar(
+    archive: tarfile.TarFile,
     display_path: str,
     denied_terms: tuple[str, ...],
 ) -> list[Finding]:
     findings: list[Finding] = []
-    with tarfile.open(path, "r:*") as archive:
+    try:
         for member in sorted(archive.getmembers(), key=lambda item: item.name):
             member_display = _archive_display(display_path, member.name)
             unsafe = _member_name_is_unsafe(member.name)
@@ -216,46 +232,144 @@ def _scan_tar(
                 continue
             if not member.isfile():
                 continue
-            try:
-                stream = archive.extractfile(member)
-                payload = b"" if stream is None else stream.read()
-            except (KeyError, OSError, tarfile.TarError):
-                continue
-            findings.extend(_scan_text(payload, member_display, denied_terms))
+            stream = archive.extractfile(member)
+            if stream is None:
+                raise PublicScanError()
+            findings.extend(_scan_text(stream.read(), member_display, denied_terms))
+    except Exception:
+        raise PublicScanError() from None
     return findings
 
 
-def _scan_regular_file(
-    path: Path,
+def _scan_regular_payload(
+    payload: bytes,
     display_path: str,
     denied_terms: tuple[str, ...],
 ) -> list[Finding]:
-    if zipfile.is_zipfile(path):
-        return _scan_zip(path, display_path, denied_terms)
-    if tarfile.is_tarfile(path):
-        return _scan_tar(path, display_path, denied_terms)
-    return _scan_text(path.read_bytes(), display_path, denied_terms)
+    if zipfile.is_zipfile(io.BytesIO(payload)):
+        return _scan_zip(payload, display_path, denied_terms)
+    try:
+        archive = tarfile.open(fileobj=io.BytesIO(payload), mode="r:*")
+    except tarfile.ReadError:
+        return _scan_text(payload, display_path, denied_terms)
+    except Exception:
+        raise PublicScanError() from None
+    with archive:
+        return _scan_open_tar(archive, display_path, denied_terms)
 
 
-def _walk_directory(root: Path) -> list[tuple[Path, str, bool]]:
-    found: list[tuple[Path, str, bool]] = []
+def _stat_signature(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
 
-    def visit(directory: Path) -> None:
-        with os.scandir(directory) as entries:
-            for entry in sorted(entries, key=lambda item: item.name):
-                if entry.name in SKIPPED_DIRECTORIES and not entry.is_symlink():
-                    continue
-                child = Path(entry.path)
-                relative = child.relative_to(root).as_posix()
-                if entry.is_symlink():
-                    found.append((child, relative, True))
-                elif entry.is_dir(follow_symlinks=False):
-                    visit(child)
-                elif entry.is_file(follow_symlinks=False):
-                    found.append((child, relative, False))
 
-    visit(root)
-    return found
+def _lstat_at(parent_fd: int, name: str) -> os.stat_result:
+    try:
+        return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError:
+        raise PublicScanError() from None
+
+
+def _open_at(
+    parent_fd: int,
+    name: str,
+    flags: int,
+    expected: os.stat_result,
+) -> int:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+        opened = os.fstat(descriptor)
+    except OSError:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise PublicScanError() from None
+    if _stat_signature(opened) != _stat_signature(expected):
+        os.close(descriptor)
+        raise PublicScanError()
+    return descriptor
+
+
+def _read_at(parent_fd: int, name: str, expected: os.stat_result) -> bytes:
+    descriptor = _open_at(parent_fd, name, READ_FLAGS, expected)
+    try:
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        after_read = os.fstat(descriptor)
+        current = _lstat_at(parent_fd, name)
+        if (
+            _stat_signature(after_read) != _stat_signature(expected)
+            or _stat_signature(current) != _stat_signature(expected)
+        ):
+            raise PublicScanError()
+        return b"".join(chunks)
+    except OSError:
+        raise PublicScanError() from None
+    finally:
+        os.close(descriptor)
+
+
+def _scan_directory(
+    descriptor: int,
+    prefix: str,
+    denied_terms: tuple[str, ...],
+) -> list[Finding]:
+    try:
+        names = sorted(os.listdir(descriptor))
+    except OSError:
+        raise PublicScanError() from None
+    findings: list[Finding] = []
+    for name in names:
+        display = name if not prefix else f"{prefix}/{name}"
+        metadata = _lstat_at(descriptor, name)
+        if name in SKIPPED_DIRECTORIES and not stat.S_ISLNK(metadata.st_mode):
+            continue
+        if stat.S_ISLNK(metadata.st_mode):
+            findings.append(_finding("symlink_entry", display, None, denied_terms))
+            continue
+        if stat.S_ISDIR(metadata.st_mode):
+            child_fd = _open_at(descriptor, name, DIRECTORY_FLAGS, metadata)
+            try:
+                findings.extend(_scan_directory(child_fd, display, denied_terms))
+                current = _lstat_at(descriptor, name)
+                if _stat_signature(current) != _stat_signature(metadata):
+                    raise PublicScanError()
+            finally:
+                os.close(child_fd)
+            continue
+        if stat.S_ISREG(metadata.st_mode):
+            payload = _read_at(descriptor, name, metadata)
+            findings.extend(_scan_regular_payload(payload, display, denied_terms))
+    return findings
+
+
+def _open_root(path: Path, metadata: os.stat_result, flags: int) -> int:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+    except OSError:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise PublicScanError() from None
+    if _stat_signature(opened) != _stat_signature(metadata):
+        os.close(descriptor)
+        raise PublicScanError()
+    return descriptor
+
+
+def _current_root(path: Path) -> os.stat_result:
+    try:
+        return os.stat(path, follow_symlinks=False)
+    except OSError:
+        raise PublicScanError() from None
 
 
 def _sort_key(finding: Finding) -> tuple[str, int, str]:
@@ -269,19 +383,41 @@ def scan_path(
 ) -> list[Finding]:
     path = Path(path)
     terms = _active_terms(denied_terms)
-    if path.is_symlink():
+    metadata = _current_root(path)
+    if stat.S_ISLNK(metadata.st_mode):
         return [_finding("symlink_entry", path.name, None, terms)]
-    if path.is_dir():
-        findings: list[Finding] = []
-        for child, display, is_link in _walk_directory(path):
-            if is_link:
-                findings.append(_finding("symlink_entry", display, None, terms))
-            else:
-                findings.extend(_scan_regular_file(child, display, terms))
+    if stat.S_ISDIR(metadata.st_mode):
+        descriptor = _open_root(path, metadata, DIRECTORY_FLAGS)
+        try:
+            findings = _scan_directory(descriptor, "", terms)
+            current = _current_root(path)
+            if _stat_signature(current) != _stat_signature(metadata):
+                raise PublicScanError()
+        finally:
+            os.close(descriptor)
         return sorted(findings, key=_sort_key)
-    if path.is_file():
-        return sorted(_scan_regular_file(path, path.name, terms), key=_sort_key)
-    raise FileNotFoundError(path)
+    if stat.S_ISREG(metadata.st_mode):
+        descriptor = _open_root(path, metadata, READ_FLAGS)
+        try:
+            chunks: list[bytes] = []
+            while chunk := os.read(descriptor, 1024 * 1024):
+                chunks.append(chunk)
+            after_read = os.fstat(descriptor)
+            current = _current_root(path)
+            if (
+                _stat_signature(after_read) != _stat_signature(metadata)
+                or _stat_signature(current) != _stat_signature(metadata)
+            ):
+                raise PublicScanError()
+        except OSError:
+            raise PublicScanError() from None
+        finally:
+            os.close(descriptor)
+        return sorted(
+            _scan_regular_payload(b"".join(chunks), path.name, terms),
+            key=_sort_key,
+        )
+    raise PublicScanError()
 
 
 def _read_denylist(path: Path | None) -> tuple[str, ...]:
@@ -306,16 +442,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--denylist", type=Path)
     parser.add_argument("paths", nargs="*", type=Path)
     args = parser.parse_args(argv)
-    denied_terms = _read_denylist(args.denylist)
-    paths = args.paths or [Path(".")]
-    findings = sorted(
-        (
-            finding
-            for scan_target in paths
-            for finding in scan_path(scan_target, denied_terms)
-        ),
-        key=_sort_key,
-    )
+    try:
+        denied_terms = _read_denylist(args.denylist)
+        paths = args.paths or [Path(".")]
+        findings: list[Finding] = []
+        for index, scan_target in enumerate(paths, start=1):
+            scanned = scan_path(scan_target, denied_terms)
+            if len(paths) > 1:
+                scanned = [
+                    Finding(
+                        finding.code,
+                        f"input-{index}/{finding.path}",
+                        finding.line,
+                        finding.message,
+                    )
+                    for finding in scanned
+                ]
+            findings.extend(scanned)
+        findings.sort(key=_sort_key)
+    except (OSError, UnicodeError, PublicScanError):
+        print("public scan failed", file=sys.stderr)
+        return 2
     for finding in findings:
         print(_render(finding))
     return 1 if findings else 0
