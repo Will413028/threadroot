@@ -23,6 +23,9 @@ class ReleaseArchiveTests(unittest.TestCase):
         for relative in (
             "LICENSE",
             "README.md",
+            "CONTRIBUTING.md",
+            "SECURITY.md",
+            "docs/testing.md",
             ".claude-plugin/plugin.json",
             ".claude-plugin/marketplace.json",
             ".codex-plugin/plugin.json",
@@ -38,6 +41,9 @@ class ReleaseArchiveTests(unittest.TestCase):
         common_files = {
             "LICENSE",
             "README.md",
+            "CONTRIBUTING.md",
+            "SECURITY.md",
+            "docs/testing.md",
             ".claude-plugin/marketplace.json",
             *(
                 path.as_posix()
@@ -134,6 +140,10 @@ class ReleaseArchiveTests(unittest.TestCase):
             )
             (root / "LICENSE").write_text("synthetic\n", encoding="utf-8")
             (root / "README.md").write_text("synthetic\n", encoding="utf-8")
+            (root / "CONTRIBUTING.md").write_text("synthetic\n", encoding="utf-8")
+            (root / "SECURITY.md").write_text("synthetic\n", encoding="utf-8")
+            (root / "docs").mkdir()
+            (root / "docs/testing.md").write_text("synthetic\n", encoding="utf-8")
             for relative in (
                 ".claude-plugin/plugin.json",
                 ".claude-plugin/marketplace.json",
@@ -162,6 +172,9 @@ class ReleaseArchiveTests(unittest.TestCase):
             for relative in (
                 "LICENSE",
                 "README.md",
+                "CONTRIBUTING.md",
+                "SECURITY.md",
+                "docs/testing.md",
                 ".claude-plugin/plugin.json",
                 ".claude-plugin/marketplace.json",
                 ".codex-plugin/plugin.json",

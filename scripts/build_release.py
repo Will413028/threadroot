@@ -16,6 +16,9 @@ HOST_MANIFESTS = {
 COMMON_ROOTS = (
     Path("LICENSE"),
     Path("README.md"),
+    Path("CONTRIBUTING.md"),
+    Path("SECURITY.md"),
+    Path("docs/testing.md"),
     Path("skills"),
     Path("templates"),
 )
