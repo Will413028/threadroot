@@ -244,6 +244,80 @@ class EffectiveSkillContractTests(unittest.TestCase):
             dict(contract.invariants),
         )
 
+    def test_valid_multiline_inline_command_is_normalized(self) -> None:
+        load_effective_contract = self._loader()
+        skill = SYNTHETIC_SKILL.replace(
+            "`threadroot --version`",
+            "``threadroot\n--version``",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_fixture(directory, skill=skill)
+
+            contract = load_effective_contract(
+                path,
+                frozenset({"threadroot --version"}),
+            )
+
+        self.assertEqual(frozenset({"threadroot --version"}), contract.commands)
+
+    def test_valid_fences_accept_longer_matching_closers(self) -> None:
+        load_effective_contract = self._loader()
+        fences = {
+            "backtick": "   ```sh\nthreadroot --version\n   ````\n",
+            "tilde": "   ~~~sh\nthreadroot --version\n   ~~~~\n",
+        }
+
+        for name, fence in fences.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                path = self._write_fixture(
+                    directory,
+                    skill=SYNTHETIC_SKILL + "\n" + fence,
+                )
+                contract = load_effective_contract(
+                    path,
+                    frozenset({"threadroot --version"}),
+                )
+                self.assertEqual(
+                    frozenset({"threadroot --version"}),
+                    contract.commands,
+                )
+
+    def test_malformed_or_unaccounted_command_syntax_is_rejected(self) -> None:
+        load_effective_contract = self._loader()
+        mutations = {
+            "multiline inline unknown command": (
+                SYNTHETIC_SKILL + "\nRun ``threadroot\nmigrate``.\n"
+            ),
+            "unclosed inline span": (
+                SYNTHETIC_SKILL + "\nRun ``threadroot --version.\n"
+            ),
+            "mismatched inline delimiter": (
+                SYNTHETIC_SKILL + "\nRun ``threadroot --version`.\n"
+            ),
+            "unclosed backtick fence": (
+                SYNTHETIC_SKILL + "\n```sh\nthreadroot --version\n"
+            ),
+            "unclosed tilde fence": (
+                SYNTHETIC_SKILL + "\n~~~sh\nthreadroot --version\n"
+            ),
+            "mixed fence closing character": (
+                SYNTHETIC_SKILL + "\n```sh\nthreadroot --version\n~~~\n"
+            ),
+            "four-space indented code block": (
+                SYNTHETIC_SKILL + "\n    threadroot migrate\n"
+            ),
+            "bare executable command": SYNTHETIC_SKILL + "\nRun `threadroot`.\n",
+        }
+
+        for name, skill in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                path = self._write_fixture(directory, skill=skill)
+                with self.assertRaises(AssertionError):
+                    load_effective_contract(
+                        path,
+                        frozenset({"threadroot --version"}),
+                    )
+
     def test_synthetic_contract_mutations_are_rejected(self) -> None:
         load_effective_contract = self._loader()
         mutations = {

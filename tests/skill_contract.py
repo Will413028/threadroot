@@ -68,19 +68,21 @@ def _contract_fields(path: Path, text: str) -> dict[str, str]:
 
 def _threadroot_commands(text: str) -> frozenset[str]:
     commands: set[str] = set()
-    inline_spans = re.finditer(
-        r"(?<!`)(?P<fence>`+)(?!`)(?P<code>[^\n]*?)(?<!`)(?P=fence)(?!`)",
-        text,
-    )
-    for match in inline_spans:
-        code = match.group("code").strip()
-        if code.startswith("threadroot "):
-            commands.add(code)
+    accounted_offsets: set[int] = set()
+    lexical_invocation = re.compile(r"(?<![\w-])threadroot(?![\w-])")
 
-    lines = text.splitlines()
+    lines = text.splitlines(keepends=True)
+    line_offsets: list[int] = []
+    offset = 0
+    for line in lines:
+        line_offsets.append(offset)
+        offset += len(line)
+
+    fenced_ranges: list[tuple[int, int]] = []
     index = 0
     while index < len(lines):
-        opener = re.match(r"^ {0,3}(?P<fence>`{3,}|~{3,})", lines[index])
+        line = lines[index].rstrip("\r\n")
+        opener = re.fullmatch(r" {0,3}(?P<fence>`{3,}|~{3,}).*", line)
         if opener is None:
             index += 1
             continue
@@ -89,13 +91,66 @@ def _threadroot_commands(text: str) -> frozenset[str]:
         closer = re.compile(
             rf"^ {{0,3}}{re.escape(fence[0])}{{{len(fence)},}}[ \t]*$"
         )
-        index += 1
-        while index < len(lines) and closer.fullmatch(lines[index]) is None:
-            code = lines[index].strip()
-            if code.startswith("threadroot "):
-                commands.add(code)
+        closing_index = index + 1
+        while closing_index < len(lines):
+            closing_line = lines[closing_index].rstrip("\r\n")
+            if closer.fullmatch(closing_line) is not None:
+                break
+            closing_index += 1
+
+        if closing_index == len(lines):
+            remaining = text[line_offsets[index] :]
+            if lexical_invocation.search(remaining) is not None:
+                raise AssertionError("unclosed fence contains threadroot command syntax")
             index += 1
-        index += 1
+            continue
+
+        fenced_ranges.append(
+            (
+                line_offsets[index],
+                line_offsets[closing_index] + len(lines[closing_index]),
+            )
+        )
+        for body_index in range(index + 1, closing_index):
+            body_line = lines[body_index].rstrip("\r\n")
+            code = body_line.strip()
+            if code == "threadroot" or code.startswith("threadroot "):
+                commands.add(code)
+                accounted_offsets.add(
+                    line_offsets[body_index] + body_line.index("threadroot")
+                )
+        index = closing_index + 1
+
+    segment_start = 0
+    segments: list[tuple[int, int]] = []
+    for fence_start, fence_end in fenced_ranges:
+        segments.append((segment_start, fence_start))
+        segment_start = fence_end
+    segments.append((segment_start, len(text)))
+
+    inline_pattern = re.compile(
+        r"(?<!`)(?P<fence>`+)(?!`)(?P<code>.*?)(?<!`)(?P=fence)(?!`)",
+        re.DOTALL,
+    )
+    for start, end in segments:
+        segment = text[start:end]
+        for match in inline_pattern.finditer(segment):
+            raw_code = match.group("code")
+            code = re.sub(r"\r\n?|\n", " ", raw_code)
+            if code.startswith(" ") and code.endswith(" ") and code.strip(" "):
+                code = code[1:-1]
+            if code == "threadroot" or code.startswith("threadroot "):
+                commands.add(code)
+                invocation = lexical_invocation.search(raw_code)
+                if invocation is not None:
+                    accounted_offsets.add(
+                        start + match.start("code") + invocation.start()
+                    )
+
+    lexical_offsets = {match.start() for match in lexical_invocation.finditer(text)}
+    unaccounted = lexical_offsets - accounted_offsets
+    if unaccounted:
+        raise AssertionError("unaccounted threadroot command syntax")
 
     return frozenset(commands)
 
