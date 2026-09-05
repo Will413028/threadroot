@@ -114,6 +114,8 @@ def _validate_member_table(
         if name in directories or any(
             other != name and (other.startswith(name + "/") or name.startswith(other + "/"))
             for other in files
+        ) or any(
+            directory.startswith(name + "/") for directory in directories
         ):
             raise _fail("unsupported_member", "archive file conflicts with member tree")
 
@@ -313,7 +315,15 @@ def _ensure_directory(root_fd: int, parts: tuple[str, ...]) -> int:
         raise
 
 
-def _exclusive_rename(parent_fd: int, source: str, destination: str) -> None:
+def _exclusive_rename(
+    parent_fd: int, source: str, destination: str, stage_fd: int, identity: os.stat_result
+) -> None:
+    try:
+        pathname = os.stat(source, dir_fd=parent_fd, follow_symlinks=False)
+        if not _same_identity(pathname, identity) or not _same_identity(os.fstat(stage_fd), identity):
+            raise OSError("staging directory changed before publication")
+    except OSError:
+        raise _fail("unsafe_destination", "staging directory changed before publication") from None
     library = ctypes.CDLL(None, use_errno=True)
     source_bytes = os.fsencode(source)
     destination_bytes = os.fsencode(destination)
@@ -406,9 +416,12 @@ def _extract_members(
     stage_identity: os.stat_result | None = None
     try:
         os.mkdir(stage_name, 0o700, dir_fd=parent_fd)
-        created = True
+        pathname_identity = os.stat(stage_name, dir_fd=parent_fd, follow_symlinks=False)
         stage_fd = _open_directory(parent_fd, stage_name)
         stage_identity = os.fstat(stage_fd)
+        if not _same_identity(pathname_identity, stage_identity):
+            raise OSError("staging directory changed before first open")
+        created = True
         try:
             for path, is_directory, mode, payload in members:
                 parts = path.parts
@@ -437,7 +450,7 @@ def _extract_members(
                 finally:
                         os.close(directory_fd)
             os.fchmod(stage_fd, 0o755)
-            _exclusive_rename(parent_fd, stage_name, destination.name)
+            _exclusive_rename(parent_fd, stage_name, destination.name, stage_fd, stage_identity)
             created = False
         finally:
             pass
@@ -527,6 +540,7 @@ def _walk_regular(descriptor: int, prefix: PurePosixPath) -> dict[str, tuple[byt
 
 
 def _source_snapshot(source: Path, roots: list[str]) -> dict[str, tuple[bytes, int]]:
+    root_fd: int | None = None
     try:
         before = os.lstat(source)
         root_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
@@ -555,9 +569,12 @@ def _source_snapshot(source: Path, roots: list[str]) -> dict[str, tuple[bytes, i
                     os.close(parent_fd)
             return result
         finally:
-            os.close(root_fd)
+            pass
     except (OSError, ReleaseArchiveError):
         raise _fail("source_mismatch", "source tree is missing, changed, or unsafe") from None
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
 
 
 def _source_regular_files(source: Path, relative: str) -> dict[str, tuple[bytes, int]]:
@@ -586,9 +603,12 @@ def _parse_header_metadata(payload: bytes) -> object:
     if not payload.endswith(b"\n"):
         raise _fail("metadata_mismatch", "metadata header is not newline terminated")
     try:
-        return BytesParser(policy=email_policy).parsebytes(payload)
+        message = BytesParser(policy=email_policy).parsebytes(payload)
     except Exception:
         raise _fail("metadata_mismatch", "invalid header metadata") from None
+    if message.get_payload() not in {None, ""}:
+        raise _fail("metadata_mismatch", "header metadata has a body")
+    return message
 
 
 def _require_one(message: object, key: str, value: str) -> None:

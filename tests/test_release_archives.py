@@ -123,11 +123,11 @@ def _wheel_payloads(source: Path) -> tuple[list[str], dict[str, bytes]]:
     return order, payloads
 
 
-def _write_wheel(path: Path, order: list[str], payloads: dict[str, bytes]) -> None:
+def _write_wheel(path: Path, order: list[str], payloads: dict[str, bytes], *, regenerate_record: bool = True) -> None:
     prefix = "threadroot-0.1.0.dist-info/"
     record_name = prefix + "RECORD"
     payloads = dict(payloads)
-    if record_name in order:
+    if record_name in order and regenerate_record:
         rows = []
         for name in order:
             if name == record_name:
@@ -447,6 +447,20 @@ class CommonArchiveTests(unittest.TestCase):
             with self.assertRaises(ReleaseArchiveError):
                 extract_regular_tar(artifact, root / "other")
 
+            overridden = root / "override.tar"
+            output = io.BytesIO()
+            with tarfile.open(fileobj=output, mode="w", format=tarfile.PAX_FORMAT, pax_headers={"comment": "commit-sha"}) as archive:
+                info = tarfile.TarInfo("safe/file.txt")
+                info.mode = 0o644
+                info.size = 5
+                info.pax_headers = {"path": "renamed/file.txt"}
+                archive.addfile(info, io.BytesIO(b"safe\n"))
+            overridden.write_bytes(output.getvalue())
+            with tarfile.open(overridden, "r:") as archive:
+                self.assertEqual(archive.getmembers()[0].pax_headers["path"], "renamed/file.txt")
+            with self.assertRaises(ReleaseArchiveError):
+                extract_regular_tar(overridden, root / "override-out", expected_global_comment="commit-sha")
+
     def test_tar_rejects_unsafe_duplicate_link_special_mode_and_archive_data(self) -> None:
         regular = ("safe/file.txt", b"safe\n", 0o644, tarfile.REGTYPE)
         cases = {
@@ -508,6 +522,8 @@ class CommonArchiveTests(unittest.TestCase):
                 ("file-descendant", [("safe/file", b"x", 0o644, tarfile.REGTYPE), ("safe", b"x", 0o644, tarfile.REGTYPE)]),
                 ("directory-duplicate", [("safe/", b"", 0o755, tarfile.DIRTYPE), ("safe", b"", 0o755, tarfile.DIRTYPE)]),
                 ("file-trailing-slash", [("safe/file/", b"x", 0o644, tarfile.REGTYPE)]),
+                ("file-before-descendant-dir", [("a", b"x", 0o644, tarfile.REGTYPE), ("a/b", b"", 0o755, tarfile.DIRTYPE)]),
+                ("descendant-dir-before-file", [("a/b", b"", 0o755, tarfile.DIRTYPE), ("a", b"x", 0o644, tarfile.REGTYPE)]),
             ):
                 with self.subTest(case=label):
                     artifact = root / f"{label}.tar"
@@ -596,17 +612,59 @@ class CommonArchiveTests(unittest.TestCase):
             destination = root / "out"
             original = getattr(release_archives, "_exclusive_rename", None)
 
-            def race(parent_fd: int, stage_name: str, destination_name: str) -> None:
+            def race(parent_fd: int, stage_name: str, destination_name: str, stage_fd: int, identity: os.stat_result) -> None:
                 os.mkdir(destination_name, dir_fd=parent_fd)
                 if original is None:
                     return
-                original(parent_fd, stage_name, destination_name)
+                original(parent_fd, stage_name, destination_name, stage_fd, identity)
 
             with patch.object(release_archives, "_exclusive_rename", side_effect=race, create=True):
                 with self.assertRaises(ReleaseArchiveError):
                     extract_regular_tar(artifact, destination)
             self.assertTrue(destination.is_dir())
             self.assertEqual(list(destination.iterdir()), [])
+
+    def test_staging_replacement_before_first_open_is_not_owned_or_removed(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "artifact.tar"
+            artifact.write_bytes(_tar_bytes([("safe/file", b"safe", 0o644, tarfile.REGTYPE)]))
+            original_open = os.open
+            replacement: Path | None = None
+
+            def race(path: object, flags: int, *args: object, **kwargs: object) -> int:
+                nonlocal replacement
+                if isinstance(path, str) and path.startswith(".out.stage-") and replacement is None:
+                    stage = root / path
+                    stage.rename(root / "owned-parked")
+                    stage.mkdir()
+                    (stage / "competitor").write_text("keep")
+                    replacement = stage
+                return original_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+            with patch("scripts.release_archives.os.open", side_effect=race), self.assertRaises(ReleaseArchiveError):
+                extract_regular_tar(artifact, root / "out")
+            self.assertEqual((replacement / "competitor").read_text(), "keep")  # type: ignore[operator]
+
+    def test_staging_replacement_before_publication_is_not_published_or_removed(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "artifact.tar"
+            artifact.write_bytes(_tar_bytes([("safe/file", b"safe", 0o644, tarfile.REGTYPE)]))
+            original = release_archives._exclusive_rename
+            replacement: Path | None = None
+
+            def race(parent_fd: int, stage: str, destination: str, stage_fd: int, identity: os.stat_result) -> None:
+                nonlocal replacement
+                (root / stage).rename(root / "owned-parked")
+                (root / stage).mkdir()
+                (root / stage / "competitor").write_text("keep")
+                replacement = root / stage
+                original(parent_fd, stage, destination, stage_fd, identity)
+
+            with patch.object(release_archives, "_exclusive_rename", side_effect=race), self.assertRaises(ReleaseArchiveError):
+                extract_regular_tar(artifact, root / "out")
+            self.assertEqual((replacement / "competitor").read_text(), "keep")  # type: ignore[operator]
 
     def test_destination_parent_identity_is_bound_across_open(self) -> None:
         with TemporaryDirectory() as directory:
@@ -664,6 +722,68 @@ class CommonArchiveTests(unittest.TestCase):
 
 
 class WheelContractTests(unittest.TestCase):
+    def test_source_root_identity_mismatch_closes_descriptor(self) -> None:
+        with TemporaryDirectory() as directory:
+            source = _make_wheel_source(Path(directory))
+            original_open = os.open
+            captured: list[int] = []
+
+            def tracking_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+                descriptor = original_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+                if Path(path) == source:  # type: ignore[arg-type]
+                    captured.append(descriptor)
+                return descriptor
+
+            with patch("scripts.release_archives.os.open", side_effect=tracking_open), patch(
+                "scripts.release_archives._same_identity", return_value=False
+            ), self.assertRaises(ReleaseArchiveError):
+                release_archives._source_snapshot(source, ["README.md"])
+            self.assertEqual(len(captured), 1)
+            with self.assertRaises(OSError):
+                os.fstat(captured[0])
+
+    def test_wheel_rejects_nonempty_wheel_metadata_body(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _make_wheel_source(root)
+            order, payloads = _wheel_payloads(source)
+            valid = root / "valid.whl"
+            _write_wheel(valid, order, payloads)
+            validate_wheel(valid, source, "0.1.0", WHEEL_EPOCH)
+            wheel_name = "threadroot-0.1.0.dist-info/WHEEL"
+            payloads[wheel_name] += b"unexpected body\n"
+            artifact = root / "body.whl"
+            _write_wheel(artifact, order, payloads)
+            with self.assertRaises(ReleaseArchiveError):
+                validate_wheel(artifact, source, "0.1.0", WHEEL_EPOCH)
+
+    def test_wheel_rejects_malformed_record_fields_without_regeneration(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _make_wheel_source(root)
+            order, original = _wheel_payloads(source)
+            record = "threadroot-0.1.0.dist-info/RECORD"
+            valid = root / "valid.whl"
+            _write_wheel(valid, order, original, regenerate_record=False)
+            validate_wheel(valid, source, "0.1.0", WHEEL_EPOCH)
+            rows = original[record].decode().splitlines()
+            mutations = {
+                "digest": rows[0].replace("sha256=", "sha256=x", 1),
+                "size": rows[0].rsplit(",", 1)[0] + ",999",
+                "self": rows[-1] + "sha256=x,1",
+            }
+            for label, changed in mutations.items():
+                with self.subTest(label=label):
+                    payloads = dict(original)
+                    changed_rows = list(rows)
+                    changed_rows[0 if label != "self" else -1] = changed
+                    payloads[record] = ("\n".join(changed_rows) + "\n").encode()
+                    self.assertNotEqual(payloads[record], original[record])
+                    artifact = root / f"record-{label}.whl"
+                    _write_wheel(artifact, order, payloads, regenerate_record=False)
+                    with self.assertRaises(ReleaseArchiveError) as raised:
+                        validate_wheel(artifact, source, "0.1.0", WHEEL_EPOCH)
+                    self.assertEqual(raised.exception.code, "record_mismatch")
     def test_wheel_rejects_source_swap_at_descriptor_open(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
