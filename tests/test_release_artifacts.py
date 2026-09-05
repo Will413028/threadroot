@@ -12,6 +12,7 @@ from scripts.release_artifacts import (
     compare_artifact_sets,
     expected_asset_names,
 )
+from tests.test_release_archives import WHEEL_EPOCH, _make_sdist_source, _sdist_entries, _write_sdist
 
 
 class ArtifactSetTests(unittest.TestCase):
@@ -62,7 +63,9 @@ def _make_source(root: Path) -> Path:
     (source / "tools/release/Dockerfile").write_text("FROM synthetic\n", encoding="utf-8")
     (source / "requirements").mkdir()
     (source / "requirements/release.txt").write_text(
-        "build==1.6.0 \\\n+    --hash=sha256:" + "0" * 64 + "\n",
+        "--only-binary=:all:\n"
+        + "build==1.6.0 " + "\\\n"
+        + "    --hash=sha256:" + "0" * 64 + "\n",
         encoding="utf-8",
     )
     return source
@@ -82,10 +85,70 @@ def _fake_extract(_artifact: Path, destination: Path, **_kwargs: object) -> None
 
 
 class BuildAndVerifyTests(unittest.TestCase):
+    def test_scanner_uses_sanitized_environment_and_all_explicit_roots(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_a = root / "a"
+            source_b = root / "b"
+            source_a.mkdir()
+            source_b.mkdir()
+            (source_a / "scripts").mkdir()
+            scanner = source_a / "scripts/check_public.py"
+            scanner.write_text("# scanner\n", encoding="utf-8")
+            candidate = root / "candidate"
+            _seed_candidate(candidate)
+            unpacked = root / "unpacked"
+            for name in ("wheel", "sdist", "claude", "codex"):
+                (unpacked / name).mkdir(parents=True)
+            artifacts = ArtifactSet.load(candidate, "0.1.0")
+            with patch.object(release_artifacts.subprocess, "run") as run:
+                release_artifacts._scan(source_a, source_b, artifacts, unpacked, None)
+            command = run.call_args.args[0]
+            self.assertEqual(command[0], release_artifacts.sys.executable)
+            self.assertEqual(command[1], str(scanner))
+            self.assertEqual(command[2:], [str(source_a), str(source_b), *[str(candidate / name) for name in expected_asset_names("0.1.0")], *[str(unpacked / name) for name in ("wheel", "sdist", "claude", "codex")]])
+            self.assertEqual(run.call_args.kwargs["env"], {"PATH": release_artifacts.os.environ.get("PATH", ""), "PYTHONHASHSEED": "0", "LC_ALL": "C.UTF-8", "LANG": "C.UTF-8", "TZ": "UTC"})
+
+    def test_release_lock_parser_rejects_malformed_duplicate_and_extra_lines(self) -> None:
+        with TemporaryDirectory() as directory:
+            lock = Path(directory) / "release.txt"
+            valid = "--only-binary=:all:\npackage==1.0 \\\n+    --hash=sha256:" + "0" * 64 + "\n"
+            for mutation in (
+                valid.replace("package==1.0", "package==1.0\npackage==1.0"),
+                valid.replace("--only-binary=:all:", "--index-url=https://example.invalid"),
+                valid.replace("--hash=sha256:", "--hash=sha256:not-a-digest"),
+            ):
+                lock.write_text(mutation, encoding="utf-8")
+                with self.assertRaises(ReleaseArtifactError):
+                    release_artifacts._read_lock_versions(lock)
+
+    def test_real_task3_sdist_validates_replays_and_unpacks_without_pax_comment(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _make_sdist_source(root)
+            sdist = root / "threadroot-0.1.0.tar.gz"
+            _write_sdist(sdist, _sdist_entries(source), gzip_mtime=WHEEL_EPOCH)
+            release_artifacts.validate_sdist(sdist, source, "0.1.0", WHEEL_EPOCH)
+            candidate = root / "candidate"
+            _seed_candidate(candidate)
+            (candidate / "threadroot-0.1.0.tar.gz").write_bytes(sdist.read_bytes())
+            artifacts = ArtifactSet.load(candidate, "0.1.0")
+            evidence = root / "evidence"
+            evidence.mkdir()
+
+            def fake_run(_command: list[str], _environment: dict[str, str]) -> None:
+                replay = evidence / "replay-wheel" / artifacts.wheel.name
+                replay.write_bytes(artifacts.wheel.read_bytes())
+
+            with patch.object(release_artifacts, "_run", side_effect=fake_run):
+                release_artifacts._replay_sdist(artifacts, evidence, WHEEL_EPOCH)
+            release_artifacts.extract_regular_tar(sdist, evidence / "unpacked")
+            self.assertTrue((evidence / "unpacked" / "threadroot-0.1.0" / "PKG-INFO").is_file())
+
     def test_environment_gate_rejects_missing_canonical_flag(self) -> None:
         with patch.dict(release_artifacts.os.environ, {}, clear=True):
             with self.assertRaisesRegex(ReleaseArtifactError, "environment is not enabled"):
-                release_artifacts._validate_environment(0)
+                release_artifacts._validate_environment(0, release_artifacts.EXPECTED_PACKAGES)
 
     def test_input_gate_rejects_shared_source_root(self) -> None:
         with TemporaryDirectory() as directory:
@@ -246,7 +309,7 @@ class BuildAndVerifyTests(unittest.TestCase):
                 patch.object(release_artifacts, "_run", side_effect=fake_run),
             ):
                 with self.assertRaisesRegex(ReleaseArtifactError, "replay bytes differ"):
-                    release_artifacts._replay_sdist(artifacts, evidence, "a" * 40, 1)
+                    release_artifacts._replay_sdist(artifacts, evidence, 1)
 
     def test_copy_failure_leaves_only_pending_promotion_directory(self) -> None:
         with TemporaryDirectory() as directory:
@@ -259,20 +322,33 @@ class BuildAndVerifyTests(unittest.TestCase):
                 for name in expected_asset_names("0.1.0")
             }
             calls = 0
-            original_copy = release_artifacts.shutil.copyfile
+            original_write = release_artifacts.os.write
 
-            def failing_copy(source: Path, destination: Path) -> None:
+            def failing_write(descriptor: int, payload: bytes) -> int:
                 nonlocal calls
                 calls += 1
                 if calls == 2:
                     raise OSError("synthetic copy failure")
-                original_copy(source, destination)
+                return original_write(descriptor, payload)
 
-            with patch.object(release_artifacts.shutil, "copyfile", side_effect=failing_copy):
+            with patch.object(release_artifacts.os, "write", side_effect=failing_write):
                 with self.assertRaisesRegex(ReleaseArtifactError, "promotion failed"):
                     release_artifacts._promote(root, artifacts, hashes)
             self.assertTrue((root / "selected.pending").is_dir())
             self.assertFalse((root / "selected").exists())
+
+    def test_promotion_rejects_existing_broken_selected_link(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidate = root / "candidate"
+            _seed_candidate(candidate)
+            artifacts = ArtifactSet.load(candidate, "0.1.0")
+            hashes = {name: release_artifacts._sha256(candidate / name) for name in expected_asset_names("0.1.0")}
+            (root / "selected").symlink_to(root / "missing")
+            with self.assertRaisesRegex(ReleaseArtifactError, "already exists"):
+                release_artifacts._promote(root, artifacts, hashes)
+            self.assertTrue((root / "selected").is_symlink())
+            self.assertFalse((root / "selected.pending").exists())
 
     def test_build_and_verify_rejects_invalid_commit_before_output_creation(self) -> None:
         with TemporaryDirectory() as directory:
