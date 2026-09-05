@@ -10,6 +10,17 @@ PYTHONPATH=src:. python -m unittest discover -s tests -v
 
 Run the suite on every supported Python minor version available locally. CI defines the complete macOS/Linux and Python 3.11–3.14 matrix.
 
+Run the final-review safety regressions without launching a model:
+
+```bash
+PYTHONPATH=src:. python -m unittest tests.test_final_safety -v
+PYTHONPATH=src:. python -m unittest tests.test_claim -v
+PYTHONPATH=src:. python -m unittest tests.test_claim_workflows -v
+PYTHONPATH=src:. python -m unittest tests.test_contracts.MarkdownFenceTests -v
+```
+
+These cover lexical/resolved secrets and marker boundaries, filesystem translation and init exit `4`, pointer-overlap zero-write rejection and owned-temp cleanup, exclusive claim collision/parent/config/root behavior, and read-only doctor remediation. The claim trace oracle checks exact metadata/result events and safe stopping; it does not prove that a model follows the skills or that generic native Write is exclusive.
+
 ## Build and inspect artifacts
 
 Build a wheel, source distribution, and both host archives from a clean tree:
@@ -23,16 +34,27 @@ python -m zipfile -l dist/threadroot-codex-0.1.0.zip
 
 The wheel contains the CLI. The source distribution contains the public source tree. Each host ZIP contains the shared skills, templates, public entry documents, marketplace catalog, and only that host's native manifest.
 
+For an offline verification wave, use an already-installed `build` environment with setuptools `>=69` and run `python -m build --no-isolation`. Do not install missing build tools or interpreters through the network without separate authorization. Verify updated shared skill bytes in both archives and new safety/claim tests in the source distribution; versions, runtime dependencies and manifests are unchanged by claim.
+
 Use a disposable virtual environment for the wheel smoke test:
 
 ```bash
 threadroot_wheel_test_root="$(mktemp -d)"
 python3 -m venv "$threadroot_wheel_test_root/venv"
-"$threadroot_wheel_test_root/venv/bin/python" -m pip install --no-deps --force-reinstall dist/threadroot-0.1.0-py3-none-any.whl
+"$threadroot_wheel_test_root/venv/bin/python" -m pip install --no-index --no-deps --force-reinstall dist/threadroot-0.1.0-py3-none-any.whl
 "$threadroot_wheel_test_root/venv/bin/threadroot" --version
 ```
 
 Leave the temporary directory for operating-system cleanup; do not use a broad recursive delete command.
+
+Against an existing configured synthetic vault with a daily parent, run claim smoke:
+
+```bash
+threadroot claim --path daily/2042-04-03.md --vault ./synthetic-vault --json
+threadroot claim --path daily/2042-04-03.md --vault ./synthetic-vault --json --apply
+```
+
+Require pure preview (target absent), then one empty regular reservation. Parse exactly the six result keys `ok`, `command`, `applied`, `vault`, `changes`, `issues`: success has `ok=true`, `command=claim`, the diagnosed vault, no issues, and one `create_file` change for the exact target (`planned`/`applied=false` in preview, `completed`/`applied=true` in apply). Repeat apply and require exit `5` with unchanged bytes. Claim never receives note text or creates parents; unsafe paths return `4`, filesystem failures and post-planning collisions return `6`.
 
 ## Public-safety scans
 
@@ -41,6 +63,7 @@ Scan the checkout, the complete distribution directory, and each release artifac
 ```bash
 python scripts/check_public.py .
 python scripts/check_public.py dist
+python scripts/check_public.py dist/threadroot-0.1.0-py3-none-any.whl
 python scripts/check_public.py dist/threadroot-0.1.0.tar.gz
 python scripts/check_public.py dist/threadroot-claude-0.1.0.zip
 python scripts/check_public.py dist/threadroot-codex-0.1.0.zip
@@ -55,6 +78,8 @@ python scripts/check_public.py --denylist /path/to/untracked-denylist.txt . dist
 Never print, commit, or copy the denylist into an artifact.
 
 ## Native host validation
+
+Local no-model validation is distinct from installation or model execution. Run it only when the installed host can stay offline and all runtime configuration/cache writes are contained in disposable roots. Do not assume that an earlier authorization to run a host permits a fresh model/network run or normal host-state mutation. Otherwise report the gate unexecuted.
 
 Validate the Claude manifest and skills when Claude Code is installed:
 
@@ -76,6 +101,8 @@ Require all commands to exit zero and the final JSON to mark `threadroot@threadr
 ## Synthetic cross-host contracts
 
 The structural contract tooling uses only the executable ten-field cases under `tests/fixtures/contracts`. A case declares its synthetic directories and exact initial file bytes separately from its request, allowed semantic reads, expected writes, required headings and document links, forbidden actions, and forbidden paths. The checker hashes bytes, records file kinds and empty directories, and compares normalized Markdown structure without scoring or comparing generated prose.
+
+Structural extraction ignores backtick and tilde fenced blocks (including longer/indented fences), so examples cannot satisfy real headings or links. Optional ATX closing hashes are normalized; literal trailing hashes remain. This is a lightweight structural checker, not a general Markdown renderer.
 
 Run its focused automated tests without launching a model:
 
@@ -119,6 +146,10 @@ After obtaining explicit authorization to launch each installed host and incur i
 17. Confirm the secrets sentinel and all unrelated bytes remain unchanged. Do not open or print the sentinel while reviewing results.
 
 Generated vaults, prompts containing real context, host transcripts, private paths, and diffs must remain outside Git.
+
+### Fresh claim behavior manual checkpoint
+
+Fresh Claude/Codex model or network synthetic runs require separate explicit authorization; prior runs do not verify the new claim protocol. Until authorized, mark all nine cases unexecuted: missing daily claim; missing review claim; kickoff/ADR with pre-existing parents; unsupported command or missing executable; invalid/mismatched preview/apply JSON; competing empty reservation; changed identity or size; native-edit failure preserving the reservation; outside-vault adapter without exclusive capability. Use only isolated synthetic roots and the existing host-containment rules above. Audit recorded metadata events with `validate_claim_trace(events, expected_vault=diagnosed_vault, expected_path=approved_relative_target)` and final files with the structural checker; neither oracle output nor earlier generic Write success substitutes for fresh host behavior evidence. Do not copy credentials, launch new models, repeat private dogfood, or install a live registry to close an unauthorized gate.
 
 ## Private dogfood records
 

@@ -2,7 +2,7 @@
 
 Root your work across sessions.
 
-Threadroot is a local-first second-brain developer tool for people who work with coding agents. It combines nine portable Agent Skills with a small deterministic CLI for setting up, adopting, and checking a Markdown vault.
+Threadroot is a local-first second-brain developer tool for people who work with coding agents. It combines nine portable Agent Skills with a small deterministic CLI for setting up, adopting, checking a Markdown vault, and exclusively reserving new files.
 
 Your Markdown, Git history, and private context stay in a vault you own. Threadroot supplies workflows and safety checks; it is not a hosted memory service and does not copy your vault into its installation.
 
@@ -119,6 +119,21 @@ Check either vault without writing:
 threadroot doctor --vault "$SECOND_BRAIN_ROOT"
 ```
 
+## Reserve a new vault file
+
+The command surface is `threadroot claim --path <vault-relative-file> [--vault <path>] [--apply] [--json]`. Claim accepts no note bytes and creates no parent directories. The target must be strictly inside exactly one configured content root, outside `secrets` and the marker namespace, with an existing safe directory parent.
+
+For an existing configured synthetic vault with a daily parent, preview first:
+
+```bash
+threadroot claim --path daily/2042-04-03.md --vault ./synthetic-vault --json
+threadroot claim --path daily/2042-04-03.md --vault ./synthetic-vault --json --apply
+```
+
+Preview writes nothing. Apply exclusively creates one zero-byte regular file using OS `O_EXCL` semantics; it does not write a note. A target already present at planning gives exit `5`; unsafe paths give `4`; filesystem failure or a collision after planning gives `6`, with completed/unexecuted changes visible in the structured result.
+
+The five file-creating skills finish a draft, validate successful claim preview/apply JSON for the exact target, verify the empty regular reservation's unchanged file identity using native metadata, then fill it through the host's native edit mechanism. Missing/unsupported claim capability, malformed output, failed verification, or collision stops the workflow without a generic Write fallback. A reservation or partial edit left after failure stays visible and is reported, never deleted or reused by pretending it was an existing-file edit. Outside-vault adapters require independent native exclusive creation or are omitted.
+
 ## Skills
 
 - `daily-wrap-up`
@@ -148,6 +163,8 @@ Removing a marketplace entry is optional and separate. None of these uninstall c
 No telemetry. The Threadroot runtime makes no network requests, background uploads, or model calls. It previews setup changes, rejects unsafe configured paths, never overwrites existing vault files or content, and leaves partial failures visible for inspection.
 
 When `init` or `adopt` runs with `--apply --set-default`, Threadroot atomically replaces the machine-local default-vault pointer only after the vault operation succeeds. The pointer stores the selected vault location; replacing it does not modify vault content.
+
+A pointer destination equal to or inside the vault, including through a parent symlink, is rejected before any setup or pointer write. `doctor` remains read-only and supplies concrete remediation for each error.
 
 The host model or service may read files you approve and is governed by that host's own data-handling policy. Threadroot's no-network runtime does not change that policy. See [Security](SECURITY.md) for the threat model and reporting guidance.
 
