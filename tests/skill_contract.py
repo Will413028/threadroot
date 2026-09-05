@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+
 from dataclasses import dataclass
 from pathlib import Path
 import re
 
 
 CONTRACT_KEYS = {
+    "new-file",
+    "claim-failure",
+    "claim-verification",
+    "partial-state",
+    "outside-vault-create",
     "extends",
     "drift",
     "secrets",
@@ -145,7 +152,15 @@ def load_effective_contract(
         raise AssertionError(f"{shared_path} must not extend another contract")
 
     invariants = shared | local
-    required = {"drift": "stop", "secrets": "never-read"}
+    required = {
+        "drift": "stop",
+        "secrets": "never-read",
+        "new-file": "claim-verify-native-edit",
+        "claim-failure": "stop",
+        "claim-verification": "same-identity-empty-regular",
+        "partial-state": "preserve-and-report",
+        "outside-vault-create": "independent-native-exclusive-or-omit"
+    }
     for key, value in required.items():
         if invariants.get(key) != value:
             raise AssertionError(
@@ -164,3 +179,88 @@ def load_effective_contract(
         commands=commands,
         invariants=tuple(sorted(invariants.items())),
     )
+
+
+def _claim_result_pair(event: Mapping[str, object], applied: bool) -> tuple[str, str] | None:
+    result = event.get("result")
+    if (type(event.get("exit")) is not int or event["exit"] != 0
+            or type(result) is not dict
+            or set(result) != {"ok", "command", "applied", "vault", "changes", "issues"}):
+        return None
+    if (result["ok"] is not True or result["applied"] is not applied
+            or result["command"] != "claim" or result["issues"] != []
+            or type(result["vault"]) is not str or not result["vault"]):
+        return None
+    changes = result["changes"]
+    if type(changes) is not list or len(changes) != 1 or type(changes[0]) is not dict:
+        return None
+    change = changes[0]
+    if (set(change) != {"action", "path", "status"}
+            or change["action"] != "create_file"
+            or change["status"] != ("completed" if applied else "planned")
+            or type(change["path"]) is not str or not change["path"]):
+        return None
+    return result["vault"], change["path"]
+
+
+def validate_claim_trace(
+    events: Sequence[Mapping[str, object]], *,
+    expected_vault: str = "/synthetic/vault",
+    expected_path: str = "daily/2042-04-03.md",
+) -> tuple[str, ...]:
+    state = "preview"
+    pair = (expected_vault, expected_path)
+    identity: list[int] | None = None
+    partial = False
+    failure = ("claim.unsafe-continuation",)
+    for event in events:
+        kind = event.get("kind")
+        if kind == "stop":
+            if (set(event) != {"kind", "partial"} or state != "stop"
+                    or event.get("partial") is not partial):
+                return failure
+            state = "done"
+            continue
+        if state in ("stop", "done"):
+            return failure
+        if state in ("preview", "apply"):
+            if kind != state or set(event) != {"kind", "exit", "result"}:
+                return failure
+            applying = state == "apply"
+            if applying:
+                result = event.get("result")
+                changes = result.get("changes", []) if type(result) is dict else []
+                completed = type(changes) is list and any(
+                    type(change) is dict and change.get("status") == "completed"
+                    for change in changes
+                )
+                partial = event.get("exit") == 0 or completed
+            observed = _claim_result_pair(event, applying)
+            if observed != pair:
+                state = "stop"
+            elif applying:
+                state = "verify-first"
+            else:
+                state = "apply"
+        elif state in ("verify-first", "verify-second"):
+            if kind != "verify":
+                return failure
+            observed = event.get("identity")
+            valid = (set(event) == {"kind", "identity", "regular", "size"}
+                     and type(observed) is list and len(observed) == 2
+                     and all(type(value) is int for value in observed)
+                     and event.get("regular") is True
+                     and type(event.get("size")) is int and event["size"] == 0)
+            if not valid or (state == "verify-second" and observed != identity):
+                state = "stop"
+            elif state == "verify-first":
+                identity = list(observed)
+                state = "verify-second"
+            else:
+                state = "edit"
+        elif state == "edit":
+            if (kind != "native-edit" or set(event) != {"kind", "ok"}
+                    or type(event.get("ok")) is not bool):
+                return failure
+            state = "done" if event["ok"] else "stop"
+    return () if state == "done" else failure

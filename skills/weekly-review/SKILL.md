@@ -11,6 +11,8 @@ extends=../README.md
 <!-- threadroot-commands
 threadroot --version
 threadroot doctor --json
+threadroot claim --path <relative> --vault <vault> --json
+threadroot claim --path <relative> --vault <vault> --json --apply
 -->
 
 Read and follow the [shared skill contract](../README.md) before proceeding. This workflow produces one weekly review with a weekly-review-only write set.
@@ -29,7 +31,7 @@ Read and follow the [shared skill contract](../README.md) before proceeding. Thi
 4. Collect project-page links explicitly referenced by those seven notes. Read only those referenced project pages, keeping missing or inaccessible references explicit. Do not expand to unreferenced projects.
 5. Resolve the review target within the configured reviews path. Use `templates/vault/weekly-review.md` as the structure for one review. When the target exists, read it and preserve its content. Build `Outcomes`, `Decisions`, `Carry Forward`, and `Lessons` from the selected evidence, citing vault-relative sources. Deduplicate outcomes and decisions by exact source reference rather than textual similarity.
 6. Keep the write set for this workflow to the single weekly-review target:
-   - Target missing: draft from the public template, recheck absence, and use the host's exclusive-create operation.
+   - Target missing: draft from the public template and follow the shared new-file claim protocol: claim preview, claim apply, native same-identity/empty/regular verification, then native edit. Require its existing safe parent. If any gate fails, stop and report visible partial state and unexecuted actions.
    - Target present: preview the additive reconciliation, re-read the target immediately before applying, and stop on drift. Append or reconcile only the prepared additions; never replace the whole file.
 7. Treat any explicit request to reconcile daily or project pages as a separate workflow with its own scoped preview. Completeness, consistency, urgency, or an apparently stale project page does not add those pages to this workflow's write set.
 

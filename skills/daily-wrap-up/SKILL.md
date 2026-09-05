@@ -11,6 +11,8 @@ extends=../README.md
 <!-- threadroot-commands
 threadroot --version
 threadroot doctor --json
+threadroot claim --path <relative> --vault <vault> --json
+threadroot claim --path <relative> --vault <vault> --json --apply
 -->
 
 Read and follow the [shared skill contract](../README.md) before proceeding. This workflow closes the day from explicit records and evidence.
@@ -29,7 +31,7 @@ Read and follow the [shared skill contract](../README.md) before proceeding. Thi
 5. Build an evidence ledger from the selected daily sections, the selected project sections, direct user statements, and supplied trustworthy artifacts. Label user-supplied or external evidence. Do not use Git history to invent or reconstruct unrecorded non-code activity.
 6. Reconcile every evidenced item as `Completed`, `In Progress`, `Blocked`, `Decision`, or `Follow-up`. Preserve unknowns instead of filling gaps. When completion is ambiguous, show the proposed interpretation and missing evidence, and keep the project's `Pending` item unchanged until the user confirms completion.
 7. Draft additive updates to the daily note's existing sections and concise updates to the referenced project pages. Preserve unrelated text and structure. Identify durable decision and lesson candidates, but do not create or modify a separate durable page without a separate routing request.
-8. Immediately before applying, re-read each existing target and compare it with the version used for the draft; stop on any drift. For an explicitly authorized missing daily note, recheck absence and use the host's exclusive-create operation. Apply only the prepared additive edits with the host's native edit mechanism.
+8. Immediately before applying, re-read each existing target and compare it with the version used for the draft; stop on any drift. For an explicitly authorized missing daily note, follow the shared new-file claim protocol: claim preview, claim apply, native same-identity/empty/regular verification, then native edit. Require its existing safe parent. If any gate fails, stop remaining edits and report visible partial state and unexecuted actions. Apply only the prepared additive edits with the host's native edit mechanism.
 
 ## Safety
 

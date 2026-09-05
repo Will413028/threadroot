@@ -96,7 +96,22 @@ CORE_COMMANDS = {
     ),
 }
 
-BASE_INVARIANTS = {"drift": "stop", "secrets": "never-read"}
+CLAIM_COMMANDS = frozenset({
+    "threadroot claim --path <relative> --vault <vault> --json",
+    "threadroot claim --path <relative> --vault <vault> --json --apply",
+})
+for name in ("recording", "daily-wrap-up", "weekly-review", "project-kickoff", "decision-log"):
+    CORE_COMMANDS[name] |= CLAIM_COMMANDS
+
+BASE_INVARIANTS = {
+    "drift": "stop",
+    "secrets": "never-read",
+    "new-file": "claim-verify-native-edit",
+    "claim-failure": "stop",
+    "claim-verification": "same-identity-empty-regular",
+    "partial-state": "preserve-and-report",
+    "outside-vault-create": "independent-native-exclusive-or-omit"
+}
 
 WORKFLOW_INVARIANTS = {
     "project-kickoff": {
@@ -105,7 +120,7 @@ WORKFLOW_INVARIANTS = {
             "public-private-boundary"
         ),
         "confirmation-cadence": "one-per-turn",
-        "local-adapter": "host-native-auto-loaded-and-already-git-ignored",
+        "local-adapter": "host-native-auto-loaded-already-git-ignored-and-exclusive",
         "write-gate": "complete-preview-and-explicit-approval",
     },
     "decision-log": {
@@ -281,6 +296,11 @@ SYNTHETIC_SHARED_CONTRACT = """# Shared Contract
 <!-- threadroot-contract
 drift=stop
 secrets=never-read
+new-file=claim-verify-native-edit
+claim-failure=stop
+claim-verification=same-identity-empty-regular
+partial-state=preserve-and-report
+outside-vault-create=independent-native-exclusive-or-omit
 -->
 """
 
@@ -551,6 +571,15 @@ class CompleteSkillSetTests(unittest.TestCase):
 
 
 class EffectiveSkillContractTests(unittest.TestCase):
+    def test_claim_invariant_mutations_are_rejected(self):
+        for key, value in BASE_INVARIANTS.items():
+            for replacement in ("", f"{key}=unsafe"):
+                with self.subTest(key=key, replacement=replacement), tempfile.TemporaryDirectory() as directory:
+                    shared = SYNTHETIC_SHARED_CONTRACT.replace(f"{key}={value}", replacement)
+                    path = self._write_fixture(directory, shared=shared)
+                    with self.assertRaises(AssertionError):
+                        skill_contract.load_effective_contract(path, frozenset({"threadroot --version"}))
+
     def _loader(self):
         loader = getattr(skill_contract, "load_effective_contract", None)
         self.assertIsNotNone(loader, "effective contract validator is required")

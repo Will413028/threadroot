@@ -11,6 +11,8 @@ extends=../README.md
 <!-- threadroot-commands
 threadroot --version
 threadroot doctor --json
+threadroot claim --path <relative> --vault <vault> --json
+threadroot claim --path <relative> --vault <vault> --json --apply
 -->
 
 Read and follow the [shared skill contract](../README.md) before proceeding. This workflow records verified activity through additive Markdown edits.
@@ -34,7 +36,7 @@ Read and follow the [shared skill contract](../README.md) before proceeding. Thi
 7. Classify lessons by evidence:
    - Fewer than two concrete, named cases from different projects: keep the lesson under the existing project's `Lessons Learned`. If the project page is missing, retain the observation in the daily entry and report that project and durable-knowledge routing were skipped.
    - At least two concrete, named cases from different projects: the lesson is eligible for the configured knowledge area. Add it to a relevant existing knowledge page after reading that target. Eligibility does not authorize creating a new knowledge page or taxonomy; preview that structural choice and wait for explicit confirmation under the shared contract.
-8. Immediately before applying, re-read every existing target and compare it with the version used for the draft. Stop on any drift. For a missing daily note, recheck that it is still absent and use the host's exclusive-create operation; if exclusive creation is unavailable or the path appeared, stop instead of overwriting or merging by guesswork. Then apply only the prepared additive edits with the host's native edit mechanism.
+8. Immediately before applying, re-read every existing target and compare it with the version used for the draft. Stop on any drift. For a missing daily note, follow the shared new-file claim protocol: claim preview, claim apply, native same-identity/empty/regular verification, then native edit. Require its existing safe parent. If any gate fails, stop remaining edits and report any visible reservation or partial edit and unexecuted actions. Apply only the prepared additive edits with the host's native edit mechanism.
 
 ## Safety
 
