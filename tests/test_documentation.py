@@ -10,11 +10,20 @@ from urllib.parse import urlsplit
 from scripts.build_release import build_archive
 
 
+RELEASE_NOTES = Path("docs/releases/v0.1.0.md")
+EXPECTED_RELEASE_ASSETS = {
+    "threadroot-0.1.0-py3-none-any.whl",
+    "threadroot-0.1.0.tar.gz",
+    "threadroot-claude-0.1.0.zip",
+    "threadroot-codex-0.1.0.zip",
+}
+
 PUBLIC_DOCUMENTS = (
     Path("README.md"),
     Path("CONTRIBUTING.md"),
     Path("SECURITY.md"),
     Path("docs/testing.md"),
+    RELEASE_NOTES,
 )
 EXPECTED_SKILLS = {
     "daily-wrap-up",
@@ -270,6 +279,36 @@ class DocumentationTests(unittest.TestCase):
 
         markdown_targets = re.findall(r"\[[^]]+]\(([^)]+)\)", readme)
         self.assertFalse(any("OWNER/threadroot" in target for target in markdown_targets))
+
+    def test_v010_release_notes_match_distribution_contract(self) -> None:
+        notes = RELEASE_NOTES.read_text(encoding="utf-8")
+        documented_assets = set(
+            re.findall(
+                r"\bthreadroot-(?:"
+                r"[0-9]+\.[0-9]+\.[0-9]+-py3-none-any\.whl|"
+                r"[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz|"
+                r"(?:claude|codex)-[0-9]+\.[0-9]+\.[0-9]+\.zip"
+                r")\b",
+                notes,
+            )
+        )
+        required_statements = (
+            "first public release",
+            "A complete installation needs both layers",
+            "deterministic CLI",
+            "nine portable Agent Skills",
+            "Python 3.11 through 3.14 on macOS and Linux",
+            "local-first and has no telemetry",
+            "leaves your Markdown and Git vault intact when uninstalled",
+            "public interfaces are pre-1.0",
+            "PyPI and OpenAI universal Plugins Directory installation are not available",
+        )
+
+        self.assertEqual(documented_assets, EXPECTED_RELEASE_ASSETS)
+        for statement in required_statements:
+            with self.subTest(statement=statement):
+                self.assertIn(statement, notes)
+        self.assertNotIn("OWNER/threadroot", notes)
 
     def test_source_manifest_includes_public_policy_documents(self) -> None:
         direct_includes: set[str] = set()
