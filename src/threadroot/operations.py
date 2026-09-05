@@ -14,6 +14,8 @@ from .paths import (
     MARKER_RELATIVE,
     default_pointer_path,
     ensure_within,
+    ensure_outside_secrets,
+    filesystem_error,
     normalized_absolute,
     resolve_path,
 )
@@ -64,8 +66,10 @@ def _config_path_invalid() -> ThreadrootError:
 def _is_initialized(vault: Path) -> bool:
     try:
         config = load_config(vault)
-    except ThreadrootError:
-        raise _config_path_invalid() from None
+    except ThreadrootError as error:
+        if error.exit_code == ExitCode.CONFIG:
+            raise _config_path_invalid() from None
+        raise
 
     for relative in (
         config.paths.daily,
@@ -74,16 +78,18 @@ def _is_initialized(vault: Path) -> bool:
         config.paths.reviews,
     ):
         try:
-            configured = ensure_within(vault, relative)
-        except ThreadrootError:
-            raise _config_path_invalid() from None
+            configured = ensure_outside_secrets(vault, relative)
+        except ThreadrootError as error:
+            if error.exit_code == ExitCode.CONFIG:
+                raise _config_path_invalid() from None
+            raise
         if not configured.is_dir():
             raise _config_path_invalid()
     return True
 
 
 def plan_init(vault: Path) -> tuple[PlannedChange, ...]:
-    root = Path(vault).resolve(strict=False)
+    root = resolve_path(vault)
     marker = root / MARKER_RELATIVE
     if os.path.lexists(marker):
         _is_initialized(root)
@@ -142,13 +148,13 @@ def _validate_existing_adopt_marker(vault: Path) -> None:
         config.paths.knowledge,
         config.paths.reviews,
     ):
-        configured = ensure_within(vault, relative)
+        configured = ensure_outside_secrets(vault, relative)
         if not configured.is_dir():
             raise _config_path_invalid()
 
 
 def plan_adopt(vault: Path) -> tuple[PlannedChange, ...]:
-    root = Path(vault).resolve(strict=False)
+    root = resolve_path(vault)
     marker = root / MARKER_RELATIVE
     if os.path.lexists(marker):
         _validate_existing_adopt_marker(root)
@@ -163,7 +169,7 @@ def plan_adopt(vault: Path) -> tuple[PlannedChange, ...]:
 
     invalid_directories: list[str] = []
     for relative in REQUIRED_ADOPT_DIRECTORIES:
-        configured = ensure_within(root, relative)
+        configured = ensure_outside_secrets(root, relative)
         if not configured.is_dir():
             invalid_directories.append(relative)
     if invalid_directories:
@@ -174,7 +180,7 @@ def plan_adopt(vault: Path) -> tuple[PlannedChange, ...]:
             + ", ".join(sorted(invalid_directories)),
         )
 
-    marker_directory = ensure_within(root, ".second-brain")
+    marker_directory = ensure_outside_secrets(root, ".second-brain")
     changes: list[PlannedChange] = []
     if os.path.lexists(root / ".second-brain"):
         if not marker_directory.is_dir():
@@ -377,12 +383,12 @@ def _planned_changes(plan: Sequence[PlannedChange]) -> tuple[Change, ...]:
     return tuple(Change(change.action, change.public_path, "planned") for change in plan)
 
 
-def _error_result(command: CommandName, vault: Path, error: ThreadrootError) -> CommandResult:
+def _error_result(command: CommandName, vault: Path | None, error: ThreadrootError) -> CommandResult:
     return CommandResult(
         ok=False,
         command=command,
         applied=False,
-        vault=str(vault),
+        vault=str(vault) if vault is not None else None,
         issues=(Issue("error", error.code, error.message, error.path),),
         exit_code=error.exit_code,
     )
@@ -395,8 +401,9 @@ def run_init(
     environ: Mapping[str, str],
     home: Path,
 ) -> CommandResult:
-    root = Path(vault).resolve(strict=False)
+    root = None
     try:
+        root = resolve_path(vault)
         vault_plan = plan_init(root)
         pointer_change = (
             PlannedChange(
@@ -407,7 +414,8 @@ def run_init(
             if set_default
             else None
         )
-    except ThreadrootError as error:
+    except (ThreadrootError, OSError) as caught:
+        error = caught if isinstance(caught, ThreadrootError) else filesystem_error()
         return _error_result("init", root, error)
 
     full_plan = vault_plan + ((pointer_change,) if pointer_change is not None else ())
@@ -474,8 +482,9 @@ def run_adopt(
     environ: Mapping[str, str],
     home: Path,
 ) -> CommandResult:
-    root = Path(vault).resolve(strict=False)
+    root = None
     try:
+        root = resolve_path(vault)
         vault_plan = plan_adopt(root)
         pointer_change = (
             PlannedChange(
@@ -486,7 +495,8 @@ def run_adopt(
             if set_default
             else None
         )
-    except ThreadrootError as error:
+    except (ThreadrootError, OSError) as caught:
+        error = caught if isinstance(caught, ThreadrootError) else filesystem_error()
         return _error_result("adopt", root, error)
 
     full_plan = vault_plan + ((pointer_change,) if pointer_change is not None else ())
@@ -554,6 +564,7 @@ def _doctor_result(
     issues: Sequence[Issue],
     *,
     unsafe: bool = False,
+    error_exit: ExitCode | None = None,
 ) -> CommandResult:
     ordered = tuple(
         sorted(
@@ -566,7 +577,7 @@ def _doctor_result(
         )
     )
     has_errors = any(issue.level == "error" for issue in ordered)
-    exit_code = (
+    exit_code = error_exit if error_exit is not None else (
         ExitCode.UNSAFE_PATH
         if unsafe
         else ExitCode.CONFIG
@@ -585,6 +596,14 @@ def _doctor_result(
 
 
 def run_doctor(vault: Path) -> CommandResult:
+    try:
+        return _inspect_doctor(vault)
+    except (ThreadrootError, OSError) as caught:
+        error = caught if isinstance(caught, ThreadrootError) else filesystem_error()
+        return _error_result("doctor", None, error)
+
+
+def _inspect_doctor(vault: Path) -> CommandResult:
     root = normalized_absolute(vault)
     try:
         root = resolve_path(root)
@@ -593,6 +612,7 @@ def run_doctor(vault: Path) -> CommandResult:
             root,
             (Issue("error", error.code, error.message, "."),),
             unsafe=error.exit_code == ExitCode.UNSAFE_PATH,
+            error_exit=error.exit_code,
         )
     issues: list[Issue] = []
 
@@ -614,14 +634,14 @@ def run_doctor(vault: Path) -> CommandResult:
 
     marker = root / MARKER_RELATIVE
     try:
-        ensure_within(root, MARKER_RELATIVE)
+        ensure_outside_secrets(root, MARKER_RELATIVE)
     except ThreadrootError as error:
         issues.append(
             Issue("error", error.code, error.message, MARKER_RELATIVE.as_posix())
         )
         if not (root / ".git").exists():
             issues.append(Issue("info", "git.not_found", "Git metadata was not found.", ".git"))
-        return _doctor_result(root, issues, unsafe=error.exit_code == ExitCode.UNSAFE_PATH)
+        return _doctor_result(root, issues, error_exit=error.exit_code)
 
     if not marker.is_file() or not os.access(marker, os.R_OK):
         issues.append(
@@ -642,7 +662,7 @@ def run_doctor(vault: Path) -> CommandResult:
         issues.append(Issue("error", error.code, error.message, error.path))
         if not (root / ".git").exists():
             issues.append(Issue("info", "git.not_found", "Git metadata was not found.", ".git"))
-        return _doctor_result(root, issues, unsafe=error.exit_code == ExitCode.UNSAFE_PATH)
+        return _doctor_result(root, issues, error_exit=error.exit_code)
 
     unsafe = False
     for relative in (
@@ -652,7 +672,7 @@ def run_doctor(vault: Path) -> CommandResult:
         config.paths.reviews,
     ):
         try:
-            target = ensure_within(root, relative)
+            target = ensure_outside_secrets(root, relative)
         except ThreadrootError as error:
             issues.append(Issue("error", error.code, error.message, relative))
             unsafe = unsafe or error.exit_code == ExitCode.UNSAFE_PATH

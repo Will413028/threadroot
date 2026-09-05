@@ -9,13 +9,13 @@ import sys
 
 from . import __version__
 from .operations import run_adopt, run_doctor, run_init
-from .paths import resolve_vault
+from .paths import resolve_vault, filesystem_error
 from .results import CommandResult, ExitCode, Issue, ThreadrootError
 
 
 class _ArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
-        raise ThreadrootError(ExitCode.USAGE, "usage.invalid", message)
+        raise ThreadrootError(ExitCode.USAGE, "usage.invalid", "Invalid arguments; run threadroot --help.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -50,7 +50,8 @@ def execute(
         if command == "adopt":
             return run_adopt(root, args.apply, args.set_default, environ, home)
         return run_doctor(root)
-    except ThreadrootError as error:
+    except (ThreadrootError, OSError) as caught:
+        error = caught if isinstance(caught, ThreadrootError) else filesystem_error()
         return CommandResult(
             ok=False,
             command=command,

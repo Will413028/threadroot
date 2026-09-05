@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 from .jsonio import loads_unique_json
-from .paths import MARKER_RELATIVE, ensure_within
+from .paths import MARKER_RELATIVE, ensure_outside_secrets, resolve_path
 from .results import ExitCode, ThreadrootError
 
 
@@ -56,7 +56,7 @@ def config_text() -> str:
 
 
 def load_config(root: Path) -> VaultConfig:
-    marker = ensure_within(root, MARKER_RELATIVE)
+    marker = ensure_outside_secrets(root, MARKER_RELATIVE)
     if not marker.is_file() or not os.access(marker, os.R_OK):
         raise _invalid_config("Vault config is not a readable file.")
     try:
@@ -83,5 +83,10 @@ def load_config(root: Path) -> VaultConfig:
     for value in paths.values():
         if not isinstance(value, str) or not value.strip():
             raise _invalid_config("Vault config is invalid.")
-        ensure_within(root, value)
+        resolved = ensure_outside_secrets(root, value)
+        marker_directory = resolve_path(root / ".second-brain")
+        if (Path(value).parts[:1] == (".second-brain",)
+                or resolved == marker_directory or marker_directory in resolved.parents):
+            raise ThreadrootError(ExitCode.UNSAFE_PATH, "path.unsafe",
+                                  "Configured content must stay outside the marker directory.")
     return VaultConfig(schema_version=schema_version, paths=VaultPaths(**paths))

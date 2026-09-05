@@ -14,6 +14,8 @@ MARKER_RELATIVE = Path(".second-brain/config.json")
 
 def normalized_absolute(path: str | Path) -> Path:
     """Return an absolute lexical path without following symlinks."""
+    if "\x00" in str(path):
+        raise _unsafe_path()
     return Path(os.path.abspath(path))
 
 
@@ -22,25 +24,38 @@ def _invalid_config(message: str) -> ThreadrootError:
 
 
 def _unsafe_path() -> ThreadrootError:
-    return ThreadrootError(ExitCode.UNSAFE_PATH, "path.unsafe", "Path escapes the vault.")
+    return ThreadrootError(ExitCode.UNSAFE_PATH, "path.unsafe", "Path is unsafe for this vault.")
+
+
+def filesystem_error() -> ThreadrootError:
+    return ThreadrootError(
+        ExitCode.IO_OR_DRIFT, "filesystem.failed",
+        "A filesystem operation failed; check directory access and retry.",
+    )
 
 
 def resolve_path(path: str | Path, *, strict: bool = False) -> Path:
     candidate = Path(path)
+    if "\x00" in str(candidate):
+        raise _unsafe_path()
     try:
         resolved = candidate.resolve(strict=strict)
-    except RuntimeError:
+    except (RuntimeError, ValueError):
         raise _unsafe_path() from None
     except OSError as error:
         if error.errno == errno.ELOOP:
             raise _unsafe_path() from None
-        raise
+        if strict and error.errno in (errno.ENOENT, errno.ENOTDIR):
+            raise
+        raise filesystem_error() from None
 
     try:
         candidate.stat()
     except OSError as error:
         if error.errno == errno.ELOOP:
             raise _unsafe_path() from None
+        if error.errno not in (errno.ENOENT, errno.ENOTDIR):
+            raise filesystem_error() from None
     return resolved
 
 
@@ -58,13 +73,24 @@ def ensure_within(root: Path, relative: str | Path) -> Path:
     return resolved_candidate
 
 
+def ensure_outside_secrets(root: Path, relative: str | Path) -> Path:
+    candidate = Path(relative)
+    if "secrets" in candidate.parts:
+        raise _unsafe_path()
+    resolved = ensure_within(root, relative)
+    if "secrets" in resolved.relative_to(resolve_path(root)).parts:
+        raise _unsafe_path()
+    return resolved
+
+
 def find_upward(start: Path) -> Path | None:
     current = resolve_path(start)
     while True:
         marker = current / MARKER_RELATIVE
-        if marker.is_file():
-            ensure_within(current, MARKER_RELATIVE)
-            return current
+        if os.path.lexists(marker):
+            ensure_outside_secrets(current, MARKER_RELATIVE)
+            if marker.is_file():
+                return current
         if current.parent == current:
             return None
         current = current.parent
