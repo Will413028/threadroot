@@ -83,6 +83,46 @@ def _regular_identity(path: Path) -> os.stat_result:
     return metadata
 
 
+def _identity(value: os.stat_result) -> tuple[int, int, int, int, int, int, int, int]:
+    return (value.st_dev, value.st_ino, stat.S_IFMT(value.st_mode), value.st_mode & 0o7777, value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+
+
+def _dir_identity(value: os.stat_result) -> tuple[int, int, int, int]:
+    return (value.st_dev, value.st_ino, stat.S_IFMT(value.st_mode), value.st_mode & 0o7777)
+
+
+def _hash_descriptor(descriptor: int) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    total = 0
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while chunk := os.read(descriptor, 1024 * 1024):
+        digest.update(chunk)
+        total += len(chunk)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    return digest.hexdigest(), total
+
+
+def _read_regular_bound_bytes(path: Path) -> tuple[bytes, os.stat_result]:
+    identity = _regular_identity(path)
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as error:
+        raise ReleaseArtifactError("input read failed") from error
+    try:
+        opened = os.fstat(descriptor)
+        if _identity(opened) != _identity(identity):
+            raise ReleaseArtifactError("input identity changed")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if _identity(after) != _identity(identity) or _identity(_regular_identity(path)) != _identity(after):
+            raise ReleaseArtifactError("input changed while reading")
+        return b"".join(chunks), after
+    finally:
+        os.close(descriptor)
+
+
 def _bound_sha256(path: Path, identity: os.stat_result) -> tuple[str, int]:
     before = _regular_identity(path)
     if (before.st_dev, before.st_ino) != (identity.st_dev, identity.st_ino):
@@ -172,9 +212,9 @@ def _installed_packages() -> dict[str, str]:
     }
 
 
-def _read_lock_versions(lock: Path) -> dict[str, str]:
+def _parse_lock_versions(text: str) -> dict[str, str]:
     versions: dict[str, str] = {}
-    lines = Path(lock).read_text(encoding="utf-8").splitlines()
+    lines = text.splitlines()
     option_seen = False
     index = 0
     while index < len(lines):
@@ -200,6 +240,14 @@ def _read_lock_versions(lock: Path) -> dict[str, str]:
     return versions
 
 
+def _read_lock_versions(lock: Path) -> dict[str, str]:
+    payload, _ = _read_regular_bound_bytes(lock)
+    try:
+        return _parse_lock_versions(payload.decode("utf-8"))
+    except UnicodeDecodeError as error:
+        raise ReleaseArtifactError("release lock is not UTF-8") from error
+
+
 def _validate_environment(epoch: int, expected_packages: dict[str, str]) -> None:
     if os.environ.get("THREADROOT_CANONICAL_BUILD") != "1":
         raise ReleaseArtifactError("canonical build environment is not enabled")
@@ -209,6 +257,8 @@ def _validate_environment(epoch: int, expected_packages: dict[str, str]) -> None
         raise ReleaseArtifactError("canonical build requires Python 3.14.7")
     if epoch < 0:
         raise ReleaseArtifactError("source epoch must be non-negative")
+    if os.environ.get("SOURCE_DATE_EPOCH") != str(epoch):
+        raise ReleaseArtifactError("SOURCE_DATE_EPOCH mismatch")
     actual = _installed_packages()
     if actual != expected_packages:
         raise ReleaseArtifactError("canonical package set mismatch")
@@ -231,6 +281,21 @@ def _validate_roots(source_a: Path, source_b: Path, output: Path) -> None:
     output = Path(output)
     if output.is_symlink() or (output.exists() and (not output.is_dir() or any(output.iterdir()))):
         raise ReleaseArtifactError("output must be missing or empty")
+
+
+def _root_identity(path: Path) -> os.stat_result:
+    try:
+        metadata = os.lstat(path)
+    except OSError as error:
+        raise ReleaseArtifactError("build root is unavailable") from error
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise ReleaseArtifactError("build root must be a real directory")
+    return metadata
+
+
+def _assert_root_identity(path: Path, expected: os.stat_result) -> None:
+    if _dir_identity(_root_identity(path)) != _dir_identity(expected):
+        raise ReleaseArtifactError("build root identity changed")
 
 
 def _build_environment(work: Path, epoch: int) -> dict[str, str]:
@@ -273,7 +338,11 @@ def _replay_sdist(artifacts: ArtifactSet, evidence: Path, epoch: int) -> None:
     wheels = list(replay_output.iterdir())
     if len(wheels) != 1 or wheels[0].name != artifacts.wheel.name:
         raise ReleaseArtifactError("sdist wheel replay membership mismatch")
-    if not filecmp.cmp(wheels[0], artifacts.wheel, shallow=False):
+    replay_identity = _regular_identity(wheels[0])
+    approved_identity = _regular_identity(artifacts.wheel)
+    replay_hash, replay_size = _bound_sha256(wheels[0], replay_identity)
+    approved_hash, approved_size = _bound_sha256(artifacts.wheel, approved_identity)
+    if replay_hash != approved_hash or replay_size != approved_size:
         raise ReleaseArtifactError("sdist wheel replay bytes differ")
 
 
@@ -296,12 +365,26 @@ def _scan(source_a: Path, source_b: Path, artifacts: ArtifactSet, unpacked: Path
     subprocess.run(command, check=True, shell=False, capture_output=True, text=True, env=scanner_environment)
 
 
-def _write_evidence(evidence: Path, source: Path, artifacts: ArtifactSet, commit: str, epoch: int, hashes: dict[str, str], sizes: dict[str, int], packages: dict[str, str]) -> None:
+def _validate_denylist(denylist: Path | None) -> None:
+    if denylist is None:
+        return
+    denylist = Path(denylist)
+    if denylist != Path("/run/threadroot/denylist"):
+        raise ReleaseArtifactError("denylist path is not approved")
+    try:
+        metadata = os.lstat(denylist)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise ReleaseArtifactError("denylist is unreadable") from error
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise ReleaseArtifactError("denylist must be a regular file")
+
+
+def _write_evidence(evidence: Path, source: Path, artifacts: ArtifactSet, commit: str, epoch: int, hashes: dict[str, str], sizes: dict[str, int], packages: dict[str, str], dockerfile_bytes: bytes, lockfile_bytes: bytes) -> None:
     names = expected_asset_names("0.1.0")
     lines = [f"{hashes[name]}  {name}" for name in sorted(names)]
     (evidence / "SHA256SUMS").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    dockerfile = source / "tools/release/Dockerfile"
-    lockfile = source / "requirements/release.txt"
     payload = {
         "schema": 1,
         "commit": commit,
@@ -309,7 +392,7 @@ def _write_evidence(evidence: Path, source: Path, artifacts: ArtifactSet, commit
         "platform": "linux/amd64",
         "python": "3.14.7",
         "base_image": BASE_IMAGE,
-        "builder_definition_sha256": hashlib.sha256(dockerfile.read_bytes() + b"\0" + lockfile.read_bytes()).hexdigest(),
+        "builder_definition_sha256": hashlib.sha256(dockerfile_bytes + b"\0" + lockfile_bytes).hexdigest(),
         "packages": packages,
         "artifacts": [
             {"name": name, "sha256": hashes[name], "size": sizes[name]}
@@ -319,12 +402,28 @@ def _write_evidence(evidence: Path, source: Path, artifacts: ArtifactSet, commit
     (evidence / "build.json").write_text(json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
 
 
-def _exclusive_publish(parent_fd: int, pending: str, selected: str, pending_fd: int, identity: os.stat_result) -> None:
+def _exclusive_publish(parent_fd: int, pending: str, selected: str, pending_fd: int, identity: os.stat_result, approved: dict[str, tuple[str, int]]) -> None:
     try:
         current = os.stat(pending, dir_fd=parent_fd, follow_symlinks=False)
         opened = os.fstat(pending_fd)
-        if (current.st_dev, current.st_ino) != (identity.st_dev, identity.st_ino) or (opened.st_dev, opened.st_ino) != (identity.st_dev, identity.st_ino):
+        if _dir_identity(current) != _dir_identity(identity) or _dir_identity(opened) != _dir_identity(identity):
             raise OSError("pending identity changed")
+        if sorted(os.listdir(pending_fd)) != sorted(approved):
+            raise OSError("pending membership changed")
+        for name, (expected_hash, expected_size) in approved.items():
+            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=pending_fd)
+            try:
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size != expected_size:
+                    raise OSError("pending member changed")
+                actual_hash, actual_size = _hash_descriptor(descriptor)
+                if actual_hash != expected_hash or actual_size != expected_size:
+                    raise OSError("pending member bytes changed")
+                after = os.fstat(descriptor)
+                if _identity(after) != _identity(metadata):
+                    raise OSError("pending member changed while reading")
+            finally:
+                os.close(descriptor)
         library = ctypes.CDLL(None, use_errno=True)
         if os.uname().sysname == "Linux" and hasattr(library, "renameat2"):
             function = library.renameat2
@@ -366,6 +465,7 @@ def _promote(output: Path, artifacts: ArtifactSet, hashes: dict[str, str]) -> No
         if (os.fstat(pending_fd).st_dev, os.fstat(pending_fd).st_ino) != (pending_identity.st_dev, pending_identity.st_ino):
             raise ReleaseArtifactError("selected artifact promotion failed")
         source_identities: dict[str, os.stat_result] = {}
+        sizes: dict[str, int] = {}
         for name in names:
             source = artifacts.root / name
             identity = _regular_identity(source)
@@ -385,6 +485,7 @@ def _promote(output: Path, artifacts: ArtifactSet, hashes: dict[str, str]) -> No
                     os.close(destination)
                 if digest.hexdigest() != hashes[name] or os.stat(name, dir_fd=pending_fd, follow_symlinks=False).st_size != identity.st_size:
                     raise ReleaseArtifactError("selected artifact changed during promotion")
+                sizes[name] = identity.st_size
             finally:
                 os.close(descriptor)
         for name in names:
@@ -392,10 +493,9 @@ def _promote(output: Path, artifacts: ArtifactSet, hashes: dict[str, str]) -> No
             digest, size = _bound_sha256(artifacts.root / name, identity)
             if digest != hashes[name] or size != identity.st_size:
                 raise ReleaseArtifactError("artifact input changed before promotion")
-            destination = _regular_identity(output / "selected.pending" / name)
-            if destination.st_nlink != 1 or destination.st_size != identity.st_size or _sha256(output / "selected.pending" / name) != hashes[name]:
-                raise ReleaseArtifactError("selected artifact changed during promotion")
-        _exclusive_publish(parent_fd, "selected.pending", "selected", pending_fd, pending_identity)
+        _exclusive_publish(parent_fd, "selected.pending", "selected", pending_fd, pending_identity,
+                           {name: (hashes[name], sizes[name]) for name in names})
+        os.close(pending_fd)
         pending_fd = None
     except ReleaseArtifactError:
         raise
@@ -422,26 +522,49 @@ def build_and_verify(
     output = Path(output)
     if not source_a.is_absolute() or not source_b.is_absolute() or not output.is_absolute():
         raise ReleaseArtifactError("all build paths must be absolute")
-    lock_a = _read_lock_versions(source_a / "requirements/release.txt")
-    lock_b = _read_lock_versions(source_b / "requirements/release.txt")
+    _validate_denylist(denylist)
+    _validate_roots(source_a, source_b, output)
+    source_a_identity = _root_identity(source_a)
+    source_b_identity = _root_identity(source_b)
+    lock_a_bytes, _ = _read_regular_bound_bytes(source_a / "requirements/release.txt")
+    lock_b_bytes, _ = _read_regular_bound_bytes(source_b / "requirements/release.txt")
+    docker_a_bytes, _ = _read_regular_bound_bytes(source_a / "tools/release/Dockerfile")
+    docker_b_bytes, _ = _read_regular_bound_bytes(source_b / "tools/release/Dockerfile")
+    try:
+        lock_a = _parse_lock_versions(lock_a_bytes.decode("utf-8"))
+        lock_b = _parse_lock_versions(lock_b_bytes.decode("utf-8"))
+    except UnicodeDecodeError as error:
+        raise ReleaseArtifactError("release input is not UTF-8") from error
     if lock_a != lock_b:
         raise ReleaseArtifactError("source release locks differ")
+    if lock_a != EXPECTED_PACKAGES or docker_a_bytes != docker_b_bytes:
+        raise ReleaseArtifactError("builder inputs differ from approved definition")
     _validate_environment(epoch, lock_a)
     _validate_roots(source_a, source_b, output)
     previous_umask = os.umask(0o022)
     try:
         output = Path(output)
+        if output.exists() and output.is_symlink():
+            raise ReleaseArtifactError("output must be a real directory")
         output.mkdir(parents=True, exist_ok=True)
+        output_identity = _root_identity(output)
         candidate_a_root = output / "candidate-a"
         candidate_b_root = output / "candidate-b"
         evidence = output / "evidence"
         (evidence / "work").mkdir(parents=True, exist_ok=False)
+        _assert_root_identity(source_a, source_a_identity)
+        _assert_root_identity(source_b, source_b_identity)
+        _assert_root_identity(output, output_identity)
         _build_one_source(Path(source_a), candidate_a_root, evidence / "work" / "a", epoch)
+        _assert_root_identity(source_a, source_a_identity)
+        _assert_root_identity(source_b, source_b_identity)
+        _assert_root_identity(output, output_identity)
         _build_one_source(Path(source_b), candidate_b_root, evidence / "work" / "b", epoch)
         candidate_a = ArtifactSet.load(candidate_a_root, "0.1.0")
         candidate_b = ArtifactSet.load(candidate_b_root, "0.1.0")
         hashes = compare_artifact_sets(candidate_a, candidate_b)
         for artifacts, source in ((candidate_a, Path(source_a)), (candidate_b, Path(source_b))):
+            _assert_root_identity(source, source_a_identity if source == source_a else source_b_identity)
             validate_wheel(artifacts.wheel, source, "0.1.0", epoch)
             validate_sdist(artifacts.sdist, source, "0.1.0", epoch)
             validate_host_zip(artifacts.claude, source, "claude")
@@ -454,6 +577,9 @@ def build_and_verify(
         extract_regular_zip(candidate_a.claude, unpacked / "claude")
         extract_regular_zip(candidate_a.codex, unpacked / "codex")
         _scan(Path(source_a), Path(source_b), candidate_a, unpacked, denylist)
+        _assert_root_identity(source_a, source_a_identity)
+        _assert_root_identity(source_b, source_b_identity)
+        _assert_root_identity(output, output_identity)
         sizes: dict[str, int] = {}
         for name in expected_asset_names("0.1.0"):
             identity = _regular_identity(candidate_a.root / name)
@@ -461,7 +587,8 @@ def build_and_verify(
             if digest != hashes[name] or size != identity.st_size:
                 raise ReleaseArtifactError("approved artifact changed before evidence")
             sizes[name] = size
-        _write_evidence(evidence, Path(source_a), candidate_a, commit, epoch, hashes, sizes, lock_a)
+        _write_evidence(evidence, Path(source_a), candidate_a, commit, epoch, hashes, sizes, lock_a,
+                        docker_a_bytes, lock_a_bytes)
         _promote(output, candidate_a, hashes)
         return hashes
     finally:

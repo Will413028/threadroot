@@ -62,10 +62,13 @@ def _make_source(root: Path) -> Path:
     (source / "tools/release").mkdir(parents=True)
     (source / "tools/release/Dockerfile").write_text("FROM synthetic\n", encoding="utf-8")
     (source / "requirements").mkdir()
+    lock_rows = ["--only-binary=:all:\n"]
+    for package, version in release_artifacts.EXPECTED_PACKAGES.items():
+        lock_rows.append(
+            f"{package}=={version} " + "\\\n" + "    --hash=sha256:" + "0" * 64 + "\n"
+        )
     (source / "requirements/release.txt").write_text(
-        "--only-binary=:all:\n"
-        + "build==1.6.0 " + "\\\n"
-        + "    --hash=sha256:" + "0" * 64 + "\n",
+        "".join(lock_rows),
         encoding="utf-8",
     )
     return source
@@ -85,6 +88,25 @@ def _fake_extract(_artifact: Path, destination: Path, **_kwargs: object) -> None
 
 
 class BuildAndVerifyTests(unittest.TestCase):
+    def test_environment_gate_rejects_ambient_epoch_mismatch(self) -> None:
+        environment = dict(release_artifacts.EXPECTED_ENVIRONMENT)
+        environment["SOURCE_DATE_EPOCH"] = "99"
+        with patch.dict(release_artifacts.os.environ, environment, clear=True):
+            with patch.object(release_artifacts, "_installed_packages", return_value=release_artifacts.EXPECTED_PACKAGES):
+                with patch.object(release_artifacts.platform, "system", return_value="Linux"), patch.object(release_artifacts.platform, "machine", return_value="x86_64"), patch.object(release_artifacts.sys, "version_info", (3, 14, 7)):
+                    with self.assertRaisesRegex(ReleaseArtifactError, "SOURCE_DATE_EPOCH mismatch"):
+                        release_artifacts._validate_environment(100, release_artifacts.EXPECTED_PACKAGES)
+
+    def test_denylist_gate_rejects_before_output_creation(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_a = _make_source(root / "a")
+            source_b = _make_source(root / "b")
+            output = root / "output"
+            with self.assertRaisesRegex(ReleaseArtifactError, "denylist path is not approved"):
+                release_artifacts.build_and_verify(source_a, source_b, output, "a" * 40, 1, root / "denylist")
+            self.assertFalse(output.exists())
+
     def test_scanner_uses_sanitized_environment_and_all_explicit_roots(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
