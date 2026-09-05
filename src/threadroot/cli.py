@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 
 from . import __version__
-from .operations import run_adopt, run_doctor, run_init, run_claim
+from .operations import run_adopt, run_doctor, run_init, run_claim, _doctor_issue
 from .paths import resolve_vault, filesystem_error
 from .results import CommandResult, ExitCode, Issue, ThreadrootError
 
@@ -57,12 +57,15 @@ def execute(
         return run_doctor(root)
     except (ThreadrootError, OSError) as caught:
         error = caught if isinstance(caught, ThreadrootError) else filesystem_error()
+        issue = Issue("error", error.code, error.message, error.path)
+        if command == "doctor":
+            issue = _doctor_issue(issue)
         return CommandResult(
             ok=False,
             command=command,
             applied=False,
             vault=str(root) if root is not None else None,
-            issues=(Issue("error", error.code, error.message, error.path),),
+            issues=(issue,),
             exit_code=error.exit_code,
         )
 

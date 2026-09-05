@@ -424,13 +424,39 @@ def _planned_changes(plan: Sequence[PlannedChange]) -> tuple[Change, ...]:
     return tuple(Change(change.action, change.public_path, "planned") for change in plan)
 
 
+_DOCTOR_REMEDIATIONS = {
+    "vault.unresolved": "Pass --vault to select an existing configured vault.",
+    "vault.not_found": "Pass --vault for an existing vault or preview init for a new target.",
+    "vault.not_directory": "Pass --vault for a directory.",
+    "config.invalid": "Restore a readable schema-v1 .second-brain/config.json or preview adopt for a markerless vault.",
+    "config.unsupported_version": "Use a compatible Threadroot version; do not rewrite the marker with this version.",
+    "config.path_invalid": "Correct the configured paths to existing content directories and rerun doctor.",
+    "path.unsafe": "Correct the path or symlink to stay inside the vault and outside secrets, then rerun doctor.",
+    "path.not_found": "Restore the configured directory or correct its config path, then rerun doctor.",
+    "path.not_directory": "Select a directory in the config and rerun doctor.",
+    "path.not_readable": "Grant read access to the configured directory and rerun doctor.",
+    "filesystem.failed": "Check filesystem availability and directory access, then rerun doctor.",
+}
+
+
+def _doctor_issue(issue: Issue) -> Issue:
+    if issue.level != "error" or " Remediation: " in issue.message:
+        return issue
+    return Issue(issue.level, issue.code,
+                 issue.message + " Remediation: " + _DOCTOR_REMEDIATIONS[issue.code],
+                 issue.path)
+
+
 def _error_result(command: CommandName, vault: Path | None, error: ThreadrootError) -> CommandResult:
+    issue = Issue("error", error.code, error.message, error.path)
+    if command == "doctor":
+        issue = _doctor_issue(issue)
     return CommandResult(
         ok=False,
         command=command,
         applied=False,
         vault=str(vault) if vault is not None else None,
-        issues=(Issue("error", error.code, error.message, error.path),),
+        issues=(issue,),
         exit_code=error.exit_code,
     )
 
@@ -637,7 +663,7 @@ def _doctor_result(
 ) -> CommandResult:
     ordered = tuple(
         sorted(
-            issues,
+            (_doctor_issue(issue) for issue in issues),
             key=lambda issue: (
                 _ISSUE_SEVERITY[issue.level],
                 issue.code,

@@ -13,6 +13,137 @@ from threadroot.paths import resolve_path, find_upward
 from threadroot.results import ExitCode, ThreadrootError
 
 
+DOCTOR_REMEDIATIONS = {
+    "vault.unresolved": "Pass --vault to select an existing configured vault.",
+    "vault.not_found": "Pass --vault for an existing vault or preview init for a new target.",
+    "vault.not_directory": "Pass --vault for a directory.",
+    "config.invalid": "Restore a readable schema-v1 .second-brain/config.json or preview adopt for a markerless vault.",
+    "config.unsupported_version": "Use a compatible Threadroot version; do not rewrite the marker with this version.",
+    "config.path_invalid": "Correct the configured paths to existing content directories and rerun doctor.",
+    "path.unsafe": "Correct the path or symlink to stay inside the vault and outside secrets, then rerun doctor.",
+    "path.not_found": "Restore the configured directory or correct its config path, then rerun doctor.",
+    "path.not_directory": "Select a directory in the config and rerun doctor.",
+    "path.not_readable": "Grant read access to the configured directory and rerun doctor.",
+    "filesystem.failed": "Check filesystem availability and directory access, then rerun doctor.",
+}
+
+
+class DoctorRemediationTests(unittest.TestCase):
+    def test_every_error_has_concrete_remediation(self):
+        for scenario in ("missing-root", "file-root", "missing-marker", "malformed",
+                         "unknown-schema", "missing-directory", "file-directory", "unsafe"):
+            with self.subTest(scenario=scenario), TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                root = base / "vault"
+                if scenario == "file-root":
+                    root.write_text("synthetic")
+                elif scenario == "missing-marker":
+                    root.mkdir()
+                elif scenario != "missing-root":
+                    self.assertTrue(run_init(root, True, False, {}, base / "home").ok)
+                    marker = root / ".second-brain/config.json"
+                    if scenario == "malformed":
+                        marker.write_text("{")
+                    elif scenario in ("unknown-schema", "unsafe"):
+                        document = json.loads(config_text())
+                        if scenario == "unknown-schema":
+                            document["schema_version"] = 2
+                        else:
+                            document["paths"]["daily"] = "../outside"
+                        marker.write_text(json.dumps(document))
+                    else:
+                        (root / "daily").rmdir()
+                        if scenario == "file-directory":
+                            (root / "daily").write_text("synthetic")
+                def metadata():
+                    return {p.relative_to(base).as_posix():
+                            (p.lstat().st_mode, p.lstat().st_mtime_ns,
+                             os.readlink(p) if p.is_symlink() else None)
+                            for p in [base, *base.rglob("*")]}
+                before = metadata()
+                with patch.object(Path, "mkdir") as mkdir, patch.object(Path, "touch") as touch, \
+                     patch.object(Path, "write_text") as write, patch.object(Path, "unlink") as unlink, \
+                     patch("threadroot.operations.os.replace") as replace:
+                    result = run_doctor(root)
+                self.assertEqual(metadata(), before)
+                for operation in (mkdir, touch, write, unlink, replace):
+                    operation.assert_not_called()
+                self.assertFalse(result.ok)
+                self.assertFalse(result.applied)
+                self.assertEqual(result.changes, ())
+                for issue in result.issues:
+                    if issue.level == "error":
+                        self.assertIn("Remediation: ", issue.message)
+                        self.assertEqual(issue.message.split("Remediation: ", 1)[1],
+                                         DOCTOR_REMEDIATIONS[issue.code])
+
+    def test_io_remediation_keeps_exit_six_and_is_read_only(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            before = root.lstat().st_mtime_ns
+            with patch.object(Path, "resolve", side_effect=OSError(errno.EIO, "synthetic I/O")), \
+                 patch.object(Path, "mkdir") as mkdir, patch.object(Path, "touch") as touch, \
+                 patch.object(Path, "write_text") as write, patch.object(Path, "unlink") as unlink, \
+                 patch("threadroot.operations.os.replace") as replace:
+                result = run_doctor(root)
+            self.assertEqual(result.exit_code, ExitCode.IO_OR_DRIFT)
+            self.assertEqual(result.issues[0].message.split("Remediation: ", 1)[1],
+                             DOCTOR_REMEDIATIONS["filesystem.failed"])
+            for operation in (mkdir, touch, write, unlink, replace):
+                operation.assert_not_called()
+            self.assertEqual(root.lstat().st_mtime_ns, before)
+
+    def test_unresolved_cli_doctor_has_remediation(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            failure = ThreadrootError(ExitCode.CONFIG, "vault.unresolved", "Pass --vault.")
+            with patch("threadroot.cli.resolve_vault", side_effect=failure):
+                result = execute(build_parser().parse_args(["doctor", "--json"]), root, {}, root)
+            self.assertEqual(result.exit_code, ExitCode.CONFIG)
+            self.assertEqual(result.issues[0].message.split("Remediation: ", 1)[1],
+                             DOCTOR_REMEDIATIONS["vault.unresolved"])
+
+    def test_apparent_unreadability_and_all_issue_codes_are_read_only(self):
+        import stat
+        from threadroot import operations
+        from threadroot.results import Issue
+        decorate = getattr(operations, "_doctor_issue", None)
+        self.assertTrue(callable(decorate), "doctor remediation decorator is required")
+        for code, remediation in DOCTOR_REMEDIATIONS.items():
+            issue = Issue("error", code, "Synthetic diagnosis.", "daily")
+            self.assertEqual(decorate(issue).message, "Synthetic diagnosis. Remediation: " + remediation)
+            self.assertEqual(decorate(decorate(issue)), decorate(issue))
+        for level in ("warning", "info"):
+            issue = Issue(level, "synthetic.non_error", "Unchanged.", ".")
+            self.assertEqual(decorate(issue), issue)
+        with TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            root = base / "vault"
+            self.assertTrue(run_init(root, True, False, {}, base / "home").ok)
+            def metadata():
+                return {p.relative_to(root).as_posix():
+                        (stat.S_IFMT(p.lstat().st_mode), p.lstat().st_mtime_ns,
+                         os.readlink(p) if p.is_symlink() else None)
+                        for p in [root, *root.rglob("*")]}
+            for relative, expected in ((".second-brain/config.json", "config.invalid"),
+                                       ("daily", "path.not_readable")):
+                before = metadata()
+                real_access = os.access
+                def access(path, mode):
+                    return False if Path(path) == root / relative and mode == os.R_OK else real_access(path, mode)
+                with patch("threadroot.operations.os.access", side_effect=access), \
+                     patch.object(Path, "mkdir") as mkdir, patch.object(Path, "touch") as touch, \
+                     patch.object(Path, "write_text") as write, patch.object(Path, "unlink") as unlink, \
+                     patch("threadroot.operations.os.replace") as replace:
+                    result = run_doctor(root)
+                errors = [issue for issue in result.issues if issue.level == "error"]
+                self.assertEqual([issue.code for issue in errors], [expected])
+                self.assertTrue(errors[0].message.endswith(DOCTOR_REMEDIATIONS[expected]))
+                self.assertEqual(metadata(), before)
+                for operation in (mkdir, touch, write, unlink, replace):
+                    operation.assert_not_called()
+
+
 class PathBoundaryTests(unittest.TestCase):
     def test_nul_configured_path_is_structured_unsafe(self):
         with TemporaryDirectory() as temporary:
