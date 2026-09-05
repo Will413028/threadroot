@@ -284,11 +284,7 @@ class DocumentationTests(unittest.TestCase):
         notes = RELEASE_NOTES.read_text(encoding="utf-8")
         documented_assets = set(
             re.findall(
-                r"\bthreadroot-(?:"
-                r"[0-9]+\.[0-9]+\.[0-9]+-py3-none-any\.whl|"
-                r"[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz|"
-                r"(?:claude|codex)-[0-9]+\.[0-9]+\.[0-9]+\.zip"
-                r")\b",
+                r"\bthreadroot-[A-Za-z0-9_.+-]+\.(?:whl|tar\.gz|zip)\b",
                 notes,
             )
         )
