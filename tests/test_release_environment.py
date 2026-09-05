@@ -1,5 +1,6 @@
 import re
 from pathlib import Path
+import shlex
 import unittest
 
 
@@ -44,60 +45,147 @@ def _logical_requirement_lines(text: str) -> list[str]:
     return logical
 
 
+def _assert_release_lock_text(text: str) -> dict[str, tuple[str, str]]:
+    logical = _logical_requirement_lines(text)
+    options = [line for line in logical if line.startswith("--")]
+    assert options == ["--only-binary=:all:"]
+    entries = [line for line in logical if not line.startswith("--")]
+    actual: dict[str, tuple[str, str]] = {}
+    for entry in entries:
+        match = re.fullmatch(
+            r"([A-Za-z0-9_.-]+)==([^\s]+) --hash=sha256:([0-9a-f]{64})",
+            entry,
+        )
+        assert match is not None, f"invalid pinned requirement: {entry}"
+        name, version, digest = match.groups()
+        normalized = _normalized_name(name)
+        assert normalized not in actual
+        actual[normalized] = (version, digest)
+    assert actual == EXPECTED_REQUIREMENTS
+    assert "setuptools" not in actual
+    assert "wheel" not in actual
+    return actual
+
+
+EXPECTED_ENVIRONMENT = {
+    "TZ": "UTC",
+    "LC_ALL": "C.UTF-8",
+    "LANG": "C.UTF-8",
+    "PYTHONHASHSEED": "0",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+    "PIP_NO_INPUT": "1",
+    "PIP_CONFIG_FILE": "/dev/null",
+    "PIP_INDEX_URL": "https://pypi.org/simple",
+    "PIP_EXTRA_INDEX_URL": "",
+    "PIP_FIND_LINKS": "",
+    "PIP_NO_CACHE_DIR": "1",
+}
+
+
+def _logical_docker_instructions(text: str) -> list[tuple[str, str]]:
+    instructions: list[tuple[str, str]] = []
+    pending = ""
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line and not pending:
+            continue
+        if not pending and line.startswith("#"):
+            continue
+        combined = f"{pending}{line}" if pending else line
+        if combined.endswith("\\"):
+            pending = f"{combined[:-1].rstrip()} "
+            continue
+        pending = ""
+        match = re.fullmatch(r"([A-Za-z]+)\s+(.*)", combined)
+        assert match is not None, f"invalid Docker instruction: {combined}"
+        instructions.append((match.group(1).upper(), match.group(2).strip()))
+    assert not pending, "unterminated Docker instruction"
+    return instructions
+
+
+def _assert_dockerfile_contract(text: str) -> None:
+    instructions = _logical_docker_instructions(text)
+    assert instructions[0] == ("FROM", EXPECTED_BASE)
+    assert [rest for keyword, rest in instructions if keyword == "FROM"] == [EXPECTED_BASE]
+
+    envs = [rest for keyword, rest in instructions if keyword == "ENV"]
+    assert len(envs) == 1
+    env_tokens = shlex.split(envs[0])
+    assert len(env_tokens) == len(EXPECTED_ENVIRONMENT)
+    actual_environment: dict[str, str] = {}
+    for token in env_tokens:
+        name, separator, value = token.partition("=")
+        assert separator and name and name not in actual_environment
+        actual_environment[name] = value
+    assert actual_environment == EXPECTED_ENVIRONMENT
+
+    copies = [rest for keyword, rest in instructions if keyword == "COPY"]
+    assert copies == ["requirements/release.txt /opt/threadroot/release-requirements.txt"]
+
+    runs = [rest for keyword, rest in instructions if keyword == "RUN"]
+    assert len(runs) == 1
+    assert shlex.split(runs[0]) == [
+        "python",
+        "-m",
+        "pip",
+        "install",
+        "--no-cache-dir",
+        "--no-deps",
+        "--require-hashes",
+        "--only-binary=:all:",
+        "-r",
+        "/opt/threadroot/release-requirements.txt",
+        "&&",
+        "python",
+        "-m",
+        "pip",
+        "check",
+    ]
+    assert [rest for keyword, rest in instructions if keyword == "WORKDIR"] == ["/workspace"]
+    assert {keyword for keyword, _ in instructions} <= {"FROM", "ENV", "COPY", "RUN", "WORKDIR"}
+
+
 class ReleaseEnvironmentTests(unittest.TestCase):
+    def test_release_lock_rejects_unapproved_requirement_option(self) -> None:
+        text = """--only-binary=:all:
+--requirement extra-release.txt
+build==1.6.0 --hash=sha256:f7aaf1ebbb79178a02ba248bb524f2176b256017e17e8e4bd4289c7b38cc2bad
+"""
+        with self.assertRaises(AssertionError):
+            _assert_release_lock_text(text)
+
+    def test_dockerfile_rejects_second_lowercase_from(self) -> None:
+        text = Path("tools/release/Dockerfile").read_text(encoding="utf-8")
+        with self.assertRaises(AssertionError):
+            _assert_dockerfile_contract(text + "\nfrom scratch\n")
+
+    def test_dockerfile_rejects_environment_override(self) -> None:
+        text = Path("tools/release/Dockerfile").read_text(encoding="utf-8")
+        with self.assertRaises(AssertionError):
+            _assert_dockerfile_contract(text.replace("WORKDIR /workspace", "ENV TZ=BAD\nWORKDIR /workspace"))
+
+    def test_dockerfile_rejects_extra_copy_instruction(self) -> None:
+        text = Path("tools/release/Dockerfile").read_text(encoding="utf-8")
+        with self.assertRaises(AssertionError):
+            _assert_dockerfile_contract(text.replace("WORKDIR /workspace", "COPY extra.txt /tmp/extra.txt\nWORKDIR /workspace"))
+
+    def test_dockerfile_rejects_comment_only_install_and_check(self) -> None:
+        text = Path("tools/release/Dockerfile").read_text(encoding="utf-8")
+        mutated = text.replace("RUN python -m pip install", "# RUN python -m pip install")
+        with self.assertRaises(AssertionError):
+            _assert_dockerfile_contract(mutated)
+
     def test_release_lock_is_exact_and_hash_locked(self) -> None:
         path = Path("requirements/release.txt")
         self.assertTrue(path.is_file(), "canonical release lock is missing")
-        logical = _logical_requirement_lines(path.read_text(encoding="utf-8"))
-        self.assertIn("--only-binary=:all:", logical)
-        entries = [line for line in logical if not line.startswith("--")]
-        actual: dict[str, tuple[str, str]] = {}
-        for entry in entries:
-            match = re.fullmatch(
-                r"([A-Za-z0-9_.-]+)==([^\s]+) --hash=sha256:([0-9a-f]{64})",
-                entry,
-            )
-            self.assertIsNotNone(match, f"invalid pinned requirement: {entry}")
-            assert match is not None
-            name, version, digest = match.groups()
-            normalized = _normalized_name(name)
-            self.assertNotIn(normalized, actual)
-            actual[normalized] = (version, digest)
-        self.assertEqual(actual, EXPECTED_REQUIREMENTS)
-        self.assertNotIn("setuptools", actual)
-        self.assertNotIn("wheel", actual)
+        _assert_release_lock_text(path.read_text(encoding="utf-8"))
 
     def test_dockerfile_is_immutable_and_offline_build_definition(self) -> None:
         path = Path("tools/release/Dockerfile")
         self.assertTrue(path.is_file(), "canonical Dockerfile is missing")
         text = path.read_text(encoding="utf-8")
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        self.assertEqual(lines[0], f"FROM {EXPECTED_BASE}")
-        self.assertEqual(sum(line.startswith("FROM ") for line in lines), 1)
-        for setting in (
-            "TZ=UTC",
-            "LC_ALL=C.UTF-8",
-            "LANG=C.UTF-8",
-            "PYTHONHASHSEED=0",
-            "PYTHONDONTWRITEBYTECODE=1",
-            "PIP_DISABLE_PIP_VERSION_CHECK=1",
-            "PIP_NO_INPUT=1",
-            "PIP_CONFIG_FILE=/dev/null",
-            "PIP_INDEX_URL=https://pypi.org/simple",
-            'PIP_EXTRA_INDEX_URL=""',
-            'PIP_FIND_LINKS=""',
-            "PIP_NO_CACHE_DIR=1",
-        ):
-            self.assertIn(setting, text)
-        self.assertEqual(
-            re.findall(r"^COPY\s+(.+?)\s+/opt/threadroot/release-requirements\.txt$", text, re.MULTILINE),
-            ["requirements/release.txt"],
-        )
-        self.assertIn(
-            "python -m pip install --no-cache-dir --no-deps --require-hashes --only-binary=:all:",
-            text,
-        )
-        self.assertIn("python -m pip check", text)
+        _assert_dockerfile_contract(text)
 
     def test_dockerignore_exposes_only_release_lock(self) -> None:
         path = Path(".dockerignore")
