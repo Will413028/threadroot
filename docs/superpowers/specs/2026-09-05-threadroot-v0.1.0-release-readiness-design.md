@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-05
 
-**Status:** Approved in chat; awaiting written-spec review
+**Status:** Approved
 
 **Release:** `v0.1.0`
 **Repository:** `https://github.com/Will413028/threadroot`
