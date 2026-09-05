@@ -206,10 +206,16 @@ def _canonical_name(name: str) -> str:
 
 
 def _installed_packages() -> dict[str, str]:
-    return {
-        _canonical_name(item.metadata["Name"]): item.version
-        for item in importlib.metadata.distributions()
-    }
+    packages: dict[str, str] = {}
+    for item in importlib.metadata.distributions():
+        name = item.metadata.get("Name")
+        if not name:
+            raise ReleaseArtifactError("installed distribution has no Name")
+        canonical = _canonical_name(name)
+        if canonical in packages:
+            raise ReleaseArtifactError("installed distribution canonical duplicate")
+        packages[canonical] = item.version
+    return packages
 
 
 def _parse_lock_versions(text: str) -> dict[str, str]:
@@ -374,7 +380,7 @@ def _validate_denylist(denylist: Path | None) -> None:
     try:
         metadata = os.lstat(denylist)
     except FileNotFoundError:
-        return
+        raise ReleaseArtifactError("denylist is missing")
     except OSError as error:
         raise ReleaseArtifactError("denylist is unreadable") from error
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
@@ -414,7 +420,7 @@ def _exclusive_publish(parent_fd: int, pending: str, selected: str, pending_fd: 
             descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=pending_fd)
             try:
                 metadata = os.fstat(descriptor)
-                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size != expected_size:
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o7777 != 0o644 or metadata.st_nlink != 1 or metadata.st_size != expected_size:
                     raise OSError("pending member changed")
                 actual_hash, actual_size = _hash_descriptor(descriptor)
                 if actual_hash != expected_hash or actual_size != expected_size:

@@ -88,6 +88,60 @@ def _fake_extract(_artifact: Path, destination: Path, **_kwargs: object) -> None
 
 
 class BuildAndVerifyTests(unittest.TestCase):
+    def test_lock_requires_exactly_one_approved_option(self) -> None:
+        with TemporaryDirectory() as directory:
+            lock = Path(directory) / "release.txt"
+            lock.write_text("build==1.6.0 \\\n+    --hash=sha256:" + "0" * 64 + "\n", encoding="utf-8")
+            with self.assertRaises(ReleaseArtifactError):
+                release_artifacts._read_lock_versions(lock)
+
+    def test_installed_package_canonical_duplicate_is_rejected(self) -> None:
+        class Distribution:
+            def __init__(self, name: str) -> None:
+                self.metadata = {"Name": name}
+                self.version = "1.0"
+        with patch.object(release_artifacts.importlib.metadata, "distributions", return_value=[Distribution("foo-bar"), Distribution("foo_bar")]):
+            with self.assertRaises(ReleaseArtifactError):
+                release_artifacts._installed_packages()
+
+    def test_missing_fixed_denylist_is_rejected_before_output(self) -> None:
+        with patch.object(release_artifacts.os, "lstat", side_effect=FileNotFoundError):
+            with self.assertRaises(ReleaseArtifactError):
+                release_artifacts._validate_denylist(Path("/run/threadroot/denylist"))
+
+    def test_replay_symlink_wheel_is_rejected(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidate = root / "candidate"
+            _seed_candidate(candidate)
+            artifacts = ArtifactSet.load(candidate, "0.1.0")
+            evidence = root / "evidence"
+            evidence.mkdir()
+            def fake_extract(_artifact: Path, destination: Path, **_kwargs: object) -> None:
+                (destination / "threadroot-0.1.0").mkdir(parents=True)
+            def fake_run(_command: list[str], _environment: dict[str, str]) -> None:
+                output = evidence / "replay-wheel"
+                output.mkdir(exist_ok=True)
+                (output / artifacts.wheel.name).symlink_to(artifacts.wheel)
+            with patch.object(release_artifacts, "extract_regular_tar", side_effect=fake_extract), patch.object(release_artifacts, "_run", side_effect=fake_run):
+                with self.assertRaises(ReleaseArtifactError):
+                    release_artifacts._replay_sdist(artifacts, evidence, 1)
+
+    def test_pending_mode_mutation_is_rejected(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidate = root / "candidate"
+            _seed_candidate(candidate)
+            artifacts = ArtifactSet.load(candidate, "0.1.0")
+            hashes = {name: release_artifacts._sha256(candidate / name) for name in expected_asset_names("0.1.0")}
+            original_publish = release_artifacts._exclusive_publish
+            def mutate(*args: object, **kwargs: object) -> None:
+                pending = root / "selected.pending" / expected_asset_names("0.1.0")[0]
+                pending.chmod(0o777)
+                original_publish(*args, **kwargs)
+            with patch.object(release_artifacts, "_exclusive_publish", side_effect=mutate):
+                with self.assertRaises(ReleaseArtifactError):
+                    release_artifacts._promote(root, artifacts, hashes)
     def test_environment_gate_rejects_ambient_epoch_mismatch(self) -> None:
         environment = dict(release_artifacts.EXPECTED_ENVIRONMENT)
         environment["SOURCE_DATE_EPOCH"] = "99"
