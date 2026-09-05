@@ -760,6 +760,7 @@ def _inspect_doctor(vault: Path) -> CommandResult:
         return _doctor_result(root, issues, error_exit=error.exit_code)
 
     unsafe = False
+    error_exit: ExitCode | None = None
     for relative in (
         config.paths.daily,
         config.paths.projects,
@@ -771,6 +772,8 @@ def _inspect_doctor(vault: Path) -> CommandResult:
         except ThreadrootError as error:
             issues.append(Issue("error", error.code, error.message, relative))
             unsafe = unsafe or error.exit_code == ExitCode.UNSAFE_PATH
+            if error.exit_code == ExitCode.IO_OR_DRIFT:
+                error_exit = error.exit_code
             continue
         if not target.exists():
             issues.append(
@@ -812,4 +815,4 @@ def _inspect_doctor(vault: Path) -> CommandResult:
 
     if not (root / ".git").exists():
         issues.append(Issue("info", "git.not_found", "Git metadata was not found.", ".git"))
-    return _doctor_result(root, issues, unsafe=unsafe)
+    return _doctor_result(root, issues, unsafe=unsafe, error_exit=error_exit)

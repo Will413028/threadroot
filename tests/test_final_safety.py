@@ -29,6 +29,31 @@ DOCTOR_REMEDIATIONS = {
 
 
 class DoctorRemediationTests(unittest.TestCase):
+    def test_content_inspection_io_preserves_exit_six(self):
+        from threadroot import operations
+        with TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            root = base / "vault"
+            self.assertTrue(run_init(root, True, False, {}, base / "home").ok)
+            real_check = operations.ensure_outside_secrets
+            def fail_content_check(vault, relative):
+                if relative == "daily":
+                    raise ThreadrootError(ExitCode.IO_OR_DRIFT, "filesystem.failed",
+                                          "Synthetic inspection failure.")
+                return real_check(vault, relative)
+            before = {path.relative_to(base): path.lstat()
+                      for path in [base, *base.rglob("*")]}
+            with patch.object(operations, "ensure_outside_secrets", side_effect=fail_content_check):
+                result = run_doctor(root)
+            self.assertEqual(result.exit_code, ExitCode.IO_OR_DRIFT)
+            self.assertFalse(result.ok)
+            self.assertFalse(result.applied)
+            self.assertEqual(result.changes, ())
+            self.assertEqual(result.issues[0].code, "filesystem.failed")
+            self.assertTrue(result.issues[0].message.endswith(DOCTOR_REMEDIATIONS["filesystem.failed"]))
+            self.assertEqual(before, {path.relative_to(base): path.lstat()
+                                      for path in [base, *base.rglob("*")]})
+
     def test_every_error_has_concrete_remediation(self):
         for scenario in ("missing-root", "file-root", "missing-marker", "malformed",
                          "unknown-schema", "missing-directory", "file-directory", "unsafe"):
