@@ -646,6 +646,27 @@ class CommonArchiveTests(unittest.TestCase):
                 extract_regular_tar(artifact, root / "out")
             self.assertEqual((replacement / "competitor").read_text(), "keep")  # type: ignore[operator]
 
+    def test_first_staging_open_failure_cleans_owned_directory(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "artifact.tar"
+            artifact.write_bytes(_tar_bytes([("safe/file", b"safe", 0o644, tarfile.REGTYPE)]))
+            original = release_archives._open_directory
+            failed = False
+
+            def fail_once(parent_fd: int, name: str) -> int:
+                nonlocal failed
+                if name.startswith(".out.stage-") and not failed:
+                    failed = True
+                    raise OSError("first open failure")
+                return original(parent_fd, name)
+
+            with patch.object(release_archives, "_open_directory", side_effect=fail_once), self.assertRaises(ReleaseArchiveError):
+                extract_regular_tar(artifact, root / "out")
+            self.assertTrue(failed)
+            self.assertFalse((root / "out").exists())
+            self.assertEqual(list(root.glob(".out.stage-*")), [])
+
     def test_staging_replacement_before_publication_is_not_published_or_removed(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -757,6 +778,22 @@ class WheelContractTests(unittest.TestCase):
             with self.assertRaises(ReleaseArchiveError):
                 validate_wheel(artifact, source, "0.1.0", WHEEL_EPOCH)
 
+    def test_wheel_rejects_multipart_header_payload_as_structured_error(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _make_wheel_source(root)
+            order, payloads = _wheel_payloads(source)
+            wheel = "threadroot-0.1.0.dist-info/WHEEL"
+            payloads[wheel] = payloads[wheel].rstrip(b"\n") + (
+                b"\nContent-Type: multipart/mixed; boundary=x\nMIME-Version: 1.0\n\n"
+                b"--x\nContent-Type: text/plain\n\nbody\n--x--\n"
+            )
+            artifact = root / "multipart.whl"
+            _write_wheel(artifact, order, payloads)
+            with self.assertRaises(ReleaseArchiveError) as raised:
+                validate_wheel(artifact, source, "0.1.0", WHEEL_EPOCH)
+            self.assertEqual(raised.exception.code, "metadata_mismatch")
+
     def test_wheel_rejects_malformed_record_fields_without_regeneration(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -770,13 +807,16 @@ class WheelContractTests(unittest.TestCase):
             mutations = {
                 "digest": rows[0].replace("sha256=", "sha256=x", 1),
                 "size": rows[0].rsplit(",", 1)[0] + ",999",
-                "self": rows[-1] + "sha256=x,1",
+                "self-digest": f"{record},sha256=eA,",
+                "self-size": f"{record},,1",
             }
             for label, changed in mutations.items():
                 with self.subTest(label=label):
                     payloads = dict(original)
                     changed_rows = list(rows)
-                    changed_rows[0 if label != "self" else -1] = changed
+                    changed_rows[0 if not label.startswith("self-") else -1] = changed
+                    if label.startswith("self-"):
+                        self.assertEqual(len(changed.split(",")), 3)
                     payloads[record] = ("\n".join(changed_rows) + "\n").encode()
                     self.assertNotEqual(payloads[record], original[record])
                     artifact = root / f"record-{label}.whl"
@@ -784,6 +824,8 @@ class WheelContractTests(unittest.TestCase):
                     with self.assertRaises(ReleaseArchiveError) as raised:
                         validate_wheel(artifact, source, "0.1.0", WHEEL_EPOCH)
                     self.assertEqual(raised.exception.code, "record_mismatch")
+                    if label.startswith("self-"):
+                        self.assertIn("self-row", str(raised.exception))
     def test_wheel_rejects_source_swap_at_descriptor_open(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

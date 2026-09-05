@@ -382,6 +382,24 @@ def _cleanup_owned_staging(parent_fd: int, stage_fd: int, stage_name: str, ident
         return
 
 
+def _cleanup_unopened_staging(parent_fd: int, stage_name: str, identity: os.stat_result) -> None:
+    try:
+        descriptor = _open_directory(parent_fd, stage_name)
+    except OSError:
+        return
+    try:
+        if not _same_identity(os.fstat(descriptor), identity):
+            return
+        _clear_directory(descriptor)
+        current = os.stat(stage_name, dir_fd=parent_fd, follow_symlinks=False)
+        if _same_identity(current, identity):
+            os.rmdir(stage_name, dir_fd=parent_fd)
+    except OSError:
+        return
+    finally:
+        os.close(descriptor)
+
+
 def _extract_members(
     destination: Path,
     members: list[tuple[PurePosixPath, bool, int, bytes]],
@@ -417,11 +435,12 @@ def _extract_members(
     try:
         os.mkdir(stage_name, 0o700, dir_fd=parent_fd)
         pathname_identity = os.stat(stage_name, dir_fd=parent_fd, follow_symlinks=False)
-        stage_fd = _open_directory(parent_fd, stage_name)
-        stage_identity = os.fstat(stage_fd)
-        if not _same_identity(pathname_identity, stage_identity):
-            raise OSError("staging directory changed before first open")
+        stage_identity = pathname_identity
         created = True
+        stage_fd = _open_directory(parent_fd, stage_name)
+        opened_identity = os.fstat(stage_fd)
+        if not _same_identity(pathname_identity, opened_identity):
+            raise OSError("staging directory changed before first open")
         try:
             for path, is_directory, mode, payload in members:
                 parts = path.parts
@@ -461,6 +480,8 @@ def _extract_members(
     finally:
         if created and stage_fd is not None and stage_identity is not None:
             _cleanup_owned_staging(parent_fd, stage_fd, stage_name, stage_identity)
+        elif created and stage_identity is not None:
+            _cleanup_unopened_staging(parent_fd, stage_name, stage_identity)
         if stage_fd is not None:
             os.close(stage_fd)
         os.close(parent_fd)
@@ -606,7 +627,8 @@ def _parse_header_metadata(payload: bytes) -> object:
         message = BytesParser(policy=email_policy).parsebytes(payload)
     except Exception:
         raise _fail("metadata_mismatch", "invalid header metadata") from None
-    if message.get_payload() not in {None, ""}:
+    body = message.get_payload()
+    if body is not None and body != "":
         raise _fail("metadata_mismatch", "header metadata has a body")
     return message
 
