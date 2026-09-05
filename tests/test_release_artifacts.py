@@ -91,7 +91,13 @@ class BuildAndVerifyTests(unittest.TestCase):
     def test_lock_requires_exactly_one_approved_option(self) -> None:
         with TemporaryDirectory() as directory:
             lock = Path(directory) / "release.txt"
-            lock.write_text("build==1.6.0 \\\n+    --hash=sha256:" + "0" * 64 + "\n", encoding="utf-8")
+            row = "build==1.6.0 " + "\\\n" + "    --hash=sha256:" + "0" * 64 + "\n"
+            lock.write_text(row, encoding="utf-8")
+            with self.assertRaises(ReleaseArtifactError):
+                release_artifacts._read_lock_versions(lock)
+            lock.write_text("--only-binary=:all:\n" + row, encoding="utf-8")
+            self.assertEqual(release_artifacts._read_lock_versions(lock), {"build": "1.6.0"})
+            lock.write_text("--only-binary=:all:\n--only-binary=:all:\n" + row, encoding="utf-8")
             with self.assertRaises(ReleaseArtifactError):
                 release_artifacts._read_lock_versions(lock)
 

@@ -243,6 +243,8 @@ def _parse_lock_versions(text: str) -> dict[str, str]:
         versions[name] = match.group(2)
     if not versions:
         raise ReleaseArtifactError("release lock is empty")
+    if not option_seen:
+        raise ReleaseArtifactError("release lock is missing approved option")
     return versions
 
 
