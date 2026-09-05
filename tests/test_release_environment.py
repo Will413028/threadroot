@@ -148,10 +148,13 @@ def _assert_dockerfile_contract(text: str) -> None:
 
 class ReleaseEnvironmentTests(unittest.TestCase):
     def test_release_lock_rejects_unapproved_requirement_option(self) -> None:
-        text = """--only-binary=:all:
---requirement extra-release.txt
-build==1.6.0 --hash=sha256:f7aaf1ebbb79178a02ba248bb524f2176b256017e17e8e4bd4289c7b38cc2bad
-"""
+        valid = Path("requirements/release.txt").read_text(encoding="utf-8")
+        _assert_release_lock_text(valid)
+        text = valid.replace(
+            "--only-binary=:all:\n",
+            "--only-binary=:all:\n--requirement extra-release.txt\n",
+            1,
+        )
         with self.assertRaises(AssertionError):
             _assert_release_lock_text(text)
 
