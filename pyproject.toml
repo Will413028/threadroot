@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=69"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling>=1.32,<2"]
+build-backend = "hatchling.build"
 
 [project]
 name = "threadroot"
@@ -9,6 +9,7 @@ description = "Local-first second-brain workflows for coding agents"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [{ name = "Threadroot contributors" }]
 dependencies = []
 
@@ -20,8 +21,25 @@ Issues = "https://github.com/Will413028/threadroot/issues"
 [project.scripts]
 threadroot = "threadroot.cli:main"
 
-[tool.setuptools]
-include-package-data = false
+[tool.hatch.build]
+reproducible = true
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.hatch.build.targets.wheel]
+packages = ["src/threadroot"]
+
+[tool.hatch.build.targets.sdist]
+only-include = [
+  ".claude-plugin",
+  ".codex-plugin",
+  "AGENTS.md",
+  "CONTRIBUTING.md",
+  "LICENSE",
+  "README.md",
+  "SECURITY.md",
+  "docs",
+  "scripts",
+  "skills",
+  "src/threadroot",
+  "templates",
+  "tests",
+]

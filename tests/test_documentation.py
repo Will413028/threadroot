@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
-import shlex
 from tempfile import TemporaryDirectory
+import tomllib
 import unittest
 from urllib.parse import urlsplit
 
@@ -306,14 +306,12 @@ class DocumentationTests(unittest.TestCase):
                 self.assertIn(statement, notes)
         self.assertNotIn("OWNER/threadroot", notes)
 
-    def test_source_manifest_includes_public_policy_documents(self) -> None:
-        direct_includes: set[str] = set()
-        for line in Path("MANIFEST.in").read_text(encoding="utf-8").splitlines():
-            fields = shlex.split(line, comments=True)
-            if len(fields) == 2 and fields[0] == "include":
-                direct_includes.add(fields[1])
+    def test_sdist_configuration_includes_public_policy_documents(self) -> None:
+        metadata = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+        self.assertIn("hatch", metadata.get("tool", {}))
+        included_roots = metadata["tool"]["hatch"]["build"]["targets"]["sdist"]["only-include"]
 
-        self.assertTrue({"CONTRIBUTING.md", "SECURITY.md"} <= direct_includes)
+        self.assertTrue({"CONTRIBUTING.md", "SECURITY.md"} <= set(included_roots))
 
     def test_ci_has_exact_matrix_pins_and_validation_commands(self) -> None:
         workflow_path = Path(".github/workflows/ci.yml")
