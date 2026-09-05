@@ -4,8 +4,7 @@
 
 **Status:** Approved
 
-**Artifact-identity amendment:** Draft for maintainer review; architectural
-direction approved 2026-09-06
+**Artifact-identity amendment:** Approved 2026-09-06
 
 **Release:** `v0.1.0`
 **Repository:** `https://github.com/Will413028/threadroot`

@@ -23,6 +23,11 @@ SHA-256.
 **Spec:**
 `docs/superpowers/specs/2026-09-05-threadroot-v0.1.0-release-readiness-design.md`
 
+**Task 4 amendment:**
+`docs/superpowers/plans/2026-09-06-threadroot-artifact-identity-amendment.md`
+supersedes the remaining Task 4 implementation checklist after the initial
+artifact-orchestrator review exposed a cross-phase identity flaw.
+
 **Execution mode:** Subagent-Driven, as already selected by the user. Execute
 one task at a time with fresh implementation and review agents; external
 authorization gates remain with the primary agent.
@@ -729,6 +734,13 @@ git commit -m "build: validate release archive contracts"
 
 ### Task 4: Build, compare, replay, scan, and promote artifact sets
 
+> **Execution amendment (approved 2026-09-06):** Do not continue this section
+> as a standalone two-file task. Complete the approved artifact-identity
+> amendment plan named above, then mark this task complete and resume at Task
+> 5. The requirements below remain binding product context; the amendment plan
+> is the executable checklist and expands the implementation scope to the Task
+> 3 archive core and tests.
+
 **Files:**
 
 - Create: `scripts/release_artifacts.py`
@@ -1022,6 +1034,29 @@ def test_docker_run_is_offline_read_only_and_unprivileged(self) -> None:
     self.assertNotIn("--privileged", argv)
 ```
 
+The artifact-identity amendment makes this outer boundary authoritative. Add
+`test_docker_run_exactly_establishes_artifact_identity_perimeter`, parse every
+`--mount` value, and assert the complete list is exactly:
+
+```python
+[
+    "type=bind,src=/outside/source-a,dst=/source-a,readonly",
+    "type=bind,src=/outside/source-b,dst=/source-b,readonly",
+    "type=bind,src=/outside/build,dst=/release-output",
+]
+```
+
+When a denylist is supplied, the sole additional mount must end with
+`dst=/run/threadroot/denylist,readonly`. Assert there is one writable mount,
+its destination is `/release-output`, no Docker socket or extra host path is
+present, and the argv contains exactly one each of `--read-only`,
+`--network none`, `--cap-drop ALL`,
+`--security-opt no-new-privileges`, `--user UID:GID`, and the fixed inside
+arguments `--source-a /source-a --source-b /source-b --output
+/release-output`. Independently delete or alter each security option in a
+table-driven validator fixture and require rejection before the inner entry
+point can run.
+
 Add separate tests named
 `test_requires_full_commit_and_absolute_output_outside_repository`,
 `test_rejects_docker_mount_delimiters_and_control_characters`,
@@ -1032,6 +1067,9 @@ Add separate tests named
 `test_docker_build_uses_exact_platform_dockerfile_and_export_context`,
 `test_optional_denylist_is_mounted_read_only_without_entering_argv_logs`, and
 `test_inside_mode_requires_container_sentinel_and_calls_build_and_verify`.
+The inside-mode test must also reject any source or output value other than
+exactly `/source-a`, `/source-b`, and `/release-output` before importing or
+calling Task 4.
 For every rejection test, assert both the stable exception message and that no
 Docker run occurred. For the denylist test, assert only the fixed container path
 appears after `--denylist`; the host basename and bytes must be absent from
