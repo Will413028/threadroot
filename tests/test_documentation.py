@@ -218,6 +218,22 @@ class DocumentationTests(unittest.TestCase):
             {path.parent.name for path in Path("skills").glob("*/SKILL.md")},
         )
 
+    def test_readme_repository_install_uses_live_public_remote(self) -> None:
+        readme = Path("README.md").read_text(encoding="utf-8")
+        section = _section(readme, "Install from the Git repository")
+        commands = (
+            "git clone https://github.com/Will413028/threadroot.git",
+            "cd threadroot",
+            "python -m pip install .",
+            "claude plugin marketplace add Will413028/threadroot --scope user",
+            "codex plugin marketplace add Will413028/threadroot",
+        )
+
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertRegex(section, rf"(?m)^{re.escape(command)}$")
+        self.assertNotIn("OWNER/threadroot", readme)
+
     def test_readme_release_artifacts_match_real_builder_outputs(self) -> None:
         readme = Path("README.md").read_text(encoding="utf-8")
         with TemporaryDirectory() as directory:

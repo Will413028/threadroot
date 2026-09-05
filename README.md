@@ -71,16 +71,16 @@ codex plugin marketplace add .
 codex plugin add threadroot@threadroot
 ```
 
-## Install from a Git repository after a remote exists
+## Install from the Git repository
 
-`OWNER/threadroot` is a placeholder, not a live repository claim. Replace `OWNER` with the actual repository owner only after a remote exists.
+Clone the public repository for the CLI, or add the same repository directly as a host marketplace:
 
 ```bash
-git clone https://github.com/OWNER/threadroot.git
+git clone https://github.com/Will413028/threadroot.git
 cd threadroot
 python -m pip install .
-claude plugin marketplace add OWNER/threadroot --scope user
-codex plugin marketplace add OWNER/threadroot
+claude plugin marketplace add Will413028/threadroot --scope user
+codex plugin marketplace add Will413028/threadroot
 ```
 
 Install `threadroot@threadroot` with the relevant host after adding the repository marketplace.
