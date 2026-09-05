@@ -153,6 +153,53 @@ def rejected_tree_state(root: Path) -> tuple[tuple[str, str, bytes], ...]:
     return tuple(sorted(entries))
 
 
+class MarkdownFenceTests(unittest.TestCase):
+    def test_fenced_decoys_do_not_supply_structure(self):
+        from scripts.check_contract import _markdown_structure
+        for fence in ("```", "~~~~", "````"):
+            with self.subTest(fence=fence):
+                payload = (f"## Real ###\n\n{fence}text\n## Decoy\n"
+                           f"[[hidden]] [hidden](hidden.md)\n{fence}\n[[visible]]\n").encode()
+                self.assertEqual(_markdown_structure(payload), (("Real",), ("visible",)))
+
+    def test_shorter_or_wrong_fence_does_not_close(self):
+        from scripts.check_contract import _markdown_structure
+        payload = b"````\n```\n## Hidden\n~~~\n[[hidden]]\n````\n## Real ###\n"
+        self.assertEqual(_markdown_structure(payload), (("Real",), ()))
+
+
+    def test_fence_edge_cases_and_atx_closing_hashes(self):
+        from scripts.check_contract import _markdown_structure
+        cases = [
+            (b"   ~~~ language\n## Hidden\n   ~~~~~\n   ## Real ###  \n", (("Real",), ())),
+            (b"~~~\n## Hidden\n[[hidden]]\n", ((), ())),
+            (b"``` bad`info\n## Visible\n", (("Visible",), ())),
+            (b"~~~ bad`info\n## Hidden\n~~~\n## C#\n## C###\n", (("C#", "C###"), ())),
+            (b"#\n## Real#\n## Real ###\n", (("", "Real", "Real#"), ())),
+            (b"\xff## Hidden", ((), ())),
+        ]
+        for payload, expected in cases:
+            with self.subTest(payload=payload):
+                self.assertEqual(_markdown_structure(payload), expected)
+
+    def test_fenced_heading_and_link_cannot_satisfy_case(self):
+        from scripts.check_contract import materialize_fixture, validate_contract
+        case = json.loads(Path("tests/fixtures/contracts/project-decision.json").read_text())
+        with TemporaryDirectory() as temporary:
+            before = Path(temporary) / "before"
+            after = Path(temporary) / "after"
+            materialize_fixture(case, before)
+            materialize_fixture(case, after)
+            project = after / "wiki/projects/orchard-cli/index.md"
+            project.write_text(project.read_text() + "\n[[decisions/2042-04-03-json-storage]]\n")
+            adr = "wiki/projects/orchard-cli/decisions/2042-04-03-json-storage.md"
+            (after / adr).write_text("```\n## Options Considered\n## Decision\n"
+                                     "## Rationale\n[[../index]]\n```\n")
+            failures = {(item.code, item.path) for item in validate_contract(case, before, after)}
+            self.assertIn(("missing_heading", adr), failures)
+            self.assertIn(("missing_link", adr), failures)
+
+
 class SnapshotTests(unittest.TestCase):
     def test_snapshot_hashes_bytes_and_extracts_normalized_markdown_structure(self) -> None:
         with TemporaryDirectory() as directory:

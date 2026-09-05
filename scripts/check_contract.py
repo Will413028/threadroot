@@ -25,7 +25,7 @@ CASE_KEYS = frozenset(
         "forbidden_paths",
     }
 )
-HEADING_PATTERN = re.compile(r"^#{1,6}\s+(.+?)\s*$")
+HEADING_PATTERN = re.compile(r"^ {0,3}#{1,6}(?:[ \t]+(.*)|$)")
 WIKILINK_PATTERN = re.compile(r"\[\[([^\]\r\n]+)\]\]")
 MARKDOWN_LINK_PATTERN = re.compile(
     r"(?<!!)\[[^\]\r\n]*\]\(\s*(?:<([^>\r\n]+)>|([^\s)\r\n]+))"
@@ -283,17 +283,41 @@ def _normalize_destination(value: str) -> str:
     return destination
 
 
+def _markdown_visible_lines(text: str) -> list[str]:
+    visible: list[str] = []
+    fence_character = ""
+    fence_length = 0
+    for line in text.splitlines():
+        if fence_character:
+            closing = re.fullmatch(r" {0,3}(" + re.escape(fence_character)
+                                   + r"{" + str(fence_length) + r",})[ \t]*", line)
+            if closing:
+                fence_character = ""
+                fence_length = 0
+            continue
+        opening = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+        if opening and not (opening.group(1)[0] == "`" and "`" in opening.group(2)):
+            fence_character = opening.group(1)[0]
+            fence_length = len(opening.group(1))
+            continue
+        visible.append(line)
+    return visible
+
+
 def _markdown_structure(payload: bytes) -> tuple[tuple[str, ...], tuple[str, ...]]:
     try:
         text = payload.decode("utf-8")
     except UnicodeDecodeError:
         return (), ()
 
+    text = "\n".join(_markdown_visible_lines(text))
     headings = []
     for line in text.splitlines():
         match = HEADING_PATTERN.match(line)
         if match:
-            headings.append(match.group(1))
+            heading = match.group(1) or ""
+            heading = re.sub(r"[ \t]+#+[ \t]*$", "", heading)
+            headings.append(heading.strip())
 
     destinations = []
     for match in WIKILINK_PATTERN.finditer(text):
