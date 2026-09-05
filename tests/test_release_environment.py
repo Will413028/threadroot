@@ -175,7 +175,18 @@ class ReleaseEnvironmentTests(unittest.TestCase):
 
     def test_dockerfile_rejects_comment_only_install_and_check(self) -> None:
         text = Path("tools/release/Dockerfile").read_text(encoding="utf-8")
-        mutated = text.replace("RUN python -m pip install", "# RUN python -m pip install")
+        original_run = (
+            "RUN python -m pip install --no-cache-dir --no-deps --require-hashes "
+            "--only-binary=:all: " + "\\\n"
+            "      -r /opt/threadroot/release-requirements.txt " + "\\\n"
+            "    && python -m pip check"
+        )
+        mutated = text.replace(
+            original_run,
+            "RUN true # python -m pip install --no-deps && python -m pip check",
+            1,
+        )
+        self.assertNotEqual(text, mutated)
         with self.assertRaises(AssertionError):
             _assert_dockerfile_contract(mutated)
 
