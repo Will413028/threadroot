@@ -2289,6 +2289,931 @@ Expected: tests, builds, scans, and Claude validation exit `0`; `git status --sh
 
 Do not tag, push, publish, create a remote, submit to a marketplace, or claim private dogfood success unless those steps were separately authorized and completed.
 
+### Task 13: Final-Review Safety Fix Wave
+
+**Execution boundary:** This is the active SDD final review's single fix wave. The same final-fix implementer executes every step group below, with no new workspace, plan, subagent, or intermediate reviewer. Commit groups are checkpoints within this one task, not independent SDD tasks. After the full wave, the controller conducts exactly one scoped re-review against the final-review findings and directly affected mechanisms. Do not restart Tasks 1–12 or their host/private-vault procedures. This task supersedes their missing-file creation instructions where they conflict with the approved exclusive-claim design.
+
+**Authority:** `docs/superpowers/specs/2026-09-02-threadroot-v0-design.md`, approved at commit `fe0ff4938dcb2a4f009d0ed623a380be1c84dc9c`. The ignored final-fix brief and final-fix report record the review findings and authorizations. Read repository `AGENTS.md` before execution. Use systematic-debugging for root-cause confirmation, test-driven-development for observable behavior, writing-skills and skill-creator before changing shared skills, and verification-before-completion before commits. The single-implementer constraint overrides skill suggestions to delegate. No new model call or network authorization follows from this plan.
+
+**Global constraints restated for this task:** Python 3.11–3.14, macOS/Linux, runtime standard library only, empty runtime dependency list, existing schema version `1`, plugin/version `threadroot` / `0.1.0`. The CLI receives no note bytes, `claim` creates no parents, and semantic edits remain host-native. Do not add migration, journals, expected hashes, MCP, RAG, telemetry, networking, Windows, marketplace submission, or a new runtime Markdown parser. Malicious replacement of validated filesystem entries between validation and use remains outside the threat model. Preserve user changes; no private vault access, push, tag, publish, remote creation, or marketplace submission. All local document/code edits use the active patch mechanism. Ignore unrelated deferred scanner work.
+
+**File responsibility map:** Line references describe the spec-update baseline; locate named definitions again before editing.
+
+| Exact path | Responsibility and planned change |
+|---|---|
+| `src/threadroot/paths.py` | `resolve_path:28`, `ensure_within:47`, `find_upward:61`, pointer helpers:73–133; safe literal/I/O translation, lexical/resolved secrets rejection, pointer exclusion, unique claim-root containment |
+| `src/threadroot/config.py` | `load_config:58`; reject marker/configured secrets paths before content reads, disallow configured marker namespace |
+| `src/threadroot/operations.py` | `_is_initialized:64`, setup planners:85/150, `apply_plan:275`, `write_default_pointer:341`, runners:391/470/587; preserve codes, pointer preflights, claim plan/apply, doctor remediation |
+| `src/threadroot/results.py` | Extend only `CommandName` with `claim`; preserve result fields, action/status literals and exit values |
+| `src/threadroot/cli.py` | Parser:21, `execute:35`, `main:96`; claim syntax/dispatch and sanitized structured boundary errors |
+| `tests/test_final_safety.py` | Create: synthetic path, I/O, init-code, pointer-overlap/cleanup, and doctor regressions |
+| `tests/test_claim.py` | Create: claim planning, exclusive apply, CLI, containment, collision, and privacy regressions |
+| `tests/skill_contract.py` | Preserve existing contract parser; add named claim invariant keys and a test-only metadata event-trace validator |
+| `tests/test_skills.py` | Exact command inventories/invariants, mutations, and existing workflow contracts |
+| `tests/test_claim_workflows.py` | Create: executable response/trace rejection oracles and all-five-skill inventory/invariant tests; never claim these simulate a model |
+| `skills/README.md` | Shared claim–verify–native-edit protocol and failure behavior |
+| `skills/recording/SKILL.md` | Claim missing authorized daily or separately approved knowledge files; preserve daily-only routing when project missing |
+| `skills/daily-wrap-up/SKILL.md` | Claim missing daily only after existing direct-creation gate |
+| `skills/weekly-review/SKILL.md` | Claim missing review only; retain single-review write set |
+| `skills/project-kickoff/SKILL.md` | Claim project page; omit outside-vault adapter without independently exclusive native creation; retain complete-preview gate |
+| `skills/decision-log/SKILL.md` | Claim absent ADR; preserve existing matching-content no-op only when observed before claiming, and retain backlink/supersession gates |
+| `scripts/check_contract.py` | `_markdown_structure:286`; fence-aware structural extraction, ordinary ATX closing hashes |
+| `tests/test_contracts.py` | Fenced decoys, closing hashes, and unchanged prose/hash contract |
+| `README.md`, `SECURITY.md`, `docs/testing.md`, `AGENTS.md` | Public command, pointer, privacy, concurrency, workflow, and verification contract consistency |
+| `tests/test_documentation.py`, `tests/test_packaging.py`, `tests/test_release.py` | Existing documentation/manifest/build verification; extend only observable command/content packaging coverage if necessary |
+| `.superpowers/sdd/2026-09-02-threadroot-v0/final-fix-report.md` | Ignored execution evidence, RED/GREEN commands, commit hashes and final limitations |
+| `.superpowers/sdd/2026-09-02-threadroot-v0/task-12-report.md`, `.superpowers/sdd/2026-09-02-threadroot-v0/progress.md` | Ignored historical-summary reconciliation and Task 12/13 ledger status; never stage |
+
+**Interfaces and stable results:** Existing signatures remain unchanged unless explicitly extended here. `Path`, `Mapping`, `Sequence`, `VaultConfig`, `PlannedChange`, `Change`, `Issue`, `CommandResult`, `ThreadrootError`, and `ExitCode` are the existing pathlib/collections/config/operations/results types. New tests import these concrete names; no runtime protocol interpreter is introduced.
+
+| Producer | Exact signature |
+|---|---|
+| New path helper | `ensure_outside_secrets(root: Path, relative: str \| Path) -> Path` |
+| New pointer validator | `validate_default_pointer(vault: Path, pointer: Path) -> Path` |
+| New claim path validator | `ensure_claim_target(root: Path, relative: str, content_paths: Mapping[str, str]) -> Path` |
+| New claim planner | `plan_claim(vault: Path, relative: str) -> tuple[PlannedChange, ...]` |
+| New apply precondition | `_validate_claim(vault: Path, change: PlannedChange) -> None` |
+| New command runner | `run_claim(vault: Path, relative: str, apply: bool) -> CommandResult` |
+| Existing config reader | `load_config(root: Path) -> VaultConfig` |
+| Existing setup runner | `run_init(vault: Path, apply: bool, set_default: bool, environ: Mapping[str, str], home: Path) -> CommandResult` |
+| Existing adoption runner | `run_adopt(vault: Path, apply: bool, set_default: bool, environ: Mapping[str, str], home: Path) -> CommandResult` |
+| Existing doctor runner | `run_doctor(vault: Path) -> CommandResult` |
+| Existing plan application | `apply_plan(command: CommandName, vault: Path, plan: Sequence[PlannedChange]) -> CommandResult` |
+| Existing pointer writer | `write_default_pointer(vault: Path, environ: Mapping[str, str], home: Path) -> None` |
+| Existing root resolver | `resolve_vault(explicit: str \| Path \| None, cwd: Path, environ: Mapping[str, str], home: Path) -> Path` |
+| Existing CLI dispatch | `execute(args: argparse.Namespace, cwd: Path, environ: Mapping[str, str], home: Path) -> CommandResult` |
+| Extended doctor result helper | `_doctor_result(root: Path, issues: Sequence[Issue], *, unsafe: bool = False, error_exit: ExitCode \| None = None) -> CommandResult` |
+| New doctor message helper | `_doctor_issue(issue: Issue) -> Issue` |
+| New verification-only fence helper | `_markdown_visible_lines(text: str) -> list[str]` |
+| New test-only trace helper | `validate_claim_trace(events: Sequence[Mapping[str, object]], *, expected_vault: str = "/synthetic/vault", expected_path: str = "daily/2042-04-03.md") -> tuple[str, ...]` |
+
+The GREEN steps define the new interfaces' algorithms below. Keep `Change(action, path, status)` with `planned`, `completed`, `unexecuted`; claim uses `create_file`. Preserve the exact JSON keys `ok`, `command`, `applied`, `vault`, `changes`, `issues`; `exit_code` remains internal. Preview/planning failures have `applied=false`; a failure inside `apply_plan` has `applied=true`, completed/unexecuted changes, and visible state. Diagnostics never interpolate raw exceptions or an unvalidated path. Only the `vault` field/renderer's explicit root display may contain the resolved absolute root; pointer diagnostics use `machine-default-pointer`.
+
+| Trigger | Exit / issue code |
+|---|---|
+| Successful preview/apply | `0`, no error issue |
+| Missing required CLI argument, unsupported/abbreviated flag, note-content argument | `2` / `usage.invalid` |
+| Missing/unreadable/malformed root/config input | `3` / existing `vault.unresolved`, `config.invalid`, `config.unsupported_version`, `config.path_invalid` |
+| Absolute/traversing/NUL/escaping/secrets/marker claim path, ambiguous content root, unsafe pointer | `4` / `path.unsafe` |
+| Safe claim target already exists at planning, including empty file or dangling symlink | `5` / `target.conflict` |
+| Claim parent absent or not a directory at planning | `6` / `filesystem.failed` |
+| Target or safe parent changes after planning; exclusive open collision | `6` / `target.drifted` |
+| Ordinary metadata/resolution/open/write/replace I/O failure | `6` / `filesystem.failed` |
+
+Unsafe revalidation retains exit `4`, including in `init`; it is never flattened to `3` or a generic drift. Missing config/readability failures remain `3`; directory enumeration or resolution `PermissionError` is an operation failure `6`. Keep prior setup-specific conflict semantics where this task does not change them.
+
+#### Group A — Path, secrets, I/O, and init error boundaries
+
+- [ ] **A1: Reproduce and record the current boundary failures without edits.** Read `paths.py`, `config.py`, `_is_initialized`, setup runners, and `cli.execute`. Record these root causes in the ignored final-fix report: raw `ValueError` from NUL; ordinary resolution `OSError` re-raised or swallowed by the stat probe; unguarded setup `resolve`/`iterdir`; `_is_initialized` catches every `ThreadrootError` as configuration invalidity; marker containment permits a symlink into an internal `secrets` directory. Run `git status --short` and `PYTHONPATH=src:. python3 -m unittest tests.test_paths tests.test_config tests.test_operations tests.test_cli -v` as the baseline.
+
+- [ ] **A2: Write the path regressions in `tests/test_final_safety.py`.** Use this complete initial class and append all four A5 test methods and its listed additional rows now, before A3/A4. All content is synthetic. Tests assert issue values and absence of content opens, rather than only checking a message substring.
+
+~~~python
+import json
+import errno
+import os
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import unittest
+from unittest.mock import patch
+
+from threadroot.cli import build_parser, execute, render_json
+from threadroot.config import config_text, load_config
+from threadroot.operations import run_init, run_adopt, run_doctor, write_default_pointer
+from threadroot.paths import resolve_path, find_upward
+from threadroot.results import ExitCode, ThreadrootError
+
+
+class PathBoundaryTests(unittest.TestCase):
+    def test_nul_configured_path_is_structured_unsafe(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / ".second-brain").mkdir()
+            document = json.loads(config_text())
+            document["paths"]["daily"] = "daily\x00bad"
+            (root / ".second-brain/config.json").write_text(json.dumps(document))
+            with self.assertRaises(ThreadrootError) as caught:
+                load_config(root)
+            self.assertEqual((caught.exception.exit_code, caught.exception.code),
+                             (ExitCode.UNSAFE_PATH, "path.unsafe"))
+
+    def test_secret_marker_is_rejected_before_open(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / "secrets").mkdir()
+            (root / "secrets/config.json").write_text(config_text())
+            (root / ".second-brain").mkdir()
+            (root / ".second-brain/config.json").symlink_to(root / "secrets/config.json")
+            with patch.object(Path, "read_text", side_effect=AssertionError("content opened")) as read:
+                with self.assertRaises(ThreadrootError) as caught:
+                    load_config(root)
+                self.assertEqual(caught.exception.exit_code, ExitCode.UNSAFE_PATH)
+                read.assert_not_called()
+
+    def test_init_keeps_unsafe_exit(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / ".second-brain").mkdir()
+            document = json.loads(config_text())
+            document["paths"]["daily"] = "../outside"
+            (root / ".second-brain/config.json").write_text(json.dumps(document))
+            result = run_init(root, False, False, {}, root / "unused-home")
+            self.assertEqual(result.exit_code, ExitCode.UNSAFE_PATH)
+
+    def test_init_preview_permission_failure_is_structured(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch.object(Path, "iterdir", side_effect=PermissionError("synthetic I/O")):
+                result = run_init(root, False, False, {}, root / "unused-home")
+            self.assertEqual((result.exit_code, result.issues[0].code),
+                             (ExitCode.IO_OR_DRIFT, "filesystem.failed"))
+            self.assertFalse(result.applied)
+            self.assertEqual(result.changes, ())
+
+    def test_resolution_io_failure_is_structured_at_api_and_cli(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            failure = OSError(errno.EIO, "synthetic resolution failure", str(root / "opaque"))
+            with patch.object(Path, "resolve", side_effect=failure):
+                with self.assertRaises(ThreadrootError) as caught:
+                    resolve_path(root)
+                self.assertEqual(caught.exception.exit_code, ExitCode.IO_OR_DRIFT)
+                args = build_parser().parse_args(["doctor", "--vault", str(root), "--json"])
+                result = execute(args, root, {}, root)
+            self.assertEqual(result.exit_code, ExitCode.IO_OR_DRIFT)
+            self.assertNotIn(str(root), json.dumps(result.to_dict()["issues"]))
+            self.assertNotIn("Traceback", render_json(result))
+~~~
+
+- [ ] **A3: Confirm RED separately for each blocker.** Run `PYTHONPATH=src:. python3 -m unittest tests.test_final_safety.PathBoundaryTests -v`. Expected failures: raw NUL/resolution/enumeration errors, secret marker opens, and init returning `3` instead of `4`. Record the individual failing method and actual exception/assertion. Do not accept missing imports, syntax errors, or a broken fixture as the intended RED.
+
+- [ ] **A4: Implement minimal path/operation translations.** Keep existing modules. Reject NUL before pathlib normalization and translate `ValueError` only around path construction/resolution as `path.unsafe`. In `resolve_path`, translate `RuntimeError`/`ELOOP` to unsafe, non-ENOENT/non-ENOTDIR `OSError` to `filesystem.failed`; ignore only missing/not-directory from the optional non-strict stat probe. Preserve strict missing failures for the caller's precondition classification. Do not swallow ordinary I/O. Use this helper and call it before any marker/content read in `load_config`, `find_upward`, adopted-layout discovery, and doctor:
+
+~~~python
+def ensure_outside_secrets(root: Path, relative: str | Path) -> Path:
+    candidate = Path(relative)
+    if "secrets" in candidate.parts:
+        raise _unsafe_path()
+    resolved = ensure_within(root, relative)
+    resolved_root = resolve_path(root)
+    if "secrets" in resolved.relative_to(resolved_root).parts:
+        raise _unsafe_path()
+    return resolved
+~~~
+
+For config values, additionally reject lexical `.second-brain` as the first component and resolved paths at/below the resolved marker directory. Do not ban the marker itself from marker validation. `find_upward` must perform the safety check before `is_file` or content access when the candidate marker exists; use lexical existence without opening content. Resolve the selected root before comparing vault-relative components; an unrelated absolute ancestor named `secrets` is not a configured vault component.
+
+Move setup root resolution inside guarded boundaries. At public operation and `cli.execute` boundaries convert uncategorized ordinary `OSError` to a constant-message `ThreadrootError(ExitCode.IO_OR_DRIFT, "filesystem.failed", "A filesystem operation failed; check directory access and retry.")` and the existing `CommandResult`. Never print `str(error)`. In `_is_initialized`, translate only `error.exit_code == ExitCode.CONFIG` to `_config_path_invalid()`; re-raise unsafe/I/O errors unchanged. Preserve `config.invalid` for actual marker decoding/readability failures. `_doctor_result` gains keyword `error_exit: ExitCode | None = None` after its existing `unsafe` keyword so resolution/operation failures preserve `6`; existing calls continue to work. Root-resolution errors returned by `execute` keep the original exit. `main` must sanitize argparse errors (do not echo unknown raw arguments) while retaining exit `2` and the existing stderr usage-error behavior; parsed commands with `--json` continue returning one structured object.
+
+- [ ] **A5: Verify the boundary expansion cases written in A2.** These are the four concrete test methods A2 appends to `PathBoundaryTests`; they must already have participated in A3's RED run before A4:
+
+~~~python
+    def test_secret_configured_paths_are_rejected(self):
+        for relative in ("secrets/daily", "wiki/secrets/daily", ".second-brain/content"):
+            with self.subTest(relative=relative), TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                (root / ".second-brain").mkdir()
+                marker = root / ".second-brain/config.json"
+                document = json.loads(config_text())
+                document["paths"]["daily"] = relative
+                marker.write_text(json.dumps(document))
+                real_read = Path.read_text
+                def safe_read(path, *args, **kwargs):
+                    self.assertEqual(path, marker)
+                    return real_read(path, *args, **kwargs)
+                with patch.object(Path, "read_text", safe_read):
+                    with self.assertRaises(ThreadrootError) as caught:
+                        load_config(root)
+                    self.assertEqual(caught.exception.exit_code, ExitCode.UNSAFE_PATH)
+
+    def test_upward_secret_marker_is_never_opened(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / "secrets").mkdir()
+            (root / "secrets/config.json").write_text(config_text())
+            (root / ".second-brain").symlink_to(root / "secrets", target_is_directory=True)
+            with patch.object(Path, "read_text", side_effect=AssertionError("content opened")) as read:
+                with self.assertRaises(ThreadrootError) as caught:
+                    find_upward(root)
+                self.assertEqual(caught.exception.exit_code, ExitCode.UNSAFE_PATH)
+                read.assert_not_called()
+
+    def test_path_probe_io_is_not_swallowed(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch.object(Path, "resolve", return_value=root), patch.object(
+                Path, "stat", side_effect=OSError(errno.EIO, "synthetic probe")
+            ):
+                with self.assertRaises(ThreadrootError) as caught:
+                    resolve_path(root)
+                self.assertEqual(caught.exception.exit_code, ExitCode.IO_OR_DRIFT)
+
+    def test_cli_invalid_literal_is_private(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for command in ("init", "adopt", "doctor"):
+                with self.subTest(command=command):
+                    args = build_parser().parse_args([command, "--vault", "bad\x00root", "--json"])
+                    result = execute(args, root, {}, root)
+                    self.assertEqual(result.exit_code, ExitCode.UNSAFE_PATH)
+                    issues = json.dumps(result.to_dict()["issues"])
+                    self.assertNotIn(str(root), issues)
+                    self.assertNotIn("bad", issues)
+~~~
+
+Also extend the configured-path test with a `daily` symlink into `secrets/daily` and `daily-secrets` as an allowed negative control; the existing escaping-marker regression remains required. Run each command before and after its corresponding minimal correction, recording already-GREEN cases honestly:
+
+~~~bash
+PYTHONPATH=src:. python3 -m unittest tests.test_final_safety.PathBoundaryTests.test_secret_configured_paths_are_rejected -v
+PYTHONPATH=src:. python3 -m unittest tests.test_final_safety.PathBoundaryTests.test_upward_secret_marker_is_never_opened -v
+PYTHONPATH=src:. python3 -m unittest tests.test_final_safety.PathBoundaryTests.test_path_probe_io_is_not_swallowed -v
+PYTHONPATH=src:. python3 -m unittest tests.test_final_safety.PathBoundaryTests.test_cli_invalid_literal_is_private -v
+PYTHONPATH=src:. python3 -m unittest tests.test_final_safety.PathBoundaryTests tests.test_paths tests.test_config tests.test_operations tests.test_cli -v
+~~~
+
+- [ ] **A6: Commit the path/error fix.**
+
+~~~bash
+git add -- src/threadroot/paths.py src/threadroot/config.py src/threadroot/operations.py src/threadroot/cli.py tests/test_final_safety.py
+git diff --cached --name-only
+git diff --cached --check
+git commit -m "fix: preserve safe path and filesystem error boundaries"
+~~~
+
+Require exactly those five staged paths; if a concurrent session staged unrelated files, preserve their edits and remove only their index entries before committing. Every subsequent commit block has the same exact-staged-set rule.
+
+#### Group B — Default-pointer vault exclusion and owned temporary cleanup
+
+- [ ] **B1: Write all pointer regressions before changing the writer.** Add `PointerSafetyTests` to `tests/test_final_safety.py`, including the five B4 methods and cleanup code below, before B2/B3. This representative test directly exercises the critical overwrite route:
+
+~~~python
+class PointerSafetyTests(unittest.TestCase):
+    def test_direct_and_parent_symlink_overlap_are_zero_write(self):
+        for operation in (run_init, run_adopt):
+            for apply in (False, True):
+                for symlink_parent in (False, True):
+                    with self.subTest(operation=operation.__name__, apply=apply,
+                                      symlink_parent=symlink_parent), TemporaryDirectory() as temporary:
+                        base = Path(temporary).resolve()
+                        vault = base / "vault"
+                        self.assertTrue(run_init(vault, True, False, {}, base / "home").ok)
+                        (vault / "threadroot").mkdir()
+                        protected = vault / "threadroot/config.json"
+                        protected.write_bytes(b"synthetic vault content")
+                        xdg = base / "xdg"
+                        if symlink_parent:
+                            xdg.mkdir()
+                            (xdg / "threadroot").symlink_to(vault / "threadroot", target_is_directory=True)
+                        else:
+                            xdg = vault
+                        before = protected.read_bytes(), protected.stat().st_mtime_ns
+                        with patch("threadroot.operations.os.replace") as replace:
+                            result = operation(vault, apply, True,
+                                               {"XDG_CONFIG_HOME": str(xdg)}, base / "home")
+                        self.assertEqual(result.exit_code, ExitCode.UNSAFE_PATH)
+                        self.assertFalse(result.applied)
+                        self.assertEqual(result.changes, ())
+                        replace.assert_not_called()
+                        self.assertEqual(before, (protected.read_bytes(), protected.stat().st_mtime_ns))
+~~~
+
+- [ ] **B2: Confirm the critical RED.** Run `PYTHONPATH=src:. python3 -m unittest tests.test_final_safety.PointerSafetyTests -v`, including B4's already-written revalidation cases. The baseline incorrectly reports success or reaches `os.replace`; the failure must be the missing unsafe rejection, not fixture setup. Keep `os.replace` mocked in the overlap case so the synthetic protected note is never actually overwritten during RED. Revalidation tests may report the explicitly missing `validate_default_pointer` capability until B3 adds it; cleanup may already pass and must be recorded honestly.
+
+- [ ] **B3: Implement the pointer exclusion interface.**
+
+~~~python
+def validate_default_pointer(vault: Path, pointer: Path) -> Path:
+    root = resolve_path(vault)
+    destination = resolve_path(pointer)
+    if destination == root or root in destination.parents:
+        raise ThreadrootError(
+            ExitCode.UNSAFE_PATH, "path.unsafe",
+            "Default pointer must stay outside the vault; choose another config directory.",
+            "machine-default-pointer",
+        )
+    return pointer
+~~~
+
+Call it while constructing both setup runners' pointer plans before any mutation. For apply call it again immediately before `apply_plan`, then inside `write_default_pointer` before `pointer.parent.mkdir`, before `mkstemp`, and immediately before `os.replace`. Resolve existing parent symlinks each time. Update both runners' pointer-stage exception handling to retain `ThreadrootError.exit_code` while reporting completed vault changes and an unexecuted pointer; ordinary `OSError` remains `6`. Preserve the existing `try/finally` descriptor and owned-temp cleanup; never enumerate/delete arbitrary `.tmp` files. A newly detected overlap after prior vault writes is visible partial state, while an initially unsafe destination is zero-write.
+
+- [ ] **B4: Verify revalidation and cleanup regressions written in B1.** The methods are `test_initial_overlap_does_not_create_vault_or_pointer_parents`, `test_pointer_destination_equal_to_vault_is_unsafe`, `test_apply_revalidates_before_first_write`, `test_writer_revalidates_before_mkdir_and_replace`, and `test_replace_failure_preserves_old_pointer_and_cleans_only_owned_temp`. Use a missing init root under `base/xdg/threadroot/config.json` for equality; patch planned destination changes through `validate_default_pointer` call side effects to test call-boundary rejection without simulating a malicious process. Patch `Path.mkdir`, `tempfile.mkstemp`, and `os.replace` at their `threadroot.operations` lookup sites and assert mutation order; a rejection at the first writer check must call none of them. For the cleanup case create an old machine pointer outside the vault plus unrelated `keep.tmp`, patch only `os.replace` to raise `OSError`, call the real writer, and assert old bytes/mtime and `keep.tmp` survive while its one created temporary is gone. Never delete the old pointer to make the test pass.
+
+~~~python
+    def test_replace_failure_preserves_old_pointer_and_cleans_only_owned_temp(self):
+        with TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            vault = base / "vault"
+            vault.mkdir()
+            pointer = base / "xdg/threadroot/config.json"
+            pointer.parent.mkdir(parents=True)
+            pointer.write_bytes(b'{"default_vault":"/synthetic/previous"}\n')
+            sentinel = pointer.parent / "keep.tmp"
+            sentinel.write_bytes(b"unrelated")
+            before = pointer.read_bytes(), pointer.stat().st_mtime_ns
+            with patch("threadroot.operations.os.replace", side_effect=OSError("synthetic replace")):
+                with self.assertRaises(OSError):
+                    write_default_pointer(vault, {"XDG_CONFIG_HOME": str(base / "xdg")}, base / "home")
+            self.assertEqual(before, (pointer.read_bytes(), pointer.stat().st_mtime_ns))
+            self.assertEqual({"config.json", "keep.tmp"}, {p.name for p in pointer.parent.iterdir()})
+            self.assertEqual(sentinel.read_bytes(), b"unrelated")
+~~~
+
+Run `PYTHONPATH=src:. python3 -m unittest tests.test_final_safety.PointerSafetyTests -v` before each required revalidation change; confirm the newly added assertion is the RED, or record existing coverage as GREEN. Repeat after the minimal adjustment, then run `PYTHONPATH=src:. python3 -m unittest tests.test_final_safety tests.test_operations tests.test_cli -v`.
+
+- [ ] **B5: Commit pointer safety.**
+
+~~~bash
+git add -- src/threadroot/paths.py src/threadroot/operations.py tests/test_final_safety.py
+git diff --cached --name-only
+git diff --cached --check
+git commit -m "fix: keep default pointers outside vaults"
+~~~
+
+#### Group C — Exclusive claim command and deterministic result contract
+
+- [ ] **C1: Write the claim tests in new `tests/test_claim.py`.** Import the existing operations module so the first RED is an explicit missing capability assertion. Include C4's collision methods and every C5 matrix method in this initial test edit before C2/C3. Use `getattr` plus a callable assertion for new entry points until implemented; a missing named capability is a valid first RED, unlike an unrelated broken import. Extend from this complete initial class, which creates only synthetic vaults:
+
+~~~python
+import json
+import os
+import stat
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import unittest
+from unittest.mock import patch
+
+from threadroot import operations
+from threadroot.cli import build_parser, execute
+from threadroot.config import config_text
+from threadroot.results import ExitCode
+
+
+class ClaimTests(unittest.TestCase):
+    def test_preview_and_apply_create_one_empty_regular_file(self):
+        claim = getattr(operations, "run_claim", None)
+        self.assertTrue(callable(claim), "run_claim capability is required")
+        with TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            vault = base / "vault"
+            self.assertTrue(operations.run_init(vault, True, False, {}, base / "home").ok)
+            target = vault / "daily/2042-04-03.md"
+            preview = claim(vault, "daily/2042-04-03.md", False)
+            self.assertTrue(preview.ok)
+            self.assertFalse(preview.applied)
+            self.assertFalse(target.exists())
+            self.assertEqual(preview.to_dict()["changes"], [{"action": "create_file",
+                "path": "daily/2042-04-03.md", "status": "planned"}])
+            result = claim(vault, "daily/2042-04-03.md", True)
+            self.assertEqual(result.exit_code, ExitCode.OK)
+            self.assertTrue(result.applied)
+            self.assertEqual(target.read_bytes(), b"")
+            self.assertTrue(stat.S_ISREG(target.lstat().st_mode))
+            self.assertEqual(result.to_dict()["changes"][0]["status"], "completed")
+            self.assertEqual(set(result.to_dict()),
+                             {"ok", "command", "applied", "vault", "changes", "issues"})
+            again = claim(vault, "daily/2042-04-03.md", True)
+            self.assertEqual(again.exit_code, ExitCode.CONFLICT)
+
+    def test_cli_claim_has_required_path_and_no_content_or_default_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["claim", "--path", "daily/2042-04-03.md", "--json"])
+        self.assertEqual((args.command, args.path, args.apply),
+                         ("claim", "daily/2042-04-03.md", False))
+        from threadroot.results import ThreadrootError
+        for suffix in ([], ["--path", "daily/a.md", "--set-default"],
+                       ["--path", "daily/a.md", "--content", "synthetic"],
+                       ["--pa", "daily/a.md"]):
+            with self.subTest(suffix=suffix), self.assertRaises(ThreadrootError) as caught:
+                parser.parse_args(["claim", *suffix])
+            self.assertEqual(caught.exception.exit_code, ExitCode.USAGE)
+~~~
+
+- [ ] **C2: Confirm basic RED.** Run `PYTHONPATH=src:. python3 -m unittest tests.test_claim.ClaimTests -v`. Expect `run_claim capability is required` and parser `usage.invalid` for the valid claim command. Correct any unrelated test setup error first.
+
+- [ ] **C3: Implement the claim path validator and planner.** Extend `CommandName = Literal["init", "adopt", "doctor", "claim"]`. In `ensure_claim_target`, reject empty/NUL/absolute/`..` literals, reject lexical `.second-brain` at the vault root and exact `secrets` components, then use `ensure_outside_secrets`. Compute normalized lexical paths with `normalized_absolute` and resolved paths with `resolve_path`; collect configured-root keys for which the target is a strict descendant in each representation. Both sets must contain exactly the same one key; otherwise raise `path.unsafe`. Exclude both lexical/resolved marker namespace. Return the lexical absolute target under the resolved vault, so the final exclusive open addresses that reservation name, not an existing symlink's referent. Use a mapping built from the four `VaultConfig.paths` fields, without importing config back into paths.
+
+~~~python
+def plan_claim(vault: Path, relative: str) -> tuple[PlannedChange, ...]:
+    root = resolve_path(vault)
+    config = load_config(root)
+    content_paths = {key: getattr(config.paths, key)
+                     for key in ("daily", "projects", "knowledge", "reviews")}
+    target = ensure_claim_target(root, relative, content_paths)
+    if os.path.lexists(target):
+        raise ThreadrootError(ExitCode.CONFLICT, "target.conflict",
+                              "Target already exists; choose another path.",
+                              target.relative_to(root).as_posix())
+    if not target.parent.is_dir():
+        raise ThreadrootError(ExitCode.IO_OR_DRIFT, "filesystem.failed",
+                              "Claim requires an existing directory parent.",
+                              target.relative_to(root).as_posix())
+    return (PlannedChange("create_file", target,
+                          target.relative_to(root).as_posix(), ""),)
+~~~
+
+`run_claim` guards root resolution/planning exactly like the repaired setup runners, returns planned changes for preview, and calls `apply_plan("claim", root, plan)` for apply. `_validate_claim` reloads config and calls `ensure_claim_target(root, change.public_path, content_paths)`, requires equality with `change.target`, then uses `_require_directory` for the root and existing parent. Call `_validate_claim` immediately before the ordinary descendant check in `apply_plan` for command `claim`. It must revalidate containment without invoking `plan_claim`'s planning-time conflict check. Add a `ThreadrootError` handler in `apply_plan` that preserves the error's exit/code and current completed/unexecuted status. Existing `open("x")` with `content=""` provides OS-exclusive zero-byte creation; do not add a note-content parameter, parent `mkdir`, inode result field, or alternate create action. Existing-file collision from exclusive open remains `target.drifted` / `6`.
+
+In `build_parser`, include claim with `--vault`, `--json`, required `--path`, and `--apply`; keep `--set-default` only for init/adopt. In `execute`, dispatch `run_claim(root, args.path, args.apply)`. A version check alone is not capability proof; a valid pure claim preview supplies it.
+
+- [ ] **C4: Verify claim GREEN and collision regressions written in C1.** Run `PYTHONPATH=src:. python3 -m unittest tests.test_claim.ClaimTests -v`. The collision test included in C1 is:
+
+~~~python
+    def test_apply_collision_preserves_competing_bytes(self):
+        with TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            vault = base / "vault"
+            self.assertTrue(operations.run_init(vault, True, False, {}, base / "home").ok)
+            plan = operations.plan_claim(vault, "daily/2042-04-03.md")
+            target = plan[0].target
+            real_open = Path.open
+            def competing_open(path, mode="r", *args, **kwargs):
+                if path == target and mode == "x":
+                    with real_open(path, "xb") as competitor:
+                        competitor.write(b"synthetic competitor")
+                return real_open(path, mode, *args, **kwargs)
+            with patch.object(Path, "open", competing_open):
+                result = operations.apply_plan("claim", vault, plan)
+            self.assertEqual((result.exit_code, result.issues[0].code),
+                             (ExitCode.IO_OR_DRIFT, "target.drifted"))
+            self.assertEqual(target.read_bytes(), b"synthetic competitor")
+            self.assertEqual(result.changes[0].status, "unexecuted")
+~~~
+
+Run `PYTHONPATH=src:. python3 -m unittest tests.test_claim.ClaimTests.test_apply_collision_preserves_competing_bytes -v`. Existing exclusive-open behavior may already pass; record that fact, never force a fake RED. C1 also writes `test_target_present_after_plan_is_drift` with a file created between `plan_claim` and `apply_plan`, and `test_two_preview_plans_have_one_winner` using two plans before either apply; expect first `0`, second `6`, and unchanged first reservation. These tests prove the OS/create boundary, not host-model behavior.
+
+- [ ] **C5: Complete containment/error GREEN for the C1 tests.** C1 writes the following named methods, each using a fresh initialized synthetic vault and `subTest` rows, and C2 runs them before implementation. Run the focused suite before any further adjustment and then rerun it; keep already-GREEN rows as regressions.
+
+| Method in `ClaimTests` | Inputs and exact assertions |
+|---|---|
+| `test_unsafe_claim_paths_are_zero_write` | `../a.md`, `/synthetic/a.md`, `daily/../a.md`, `daily/a\x00.md`, `.second-brain/a.md`, `secrets/a.md`, `daily/secrets/a.md`, `outside/a.md`, and `daily` all produce `4`; no `Path.open`/`mkdir` call |
+| `test_claim_uses_exactly_one_configured_root` | Duplicate daily/reviews roots and nested `daily/archive` knowledge root reject ambiguous child with `4`; custom `notes/days` root accepts its safe child; a symlink crossing from daily to reviews rejects with `4` |
+| `test_claim_parent_and_target_kinds` | Missing parent and file parent give `6`; existing file/directory/safe dangling link give `5`; `.second-brain` or secrets symlink destination gives `4`; safe directory symlink within the same content root may create its child |
+| `test_claim_revalidates_config_and_parent` | Between plan/apply, change root mapping or symlink parent to outside/secrets: `4`; remove safe parent: `6`; no file outside vault |
+| `test_claim_io_and_privacy` | Patch exclusive `Path.open` with `PermissionError`/EIO: `6`, unexecuted change, no raw exception path; NUL config: `4`; unknown schema: `3`; missing marker: `3`; JSON one object, no note bytes, no diagnostic absolute paths |
+| `test_claim_does_not_create_parents_or_accept_content` | Patch `Path.mkdir` and pointer writer during valid claim preview/apply: neither called; parser rejects `--content`, `--text`, positional bytes and `--set-default` with `2` |
+
+Use `PYTHONPATH=src:. python3 -m unittest tests.test_claim -v` for the focused complete group, then `PYTHONPATH=src:. python3 -m unittest discover -s tests -v`. Inspect every new failure before modifying code; do not loosen existing no-overwrite or privacy assertions.
+
+- [ ] **C6: Commit the deterministic claim capability.**
+
+~~~bash
+git add -- src/threadroot/results.py src/threadroot/paths.py src/threadroot/operations.py src/threadroot/cli.py tests/test_claim.py
+git diff --cached --name-only
+git diff --cached --check
+git commit -m "feat: add exclusive empty-file claims"
+~~~
+
+#### Group D — Shared skills and capability/partial-state contracts
+
+- [ ] **D1: Read required writing-skills and skill-creator instructions, then write contract REDs.** The five file-creating skills are exactly `recording`, `daily-wrap-up`, `weekly-review`, `project-kickoff`, and `decision-log`. In `tests/test_skills.py`, extend only those five `CORE_COMMANDS` inventories with these exact strings:
+
+~~~text
+threadroot claim --path <relative> --vault <vault> --json
+threadroot claim --path <relative> --vault <vault> --json --apply
+~~~
+
+Add the following invariant names to expected `BASE_INVARIANTS` and the synthetic shared fixture, but not yet to production skills or `CONTRACT_KEYS`. All shared consumers inherit the rules; read-only workflows acquire no claim command.
+
+~~~text
+new-file=claim-verify-native-edit
+claim-failure=stop
+claim-verification=same-identity-empty-regular
+partial-state=preserve-and-report
+outside-vault-create=independent-native-exclusive-or-omit
+~~~
+
+Change kickoff's expected `local-adapter` value to `host-native-auto-loaded-already-git-ignored-and-exclusive`. Add missing/inverted mutations for each new invariant using the existing `EffectiveSkillContractTests._write_fixture` and `load_effective_contract` pattern. Run `PYTHONPATH=src:. python3 -m unittest tests.test_skills.EffectiveSkillContractTests tests.test_skills.ProjectKickoffSkillContractTests -v`. Expected RED is missing claim inventory/invariants or unsupported invariant keys. Do not bypass exact command inventory validation.
+
+- [ ] **D2: Write the shared GREEN protocol and minimally adapt the five procedures.** Add the five keys to `tests/skill_contract.py:CONTRACT_KEYS`, enforce their exact values in the loader's `required` mapping, and add them to `skills/README.md`'s shared contract. Put new command strings only in each skill's canonical `threadroot-commands` block; shared skill bodies use inventory-entry names to preserve the no-command-outside-inventory contract. Use the following complete protocol text as the new shared section:
+
+> For an authorized missing vault file, finish the semantic draft in the host first. Require an existing safe parent; if it is missing, report the unmet precondition and stop this file workflow. Invoke the claim-preview inventory entry with the diagnosed vault and the exact vault-relative target. Require exit 0, one JSON object with the existing result shape, `ok=true`, `command=claim`, `applied=false`, the diagnosed `vault`, exactly one `create_file` change for that target with `status=planned`, and no error issue. Missing executable, unsupported command, malformed or mismatched output, unsafe path, or conflict means stop without any native create or edit. Do not install or substitute another write mechanism.
+>
+> With the workflow's explicit apply intent, invoke the claim-apply inventory entry. Require the same checks with `applied=true` and `status=completed`. A successful apply reserves one zero-byte file; it has not written the draft. Immediately observe the target with the host's native metadata capability without following a link, record its file identity (`device` and `inode` on supported systems), and require a regular file of size zero. Immediately before the native edit, repeat that observation and require the identical identity, regular type and zero size. If the host cannot establish this evidence, stop. Under the cooperative-session threat model the successful exclusive claim and these observations bind the reservation; they do not protect against malicious replacement between the CLI and first observation.
+>
+> Only then fill the reserved file with the host's native edit mechanism. A generic native Write or an absence check is not exclusive-create proof. Another session's existing empty file is a collision, never a reservation to reuse. If apply succeeded but verification or native editing fails, report the visible empty reservation or partial edit and every unexecuted action. Do not delete, roll back, retry as an existing-file edit, or report that nothing was created. Existing files continue to use read/draft/re-read/drift-stop/native-edit.
+>
+> A proposed local adapter outside the diagnosed vault is omitted unless its parent already exists, the host independently guarantees exclusive native creation, the exact adapter path is already ignored by Git, and the adapter is a native auto-loaded convention. The vault claim command never authorizes that outside path.
+
+In recording, daily-wrap-up and weekly-review replace only their missing-target native-exclusive clauses with the shared protocol, retaining their respective authorization/routing rules. In kickoff require the already-existing project directory; remove directory creation from its preview/apply write set and report missing parent as an unmet precondition. Retain its five confirmations and complete preview; require the third adapter fact (exclusive native create), plus existing parent. In decision-log require the existing decisions directory rather than creating it in this workflow. Keep matching-content no-op only for an ADR already observed/read before entering the new-file route; a path appearing after an absent preview is always a collision, even if bytes would match. Stop subsequent project/backlink updates after claim/verification/edit failure, retain partial state, and never inspect a competing file's content to justify continuing. Update stale Safety/Output claims about directories created. Run `PYTHONPATH=src:. python3 -m unittest tests.test_skills -v` to confirm GREEN.
+
+- [ ] **D3: Add executable capability-response and trace REDs without pretending to run a model.** Create `tests/test_claim_workflows.py`. Add the test-only `validate_claim_trace` interface declared above to `tests/skill_contract.py` only after the tests below fail for missing validator. The keyword defaults are the synthetic test fixture; auditing a separately authorized real-host synthetic trace must pass that run's diagnosed vault and approved relative target explicitly. Event records contain metadata/results only, never note bytes. Their exact shapes are: `{"kind":"preview"|"apply", "exit":int,"result":object}`, `{"kind":"verify","identity":[int,int],"regular":bool,"size":int}`, `{"kind":"native-edit","ok":bool}`, and `{"kind":"stop","partial":bool}`. No other events are permitted; in particular `native-write`, `mkdir`, `delete`, `rollback`, and `retry-existing` are invalid. Use this positive sequence and independent rejection examples:
+
+~~~python
+from copy import deepcopy
+from pathlib import Path
+import unittest
+from tests import skill_contract
+
+
+def claim_result(applied: bool) -> dict[str, object]:
+    return {"ok": True, "command": "claim", "applied": applied,
+            "vault": "/synthetic/vault", "changes": [{"action": "create_file",
+            "path": "daily/2042-04-03.md",
+            "status": "completed" if applied else "planned"}], "issues": []}
+
+
+def success_events() -> list[dict[str, object]]:
+    return [{"kind": "preview", "exit": 0, "result": claim_result(False)},
+            {"kind": "apply", "exit": 0, "result": claim_result(True)},
+            {"kind": "verify", "identity": [1, 7], "regular": True, "size": 0},
+            {"kind": "verify", "identity": [1, 7], "regular": True, "size": 0},
+            {"kind": "native-edit", "ok": True}]
+
+
+class ClaimWorkflowTests(unittest.TestCase):
+    def test_success_and_missing_invalid_unsupported_capability(self):
+        validate = getattr(skill_contract, "validate_claim_trace", None)
+        self.assertTrue(callable(validate), "claim trace validator is required")
+        self.assertEqual(validate(success_events()), ())
+        for code, payload in ((127, None), (2, None), (0, "invalid JSON"),
+                              (0, {}), (5, {"ok": False})):
+            failed = {"kind": "preview", "exit": code, "result": payload}
+            self.assertEqual(validate([failed, {"kind": "stop", "partial": False}]), ())
+            self.assertIn("claim.unsafe-continuation",
+                          validate([failed, {"kind": "native-edit", "ok": True}]))
+
+    def test_identity_collision_and_partial_failure_gates(self):
+        validate = getattr(skill_contract, "validate_claim_trace", None)
+        self.assertTrue(callable(validate), "claim trace validator is required")
+        for field, value in (("identity", [1, 8]), ("size", 1), ("regular", False)):
+            events = success_events()
+            events[3][field] = value
+            self.assertIn("claim.unsafe-continuation", validate(events))
+            self.assertEqual(validate(events[:4] + [{"kind": "stop", "partial": True}]), ())
+        events = success_events()
+        events[1] = {"kind": "apply", "exit": 6, "result": {"ok": False}}
+        self.assertIn("claim.unsafe-continuation", validate(events))
+        self.assertEqual(validate(events[:2] + [{"kind": "stop", "partial": False}]), ())
+        events = success_events()
+        events[-1]["ok"] = False
+        self.assertEqual(validate(events + [{"kind": "stop", "partial": True}]), ())
+        self.assertIn("claim.unsafe-continuation", validate(events + [{"kind": "delete"}]))
+~~~
+
+Run `PYTHONPATH=src:. python3 -m unittest tests.test_claim_workflows -v`; expected RED is the missing validator assertion. Add all four expansion tests named below before implementing the oracle. Then add these concrete test-only functions in `tests/skill_contract.py`, importing `Mapping` and `Sequence` from `collections.abc`:
+
+~~~python
+def _claim_result_pair(event: Mapping[str, object], applied: bool) -> tuple[str, str] | None:
+    result = event.get("result")
+    if (type(event.get("exit")) is not int or event["exit"] != 0
+            or type(result) is not dict
+            or set(result) != {"ok", "command", "applied", "vault", "changes", "issues"}):
+        return None
+    if (result["ok"] is not True or result["applied"] is not applied
+            or result["command"] != "claim" or result["issues"] != []
+            or type(result["vault"]) is not str or not result["vault"]):
+        return None
+    changes = result["changes"]
+    if type(changes) is not list or len(changes) != 1 or type(changes[0]) is not dict:
+        return None
+    change = changes[0]
+    if (set(change) != {"action", "path", "status"}
+            or change["action"] != "create_file"
+            or change["status"] != ("completed" if applied else "planned")
+            or type(change["path"]) is not str or not change["path"]):
+        return None
+    return result["vault"], change["path"]
+
+
+def validate_claim_trace(
+    events: Sequence[Mapping[str, object]], *,
+    expected_vault: str = "/synthetic/vault",
+    expected_path: str = "daily/2042-04-03.md",
+) -> tuple[str, ...]:
+    state = "preview"
+    pair = (expected_vault, expected_path)
+    identity: list[int] | None = None
+    partial = False
+    failure = ("claim.unsafe-continuation",)
+    for event in events:
+        kind = event.get("kind")
+        if kind == "stop":
+            if (set(event) != {"kind", "partial"} or state != "stop"
+                    or event.get("partial") is not partial):
+                return failure
+            state = "done"
+            continue
+        if state in ("stop", "done"):
+            return failure
+        if state in ("preview", "apply"):
+            if kind != state or set(event) != {"kind", "exit", "result"}:
+                return failure
+            applying = state == "apply"
+            if applying:
+                result = event.get("result")
+                changes = result.get("changes", []) if type(result) is dict else []
+                completed = type(changes) is list and any(
+                    type(change) is dict and change.get("status") == "completed"
+                    for change in changes
+                )
+                partial = event.get("exit") == 0 or completed
+            observed = _claim_result_pair(event, applying)
+            if observed != pair:
+                state = "stop"
+            elif applying:
+                state = "verify-first"
+            else:
+                state = "apply"
+        elif state in ("verify-first", "verify-second"):
+            if kind != "verify":
+                return failure
+            observed = event.get("identity")
+            valid = (set(event) == {"kind", "identity", "regular", "size"}
+                     and type(observed) is list and len(observed) == 2
+                     and all(type(value) is int for value in observed)
+                     and event.get("regular") is True
+                     and type(event.get("size")) is int and event["size"] == 0)
+            if not valid or (state == "verify-second" and observed != identity):
+                state = "stop"
+            elif state == "verify-first":
+                identity = list(observed)
+                state = "verify-second"
+            else:
+                state = "edit"
+        elif state == "edit":
+            if (kind != "native-edit" or set(event) != {"kind", "ok"}
+                    or type(event.get("ok")) is not bool):
+                return failure
+            state = "done" if event["ok"] else "stop"
+    return () if state == "done" else failure
+~~~
+
+The oracle checks result consistency, event order and metadata only; the CLI remains the path-safety authority. A zero-exit apply with malformed output conservatively marks possible partial state and allows only reporting/stopping, never cleanup. No filesystem or host tool is called by the oracle. The pairing helper's exact signature is `_claim_result_pair(event: Mapping[str, object], applied: bool) -> tuple[str, str] | None`.
+
+Add named tests `test_mismatched_claim_payloads_stop_before_edit`, `test_forbidden_native_fallbacks_are_rejected`, `test_completed_apply_failure_preserves_partial_state`, and `test_all_five_skills_declare_claim_protocol`. Mutate successful payload command/vault/path/action/status/applied/ok and missing/extra fields; assert only stop is accepted. Exercise duplicate verify with changed identity, missing metadata, non-integer identity, nonzero size, symlink type, successful apply followed by malformed result, and forbidden events. The last test loads every named skill through `load_effective_contract` using `CORE_COMMANDS` imported from `tests.test_skills`, and verifies the exact shared invariants. Run `PYTHONPATH=src:. python3 -m unittest tests.test_claim_workflows tests.test_skills -v` after minimal oracle adjustments.
+
+These tests prove the executable oracle and declared contract reject missing/invalid/unsupported capability, collision, identity drift, and hidden partial state. They do not prove that a live host follows the prose. Real-host pressure runs using this oracle are the separately authorized manual checkpoint in Group F; record them unexecuted until authorized. Do not introduce phrase-presence tests for prose or count prior dogfood as atomic-exclusivity evidence.
+
+- [ ] **D4: Self-review each consuming skill, run focused/full GREEN, and commit.** Trace one authorized missing file, one collision, one unavailable capability, one unverifiable identity and one failed native edit through each skill without invoking a model. Verify no instruction falls back to native creation inside the vault, creates missing parents, or continues to downstream backlinks after a stopped claim. Run `PYTHONPATH=src:. python3 -m unittest tests.test_skills tests.test_claim_workflows tests.test_packaging tests.test_claim -v`, then `PYTHONPATH=src:. python3 -m unittest discover -s tests -v`.
+
+~~~bash
+git add -- skills/README.md skills/recording/SKILL.md skills/daily-wrap-up/SKILL.md skills/weekly-review/SKILL.md skills/project-kickoff/SKILL.md skills/decision-log/SKILL.md tests/skill_contract.py tests/test_skills.py tests/test_claim_workflows.py
+git diff --cached --name-only
+git diff --cached --check
+git commit -m "fix: gate new skill files through exclusive claims"
+~~~
+
+#### Group E — Fence-aware structure and doctor remediation
+
+- [ ] **E1: Write fence/closing-hash REDs in `tests/test_contracts.py`.** Add `MarkdownFenceTests` using the existing private extractor's exact signature, including the E2 paragraph's additional fence/ATX rows before E2 changes the extractor; this is verification tooling only.
+
+~~~python
+class MarkdownFenceTests(unittest.TestCase):
+    def test_fenced_decoys_do_not_supply_structure(self):
+        from scripts.check_contract import _markdown_structure
+        for fence in ("```", "~~~~", "````"):
+            with self.subTest(fence=fence):
+                payload = (f"## Real ###\n\n{fence}text\n## Decoy\n"
+                           f"[[hidden]] [hidden](hidden.md)\n{fence}\n[[visible]]\n").encode()
+                self.assertEqual(_markdown_structure(payload), (("Real",), ("visible",)))
+
+    def test_shorter_or_wrong_fence_does_not_close(self):
+        from scripts.check_contract import _markdown_structure
+        payload = b"````\n```\n## Hidden\n~~~\n[[hidden]]\n````\n## Real ###\n"
+        self.assertEqual(_markdown_structure(payload), (("Real",), ()))
+~~~
+
+Run `PYTHONPATH=src:. python3 -m unittest tests.test_contracts.MarkdownFenceTests -v`; expect leaked Decoy/hidden structure and unstripped closing hashes. Add this end-to-end test before E2 and run `PYTHONPATH=src:. python3 -m unittest tests.test_contracts.ValidationTests.test_fenced_heading_and_link_cannot_satisfy_case -v`; expect the baseline to accept fenced decoys and miss both required failures. Keep byte hashes/prose comparison unchanged.
+
+~~~python
+    def test_fenced_heading_and_link_cannot_satisfy_case(self):
+        from scripts.check_contract import materialize_fixture, validate_contract
+        case = json.loads(Path("tests/fixtures/contracts/project-decision.json").read_text())
+        with TemporaryDirectory() as temporary:
+            before = Path(temporary) / "before"
+            after = Path(temporary) / "after"
+            materialize_fixture(case, before)
+            materialize_fixture(case, after)
+            project = after / "wiki/projects/orchard-cli/index.md"
+            project.write_text(project.read_text() + "\n[[decisions/2042-04-03-json-storage]]\n")
+            adr = "wiki/projects/orchard-cli/decisions/2042-04-03-json-storage.md"
+            (after / adr).write_text("```\n## Options Considered\n## Decision\n"
+                                     "## Rationale\n[[../index]]\n```\n")
+            failures = {(item.code, item.path) for item in validate_contract(case, before, after)}
+            self.assertIn(("missing_heading", adr), failures)
+            self.assertIn(("missing_link", adr), failures)
+~~~
+
+- [ ] **E2: Implement a minimal line-state filter.** Add `_markdown_visible_lines(text: str) -> list[str]` in `scripts/check_contract.py`. The exact algorithm is:
+
+~~~python
+def _markdown_visible_lines(text: str) -> list[str]:
+    visible: list[str] = []
+    fence_character = ""
+    fence_length = 0
+    for line in text.splitlines():
+        if fence_character:
+            closing = re.fullmatch(r" {0,3}(" + re.escape(fence_character)
+                                   + r"{" + str(fence_length) + r",})[ \t]*", line)
+            if closing:
+                fence_character = ""
+                fence_length = 0
+            continue
+        opening = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+        if opening and not (opening.group(1)[0] == "`" and "`" in opening.group(2)):
+            fence_character = opening.group(1)[0]
+            fence_length = len(opening.group(1))
+            continue
+        visible.append(line)
+    return visible
+~~~
+
+Feed only `"\n".join(_markdown_visible_lines(text))` into heading/link extraction. Extend ATX recognition to zero-to-three leading spaces, one-to-six hashes followed by space/tab or line end; strip a closing hash run only when preceded by whitespace and followed solely by whitespace. Preserve literal trailing hashes in `## C#`; preserve link normalization, sorted tuples and non-UTF8 behavior. Add indented opening/longer closing, unclosed fence, info-string backtick, tilde info-string, and `C#` cases to `MarkdownFenceTests`. Run `PYTHONPATH=src:. python3 -m unittest tests.test_contracts -v`, then `PYTHONPATH=src:. python3 -m unittest discover -s tests -v`.
+
+- [ ] **E3: Commit structural extraction.**
+
+~~~bash
+git add -- scripts/check_contract.py tests/test_contracts.py
+git diff --cached --name-only
+git diff --cached --check
+git commit -m "fix: ignore fenced Markdown in structural contracts"
+~~~
+
+- [ ] **E4: Write doctor remediation REDs in `tests/test_final_safety.py`.** Add `DoctorRemediationTests.test_every_error_has_concrete_remediation` and `test_io_remediation_keeps_exit_six_and_is_read_only`. The first builds synthetic missing root, file root, missing/unreadable marker, unknown schema, malformed config, unsafe path, missing/non-directory/unreadable content directories, and injected resolution-I/O cases. For every returned error require a nonempty `Remediation: ` suffix and the exact instruction selected from this mapping:
+
+~~~python
+DOCTOR_REMEDIATIONS = {
+    "vault.unresolved": "Pass --vault to select an existing configured vault.",
+    "vault.not_found": "Pass --vault for an existing vault or preview init for a new target.",
+    "vault.not_directory": "Pass --vault for a directory.",
+    "config.invalid": "Restore a readable schema-v1 .second-brain/config.json or preview adopt for a markerless vault.",
+    "config.unsupported_version": "Use a compatible Threadroot version; do not rewrite the marker with this version.",
+    "config.path_invalid": "Correct the configured paths to existing content directories and rerun doctor.",
+    "path.unsafe": "Correct the path or symlink to stay inside the vault and outside secrets, then rerun doctor.",
+    "path.not_found": "Restore the configured directory or correct its config path, then rerun doctor.",
+    "path.not_directory": "Select a directory in the config and rerun doctor.",
+    "path.not_readable": "Grant read access to the configured directory and rerun doctor.",
+    "filesystem.failed": "Check filesystem availability and directory access, then rerun doctor.",
+}
+~~~
+
+Use this class with the mapping above. Add non-directory/missing configured paths and a configured `../outside` case by changing the initialized synthetic config/entry before the guarded call; retain the existing unsafe and unsupported-version result expectations. The mapping comparison checks concrete instructions rather than accepting any arbitrary advice suffix.
+
+~~~python
+class DoctorRemediationTests(unittest.TestCase):
+    def test_every_error_has_concrete_remediation(self):
+        for scenario in ("missing-root", "file-root", "missing-marker", "malformed",
+                         "unknown-schema", "missing-directory", "file-directory", "unsafe"):
+            with self.subTest(scenario=scenario), TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                root = base / "vault"
+                if scenario == "file-root":
+                    root.write_text("synthetic")
+                elif scenario == "missing-marker":
+                    root.mkdir()
+                elif scenario != "missing-root":
+                    self.assertTrue(run_init(root, True, False, {}, base / "home").ok)
+                    marker = root / ".second-brain/config.json"
+                    if scenario == "malformed":
+                        marker.write_text("{")
+                    elif scenario in ("unknown-schema", "unsafe"):
+                        document = json.loads(config_text())
+                        if scenario == "unknown-schema":
+                            document["schema_version"] = 2
+                        else:
+                            document["paths"]["daily"] = "../outside"
+                        marker.write_text(json.dumps(document))
+                    else:
+                        (root / "daily").rmdir()
+                        if scenario == "file-directory":
+                            (root / "daily").write_text("synthetic")
+                result = run_doctor(root)
+                self.assertFalse(result.ok)
+                self.assertFalse(result.applied)
+                self.assertEqual(result.changes, ())
+                for issue in result.issues:
+                    if issue.level == "error":
+                        self.assertIn("Remediation: ", issue.message)
+                        self.assertEqual(issue.message.split("Remediation: ", 1)[1],
+                                         DOCTOR_REMEDIATIONS[issue.code])
+
+    def test_io_remediation_keeps_exit_six_and_is_read_only(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            before = root.lstat().st_mtime_ns
+            with patch.object(Path, "resolve", side_effect=OSError(errno.EIO, "synthetic I/O")), \
+                 patch.object(Path, "mkdir") as mkdir, patch.object(Path, "touch") as touch, \
+                 patch.object(Path, "write_text") as write, patch.object(Path, "unlink") as unlink, \
+                 patch("threadroot.operations.os.replace") as replace:
+                result = run_doctor(root)
+            self.assertEqual(result.exit_code, ExitCode.IO_OR_DRIFT)
+            self.assertEqual(result.issues[0].message.split("Remediation: ", 1)[1],
+                             DOCTOR_REMEDIATIONS["filesystem.failed"])
+            for operation in (mkdir, touch, write, unlink, replace):
+                operation.assert_not_called()
+            self.assertEqual(root.lstat().st_mtime_ns, before)
+
+    def test_unresolved_cli_doctor_has_remediation(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            failure = ThreadrootError(ExitCode.CONFIG, "vault.unresolved", "Pass --vault.")
+            with patch("threadroot.cli.resolve_vault", side_effect=failure):
+                result = execute(build_parser().parse_args(["doctor", "--json"]), root, {}, root)
+            self.assertEqual(result.exit_code, ExitCode.CONFIG)
+            self.assertEqual(result.issues[0].message.split("Remediation: ", 1)[1],
+                             DOCTOR_REMEDIATIONS["vault.unresolved"])
+~~~
+
+Extend the first method with marker-unreadable and content-unreadable cases using `patch("threadroot.operations.os.access")`: return false only for the selected marker or content path's read check and delegate other calls to the saved real `os.access`; do not rely on OS privilege level. For each real-tree doctor call snapshot synthetic `lstat` kind/mtime/link entries before/after and intercept the five mutation APIs after fixture setup, as in the I/O case. Run `PYTHONPATH=src:. python3 -m unittest tests.test_final_safety.DoctorRemediationTests -v`; expect missing remediation assertions, not changed exits.
+
+- [ ] **E5: Add concrete remediation without schema changes and verify GREEN.** Define `_doctor_issue(issue: Issue) -> Issue` in `operations.py`, with the mapping above as `_DOCTOR_REMEDIATIONS`:
+
+~~~python
+def _doctor_issue(issue: Issue) -> Issue:
+    if issue.level != "error" or " Remediation: " in issue.message:
+        return issue
+    return Issue(issue.level, issue.code,
+                 issue.message + " Remediation: " + _DOCTOR_REMEDIATIONS[issue.code],
+                 issue.path)
+~~~
+
+Apply it in `_doctor_result` and `_error_result` when command is doctor; in CLI resolution-error handling use the same helper for doctor. Retain existing issue codes/order, `applied=false`, empty changes, and the Group A `error_exit` preservation. E4 includes the unresolved-root case before this change, so a doctor error raised before root resolution must also receive remediation. Run `PYTHONPATH=src:. python3 -m unittest tests.test_final_safety.DoctorRemediationTests tests.test_operations.DoctorTests tests.test_cli -v`, then `PYTHONPATH=src:. python3 -m unittest discover -s tests -v`.
+
+~~~bash
+git add -- src/threadroot/operations.py src/threadroot/cli.py tests/test_final_safety.py
+git diff --cached --name-only
+git diff --cached --check
+git commit -m "fix: give doctor errors concrete remediation"
+~~~
+
+#### Group F — Public contracts, final verification, and one review handoff
+
+- [ ] **F1: Update public docs and verify packaging contract consistency.** In README command inventory add the exact approved claim syntax and a synthetic two-command preview/apply example for `daily/2042-04-03.md`; explain that only an empty reservation is created. State existing-parent and claim–verify–native-edit requirements, exits `4`/`5`/`6`, capability failure stops, and visible partial state. In SECURITY update Path containment, Non-overwriting writes, and Partial failures for lexical/resolved secrets and marker exclusions, pointer overlap rejection before writes, owned pointer-temp cleanup only, and cooperative-session limits. Preserve the existing pointer `--apply --set-default` / after-vault-success relationship checked by `tests/test_documentation.py`. In AGENTS add claim to v0 contract and state no parents/no note bytes. In `docs/testing.md` add exact focused commands for the three new test modules, fence regressions and claim smoke; distinguish local oracle checks from separately authorized model runs. Keep shared skills provider-neutral.
+
+Use these executable examples in README/testing (an existing configured synthetic vault with a daily parent is required):
+
+~~~bash
+threadroot claim --path daily/2042-04-03.md --vault ./synthetic-vault --json
+threadroot claim --path daily/2042-04-03.md --vault ./synthetic-vault --json --apply
+~~~
+
+Review both native manifests, existing manifest parity tests, release exact-member tests and privacy scan inputs: no new skill name or dependency is needed, so manifests/catalog/version remain unchanged. New test files must appear in source distribution via the existing manifest rules; host archives must carry the updated shared skill bytes from the single source tree. Runtime wheel must expose claim. Verify through build/archive inspection and CLI smoke rather than adding README phrase tests. If an existing exact-content assertion needs a changed expected value, first run its targeted test to show the legitimate RED and update only that assertion; do not bypass package parity or privacy checks.
+
+- [ ] **F2: Verify docs and commit exact public paths.** Run `PYTHONPATH=src:. python3 -m unittest tests.test_documentation tests.test_packaging tests.test_release tests.test_public_safety -v`, `python3 scripts/check_public.py .`, and `git diff --check`. Review spec criteria 1–14 against groups A–F. Existing manifest and package assertions already derive shipped content from the shared tree, so F1 requires no manifest, catalog, dependency, version, or packaging-test mutation. If evidence contradicts that assumption, report the concrete new finding to the controller; do not create an unnamed conditional commit or weaken an assertion.
+
+~~~bash
+git add -- README.md SECURITY.md docs/testing.md AGENTS.md
+git diff --cached --name-only
+git diff --cached --check
+git commit -m "docs: explain claim and final safety verification"
+~~~
+
+- [ ] **F3: Run the available local interpreter matrix.** Use the installed interpreters only; do not install missing interpreters or dependencies through the network. Report each absent interpreter as unavailable, and do not call this a completed eight-cell CI matrix. Run this exact loop from the repository root; any nonzero test/compile exit stops the loop:
+
+~~~bash
+for threadroot_python in python3.11 python3.12 python3.13 python3.14; do
+  if command -v "$threadroot_python" >/dev/null 2>&1; then
+    "$threadroot_python" --version
+    PYTHONPATH=src:. "$threadroot_python" -m unittest discover -s tests -v || exit 1
+    "$threadroot_python" -m compileall -q src scripts tests || exit 1
+  else
+    printf '%s unavailable locally\n' "$threadroot_python"
+  fi
+done
+~~~
+
+The existing CI matrix remains macOS/Linux × Python 3.11–3.14. A local macOS run cannot prove Linux behavior; no remote exists, so record hosted CI as unexecuted unless the controller supplies separate execution evidence. Do not push to obtain CI.
+
+- [ ] **F4: Build fresh artifacts without implicit network access and run wheel smoke.** Locate an already available Python environment containing `build` and setuptools `>=69`; verify with `python3 -m build --version` and `python3 -c 'import setuptools; print(setuptools.__version__)'`. If the default interpreter lacks them, inspect already known local build environments and record the chosen executable in the ignored report. Missing local build tooling is an external prerequisite: report it and request separate authorization for network installation, never silently install. Use that executable as `threadroot_build_python`; this variable holds the discovered exact Python path and is not a system option. Then run:
+
+~~~bash
+"$threadroot_build_python" -m build --no-isolation
+python3 scripts/build_release.py --output dist
+python3 -m zipfile -l dist/threadroot-claude-0.1.0.zip
+python3 -m zipfile -l dist/threadroot-codex-0.1.0.zip
+python3 scripts/check_public.py . dist
+python3 scripts/check_public.py dist/threadroot-0.1.0-py3-none-any.whl dist/threadroot-0.1.0.tar.gz dist/threadroot-claude-0.1.0.zip dist/threadroot-codex-0.1.0.zip
+threadroot_smoke_root="$(mktemp -d)"
+python3 -m venv "$threadroot_smoke_root/venv"
+"$threadroot_smoke_root/venv/bin/python" -m pip install --no-index --no-deps dist/threadroot-0.1.0-py3-none-any.whl
+"$threadroot_smoke_root/venv/bin/threadroot" --version
+"$threadroot_smoke_root/venv/bin/threadroot" init --vault "$threadroot_smoke_root/vault" --apply --json
+"$threadroot_smoke_root/venv/bin/threadroot" claim --vault "$threadroot_smoke_root/vault" --path daily/2042-04-03.md --json
+test ! -e "$threadroot_smoke_root/vault/daily/2042-04-03.md"
+"$threadroot_smoke_root/venv/bin/threadroot" claim --vault "$threadroot_smoke_root/vault" --path daily/2042-04-03.md --apply --json
+test -f "$threadroot_smoke_root/vault/daily/2042-04-03.md"
+test ! -s "$threadroot_smoke_root/vault/daily/2042-04-03.md"
+~~~
+
+Execute each dependent command only after the previous exit is checked. Parse both claim JSON results and require the exact schema/status/target; repeat apply and require exit `5`. Run host archive tests against freshly built sources and inspect ZIP member bytes for all five changed skills plus shared README. Inspect wheel/sdist members for `claim` runtime code and all new tests in the sdist, no private/generated files, valid archive paths and no symlinks. Leave the temporary root for OS cleanup; do not recursively delete it.
+
+- [ ] **F5: Perform only local native validation within existing authority; gate new host/model usage.** `claude plugin validate --strict .` is a local no-model validation; run it only if the installed command does not require network or normal-state mutation. Require exit `0`. Run `PYTHONPATH=src:. python3 -m unittest tests.test_packaging tests.test_release -v` for both native archive/manifests regardless of host binary availability. Do not automatically repeat plugin installs, marketplace add/remove, or previous Task 12 dogfood. A live disposable Codex registry/install check is a manual checkpoint if not separately authorized; package static validation remains automated. After that separate authorization, the exact local registry commands are:
+
+~~~bash
+threadroot_native_root="$(mktemp -d)"
+CODEX_HOME="$threadroot_native_root" codex plugin marketplace add "$PWD" --json
+CODEX_HOME="$threadroot_native_root" codex plugin add threadroot@threadroot --json
+CODEX_HOME="$threadroot_native_root" codex plugin list --json
+~~~
+
+Check each exit before proceeding and parse the final JSON for the installed Threadroot entry. Record only versions, exits and installed-entry boolean. These commands must use the disposable config root on every invocation and must not launch a model or contact a remote marketplace; stop if the installed host cannot meet those conditions. Leave this temporary root for OS cleanup.
+
+Fresh Claude/Codex model or network synthetic runs require separate explicit authorization even though previous Task 12 runs were authorized. Before asking, finish F1–F4 and prepare the concrete changed artifacts and these cases for controller review: (1) missing daily claim success; (2) missing review claim success; (3) kickoff/ADR with pre-existing parents; (4) unsupported command exit `2` and missing executable; (5) invalid/mismatched preview/apply JSON; (6) competing empty reservation; (7) identity or size change before native edit; (8) native edit failure retaining reservation; (9) outside-vault adapter without exclusive capability. Use only synthetic fixtures, scoped roots and no private context. The oracle in D3 audits recorded metadata events, and the existing structural checker audits final files/headings/links. Report each actual host run separately from oracle tests. Do not infer atomic exclusivity from earlier Write-tool or dogfood success, and never launch a new model, copy credentials, weaken isolation, or use the private vault to fill an evidence gap. If separate authorization is absent, mark these manual cases unexecuted and hand off that limitation; do not claim fresh cross-host behavior verified.
+
+- [ ] **F6: Reconcile only ignored historical reports and ledger.** Read `.superpowers/sdd/2026-09-02-threadroot-v0/task-12-report.md` and `progress.md`. The latter is the actual ledger filename. Replace the Task 12 report's initial stale Status paragraph with one unique current summary: Task 12 automated, disposable uninstall, authorized synthetic host runs and the authorized stable-baseline private rerun were completed at `0456d0eff3df7b1b378048357ab77323afccacea`; their earlier checkpoints are historical and do not prove the new claim contract. Mark earlier private adoption-boundary/drift-stop and pre-final-verification summaries `Superseded by the final Task 12 checkpoint` while preserving their evidence paragraphs. Do not reopen/read the private vault or recreate transcripts. Change only `- [ ] Task 12` to `- [x] Task 12` in `progress.md`, append Task 13's commit/evidence summary, and leave its review status pending the controller's one re-review. Append all exact RED/GREEN/final commands, exits, counts, commit hashes, unavailable environments and manual gates to `final-fix-report.md`. Verify all three files with `git check-ignore`; never stage them.
+
+- [ ] **F7: Self-review and final single-review handoff.** Check the approved spec's 14 acceptance criteria; requirements introduced here map to A (4, 13), B (12), C (10), D (11), E (5, 14), F (1–3, 6–9 and regression coverage). Confirm matching function signatures, result codes, command inventories and no placeholder implementation remains. Run `git diff --check`, `git diff --cached --name-only`, `git status --short`, and `git log --oneline -8`. Expected clean worktree/index with only the exact scope commits. Return DONE or DONE_WITH_CONCERNS, commits, automated evidence and explicit unexecuted manual gates. The controller now performs exactly one scoped final re-review; do not create another fix task or launch a reviewer yourself.
+
 ## Acceptance-Criteria Coverage
 
 | Spec criterion | Implemented and proved by |
