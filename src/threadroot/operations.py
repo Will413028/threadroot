@@ -297,7 +297,7 @@ def _validate_descendant(vault: Path, change: PlannedChange) -> None:
 
 def _planned_root(vault: Path, plan: Sequence[PlannedChange]) -> Path:
     if not plan:
-        return Path(vault).resolve(strict=False)
+        return resolve_path(vault)
     first = plan[0]
     target = normalized_absolute(first.target)
     if first.public_path == ".":
@@ -312,7 +312,16 @@ def apply_plan(
     vault: Path,
     plan: Sequence[PlannedChange],
 ) -> CommandResult:
-    root = _planned_root(vault, plan)
+    try:
+        root = _planned_root(vault, plan)
+    except (ThreadrootError, OSError) as caught:
+        error = caught if isinstance(caught, ThreadrootError) else filesystem_error()
+        return CommandResult(
+            ok=False, command=command, applied=True, vault=None,
+            changes=_changes_with_status(plan, 0),
+            issues=(Issue("error", error.code, error.message, error.path),),
+            exit_code=error.exit_code,
+        )
     completed = 0
     for change in plan:
         try:

@@ -169,6 +169,108 @@ class DoctorRemediationTests(unittest.TestCase):
                     operation.assert_not_called()
 
 
+class EmptyPlanBoundaryTests(unittest.TestCase):
+    def test_empty_plan_invalid_literal_and_loop_remain_unsafe(self):
+        from threadroot.operations import apply_plan
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            loop = root / "loop"
+            loop.symlink_to(loop)
+            for target in (root / "bad\x00root", loop):
+                with self.subTest(target=target.name):
+                    try:
+                        result = apply_plan("init", target, ())
+                    except (ValueError, RuntimeError, OSError):
+                        self.fail("unsafe empty-plan root escaped the structured boundary")
+                    self.assertEqual(result.exit_code, ExitCode.UNSAFE_PATH)
+                    self.assertEqual((result.exit_code, result.issues[0].code),
+                                     (ExitCode.UNSAFE_PATH, "path.unsafe"))
+                    self.assertTrue(result.applied)
+                    self.assertIsNone(result.vault)
+                    self.assertEqual(result.changes, ())
+
+    def test_direct_empty_plan_resolution_io_returns_structured_failure(self):
+        from threadroot.operations import apply_plan
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            for command in ("init", "adopt"):
+                for failure in (OSError(errno.EIO, "synthetic opaque failure", str(root)),
+                                PermissionError(errno.EACCES, "synthetic opaque denial", str(root))):
+                    with self.subTest(command=command, failure=type(failure).__name__):
+                        with patch.object(Path, "resolve", side_effect=failure):
+                            try:
+                                result = apply_plan(command, root, ())
+                            except OSError:
+                                self.fail("empty-plan resolution escaped the structured operation boundary")
+                        self.assertEqual(result.exit_code, ExitCode.IO_OR_DRIFT)
+                        self.assertEqual(result.to_dict(), {
+                            "ok": False, "command": command, "applied": True,
+                            "vault": None, "changes": [], "issues": [{
+                                "level": "error", "code": "filesystem.failed",
+                                "message": "A filesystem operation failed; check directory access and retry.",
+                                "path": None,
+                            }],
+                        })
+                        self.assertNotIn(str(root), render_json(result))
+                        self.assertNotIn("opaque", render_json(result))
+
+    def test_initialized_runners_contain_empty_plan_resolution_io(self):
+        from threadroot import operations
+        for runner in (run_init, run_adopt):
+            for set_default in (False, True):
+                with self.subTest(runner=runner.__name__, set_default=set_default), TemporaryDirectory() as temporary:
+                    base = Path(temporary).resolve()
+                    root = base / "vault"
+                    self.assertTrue(run_init(root, True, False, {}, base / "home").ok)
+                    before = {path.relative_to(base): path.lstat()
+                              for path in [base, *base.rglob("*")]}
+                    real_planned_root = operations._planned_root
+                    def fail_resolution_at_apply(vault, plan):
+                        self.assertEqual(plan, ())
+                        with patch.object(Path, "resolve", side_effect=OSError(errno.EIO, "synthetic apply resolution", str(root))):
+                            return real_planned_root(vault, plan)
+                    with patch.object(operations, "_planned_root", fail_resolution_at_apply):
+                        try:
+                            result = runner(root, True, set_default, {}, base / "home")
+                        except OSError:
+                            self.fail("initialized runner leaked empty-plan resolution I/O")
+                    self.assertEqual(result.exit_code, ExitCode.IO_OR_DRIFT)
+                    self.assertFalse(result.ok)
+                    self.assertTrue(result.applied)
+                    self.assertIsNone(result.vault)
+                    self.assertEqual(result.to_dict()["changes"], [{
+                        "action": "write_default_pointer", "path": "machine-default-pointer",
+                        "status": "unexecuted",
+                    }] if set_default else [])
+                    self.assertEqual(result.issues[0].code, "filesystem.failed")
+                    self.assertNotIn(str(root), render_json(result))
+                    self.assertEqual(before, {path.relative_to(base): path.lstat()
+                                              for path in [base, *base.rglob("*")]})
+
+    def test_empty_plan_keeps_success_and_categorized_errors(self):
+        from threadroot import operations
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            for command in ("init", "adopt"):
+                result = operations.apply_plan(command, root, ())
+                self.assertEqual((result.ok, result.applied, result.exit_code, result.changes),
+                                 (True, True, ExitCode.OK, ()))
+                self.assertEqual(result.vault, str(root))
+            for code, issue_code in ((ExitCode.UNSAFE_PATH, "path.unsafe"),
+                                     (ExitCode.CONFIG, "config.invalid")):
+                with self.subTest(code=code), patch.object(
+                    operations, "_planned_root",
+                    side_effect=ThreadrootError(code, issue_code, "Synthetic categorized failure."),
+                ):
+                    try:
+                        result = operations.apply_plan("init", root, ())
+                    except ThreadrootError:
+                        self.fail("categorized error escaped the apply boundary")
+                    self.assertEqual((result.exit_code, result.issues[0].code), (code, issue_code))
+                    self.assertTrue(result.applied)
+                    self.assertEqual(result.changes, ())
+
+
 class PathBoundaryTests(unittest.TestCase):
     def test_nul_configured_path_is_structured_unsafe(self):
         with TemporaryDirectory() as temporary:
@@ -337,6 +439,72 @@ class PathBoundaryTests(unittest.TestCase):
 
 
 class PointerSafetyTests(unittest.TestCase):
+    def test_terminal_pointer_symlink_inside_vault_is_zero_write(self):
+        from threadroot import operations
+        for operation in (run_init, run_adopt):
+            for apply in (False, True):
+                for linked_parent in (False, True):
+                    with self.subTest(operation=operation.__name__, apply=apply,
+                                      linked_parent=linked_parent), TemporaryDirectory() as temporary:
+                        base = Path(temporary).resolve()
+                        vault = base / "vault"
+                        self.assertTrue(run_init(vault, True, False, {}, base / "home").ok)
+                        outside = base / "outside.json"
+                        outside.write_bytes(b"synthetic outside content")
+                        pointer = vault / "threadroot/config.json"
+                        pointer.parent.mkdir()
+                        pointer.symlink_to(outside)
+                        xdg = vault
+                        if linked_parent:
+                            xdg = base / "xdg"
+                            xdg.mkdir()
+                            (xdg / "threadroot").symlink_to(pointer.parent, target_is_directory=True)
+                        before = pointer.lstat(), outside.stat(), outside.read_bytes()
+                        real_mkdir = Path.mkdir
+                        mkdir_calls = []
+                        def mkdir(path, *args, **kwargs):
+                            mkdir_calls.append(path)
+                            return real_mkdir(path, *args, **kwargs)
+                        with patch.object(Path, "mkdir", mkdir), \
+                             patch.object(operations.tempfile, "mkstemp", wraps=operations.tempfile.mkstemp) as temporary_file, \
+                             patch.object(operations.os, "replace", wraps=operations.os.replace) as replace:
+                            result = operation(vault, apply, True,
+                                               {"XDG_CONFIG_HOME": str(xdg)}, base / "home")
+                        self.assertEqual(result.exit_code, ExitCode.UNSAFE_PATH)
+                        self.assertFalse(result.applied)
+                        self.assertEqual(result.changes, ())
+                        self.assertEqual(result.issues[0].path, "machine-default-pointer")
+                        self.assertEqual(mkdir_calls, [])
+                        temporary_file.assert_not_called()
+                        replace.assert_not_called()
+                        self.assertTrue(pointer.is_symlink())
+                        self.assertEqual(before, (pointer.lstat(), outside.stat(), outside.read_bytes()))
+
+    def test_writer_rejects_terminal_entry_or_referent_inside_vault(self):
+        for entry_inside, referent_inside in ((True, False), (False, True), (False, False)):
+            with self.subTest(entry_inside=entry_inside, referent_inside=referent_inside), TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                vault = base / "vault"
+                vault.mkdir()
+                referent = (vault if referent_inside else base) / "referent.json"
+                referent.write_bytes(b"synthetic referent")
+                xdg = vault if entry_inside else base / "xdg"
+                pointer = xdg / "threadroot/config.json"
+                pointer.parent.mkdir(parents=True)
+                pointer.symlink_to(referent)
+                before = pointer.lstat(), referent.stat(), referent.read_bytes()
+                if entry_inside or referent_inside:
+                    with self.assertRaises(ThreadrootError) as caught:
+                        write_default_pointer(vault, {"XDG_CONFIG_HOME": str(xdg)}, base / "home")
+                    self.assertEqual(caught.exception.exit_code, ExitCode.UNSAFE_PATH)
+                    self.assertEqual(before, (pointer.lstat(), referent.stat(), referent.read_bytes()))
+                else:
+                    write_default_pointer(vault, {"XDG_CONFIG_HOME": str(xdg)}, base / "home")
+                    self.assertFalse(pointer.is_symlink())
+                    self.assertEqual(json.loads(pointer.read_text()), {"default_vault": str(vault)})
+                    self.assertEqual(before[1:], (referent.stat(), referent.read_bytes()))
+                self.assertEqual(["config.json"], [path.name for path in pointer.parent.iterdir()])
+
     def test_direct_and_parent_symlink_overlap_are_zero_write(self):
         for operation in (run_init, run_adopt):
             for apply in (False, True):

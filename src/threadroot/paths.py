@@ -136,8 +136,10 @@ def default_pointer_path(environ: Mapping[str, str], home: Path) -> Path:
 
 def validate_default_pointer(vault: Path, pointer: Path) -> Path:
     root = resolve_path(vault)
-    destination = resolve_path(pointer)
-    if destination == root or root in destination.parents:
+    entry = resolve_path(pointer.parent) / pointer.name
+    if (entry == root or root in entry.parents
+            or (destination := resolve_path(pointer)) == root
+            or root in destination.parents):
         raise ThreadrootError(
             ExitCode.UNSAFE_PATH, "path.unsafe",
             "Default pointer must stay outside the vault; choose another config directory.",
