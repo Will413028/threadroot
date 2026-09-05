@@ -15,6 +15,7 @@ import warnings
 import zipfile
 
 from scripts import build_release
+from scripts import release_archives
 from scripts.build_release import build_archive
 from scripts.release_archives import (
     ReleaseArchiveError,
@@ -155,6 +156,21 @@ def _make_sdist_source(root: Path) -> Path:
     (source / "README.md").write_bytes(b"# Synthetic Threadroot\n")
     (source / "LICENSE").write_bytes(b"synthetic license\n")
     (source / ".gitignore").write_bytes(b"dist/\n")
+    roots = [
+        ".claude-plugin", ".codex-plugin", ".dockerignore", "AGENTS.md", "CONTRIBUTING.md",
+        "LICENSE", "README.md", "SECURITY.md", "docs", "requirements", "scripts", "skills",
+        "src/threadroot", "templates", "tests", "tools/release",
+    ]
+    for name in roots:
+        path = source / name
+        if path.exists():
+            continue
+        if "." in path.name or path.name.isupper():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes((name + "\n").encode())
+        else:
+            path.mkdir(parents=True)
+            (path / "fixture.txt").write_bytes((name + "\n").encode())
     (source / "pyproject.toml").write_text(
         '[project]\nname = "threadroot"\nversion = "0.1.0"\n'
         'description = "Local-first second-brain workflows for coding agents"\n'
@@ -164,8 +180,7 @@ def _make_sdist_source(root: Path) -> Path:
         '[project.urls]\nHomepage = "https://github.com/Will413028/threadroot"\n'
         'Repository = "https://github.com/Will413028/threadroot"\n'
         'Issues = "https://github.com/Will413028/threadroot/issues"\n'
-        '[tool.hatch.build.targets.sdist]\nonly-include = '
-        '["LICENSE", "README.md", "src/threadroot"]\n',
+        '[tool.hatch.build.targets.sdist]\nonly-include = ' + repr(roots).replace("'", '"') + '\n',
         encoding="utf-8",
     )
     return source
@@ -191,7 +206,11 @@ def _pkg_info(source: Path) -> bytes:
 
 def _sdist_entries(source: Path) -> list[dict[str, object]]:
     prefix = "threadroot-0.1.0/"
-    names = [".gitignore", "LICENSE", "README.md", "pyproject.toml", "src/threadroot/__init__.py"]
+    names = sorted(
+        path.relative_to(source).as_posix()
+        for path in source.rglob("*")
+        if path.is_file()
+    )
     entries = [
         {"name": prefix + name, "payload": (source / name).read_bytes(), "kind": tarfile.REGTYPE,
          "mode": 0o644, "mtime": WHEEL_EPOCH, "uid": 0, "gid": 0}
@@ -270,7 +289,80 @@ def _rewrite_host_zip(
             archive.writestr(info, payload)
 
 
+def _eocd_offset(payload: bytes) -> int:
+    offset = payload.rfind(b"PK\x05\x06")
+    if offset < 0:
+        raise AssertionError("fixture has no EOCD")
+    return offset
+
+
+def _mutate_local_zip(payload: bytes, mutation: str) -> bytes:
+    changed = bytearray(payload)
+    if changed[:4] != b"PK\x03\x04":
+        raise AssertionError("fixture has no first local header")
+    name_size = int.from_bytes(changed[26:28], "little")
+    extra_size = int.from_bytes(changed[28:30], "little")
+    if mutation == "timestamp":
+        changed[10:12] = (1).to_bytes(2, "little")
+    elif mutation == "crc":
+        changed[14:18] = (0).to_bytes(4, "little")
+    elif mutation == "compression":
+        changed[8:10] = zipfile.ZIP_STORED.to_bytes(2, "little")
+    elif mutation == "extra":
+        insertion = 30 + name_size + extra_size
+        changed[28:30] = (extra_size + 2).to_bytes(2, "little")
+        changed[insertion:insertion] = b"xx"
+        eocd = _eocd_offset(changed)
+        central = int.from_bytes(changed[eocd + 16 : eocd + 20], "little")
+        changed[eocd + 16 : eocd + 20] = (central + 2).to_bytes(4, "little")
+    elif mutation == "interstitial":
+        eocd = _eocd_offset(changed)
+        central = int.from_bytes(changed[eocd + 16 : eocd + 20], "little")
+        changed[central:central] = b"JUNK"
+        eocd += 4
+        changed[eocd + 16 : eocd + 20] = (central + 4).to_bytes(4, "little")
+    elif mutation == "nul-name":
+        local_name = 30
+        changed[local_name + name_size - 1] = 0
+        eocd = _eocd_offset(changed)
+        central = int.from_bytes(changed[eocd + 16 : eocd + 20], "little")
+        central_name_size = int.from_bytes(changed[central + 28 : central + 30], "little")
+        if central_name_size != name_size:
+            raise AssertionError("fixture filename lengths differ")
+        changed[central + 46 + central_name_size - 1] = 0
+    else:
+        raise AssertionError(mutation)
+    result = bytes(changed)
+    if result == payload:
+        raise AssertionError("mutation did not change fixture")
+    return result
+
+
 class CommonArchiveTests(unittest.TestCase):
+    def test_artifact_same_size_rewrite_with_restored_mtime_is_rejected(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "archive.tar"
+            artifact.write_bytes(_tar_bytes([("safe.txt", b"safe\n", 0o644, tarfile.REGTYPE)]))
+            metadata = artifact.stat()
+            original_read = os.read
+            changed = False
+
+            def racing_read(descriptor: int, size: int) -> bytes:
+                nonlocal changed
+                payload = original_read(descriptor, size)
+                if payload and not changed:
+                    changed = True
+                    replacement = bytearray(artifact.read_bytes())
+                    replacement[-1] ^= 1
+                    artifact.write_bytes(replacement)
+                    os.utime(artifact, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+                return payload
+
+            with patch("scripts.release_archives.os.read", side_effect=racing_read), self.assertRaises(ReleaseArchiveError):
+                extract_regular_tar(artifact, root / "out")
+            self.assertTrue(changed)
+
     def test_validate_archive_name_rejects_unsafe_forms(self) -> None:
         invalid = ("", "/absolute", "../escape", "safe/../../escape", "dir\\file")
         for name in invalid:
@@ -392,6 +484,47 @@ class CommonArchiveTests(unittest.TestCase):
                 self.assertEqual(raised.exception.code, code)
                 self.assertFalse(destination.exists())
 
+    def test_tar_rejects_leading_zero_block_before_valid_members(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "leading-zero.tar"
+            artifact.write_bytes(bytes(512) + _tar_bytes([("safe/file.txt", b"safe\n", 0o644, tarfile.REGTYPE)]))
+            with self.assertRaises(ReleaseArchiveError):
+                extract_regular_tar(artifact, root / "out")
+
+    def test_member_tree_accepts_directory_after_child_and_rejects_file_relations(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            valid = root / "valid.tar"
+            valid.write_bytes(_tar_bytes([
+                ("safe/file.txt", b"safe\n", 0o644, tarfile.REGTYPE),
+                ("safe", b"", 0o755, tarfile.DIRTYPE),
+            ]))
+            extract_regular_tar(valid, root / "valid-out")
+            self.assertEqual((root / "valid-out/safe/file.txt").read_bytes(), b"safe\n")
+
+            for label, entries in (
+                ("file-ancestor", [("safe", b"x", 0o644, tarfile.REGTYPE), ("safe/file", b"x", 0o644, tarfile.REGTYPE)]),
+                ("file-descendant", [("safe/file", b"x", 0o644, tarfile.REGTYPE), ("safe", b"x", 0o644, tarfile.REGTYPE)]),
+                ("directory-duplicate", [("safe/", b"", 0o755, tarfile.DIRTYPE), ("safe", b"", 0o755, tarfile.DIRTYPE)]),
+                ("file-trailing-slash", [("safe/file/", b"x", 0o644, tarfile.REGTYPE)]),
+            ):
+                with self.subTest(case=label):
+                    artifact = root / f"{label}.tar"
+                    artifact.write_bytes(_tar_bytes(entries))
+                    with self.assertRaises(ReleaseArchiveError):
+                        extract_regular_tar(artifact, root / f"{label}-out")
+
+    def test_zip_rejects_local_header_and_raw_layout_mutations(self) -> None:
+        valid = _zip_bytes([("safe/file.txt", b"safe\n", stat.S_IFREG | 0o644)])
+        for mutation in ("timestamp", "crc", "compression", "extra", "interstitial", "nul-name"):
+            with self.subTest(mutation=mutation), TemporaryDirectory() as directory:
+                root = Path(directory)
+                artifact = root / "mutated.zip"
+                artifact.write_bytes(_mutate_local_zip(valid, mutation))
+                with self.assertRaises(ReleaseArchiveError):
+                    extract_regular_zip(artifact, root / "out")
+
     def test_zip_rejects_unsafe_duplicate_link_special_mode_and_archive_data(self) -> None:
         regular = ("safe/file.txt", b"safe\n", stat.S_IFREG | 0o644)
         cases = {
@@ -455,8 +588,117 @@ class CommonArchiveTests(unittest.TestCase):
                 self.assertEqual(stat.S_IMODE((destination / "safe/plain.txt").stat().st_mode), 0o644)
                 self.assertEqual(stat.S_IMODE((destination / "safe/run.sh").stat().st_mode), 0o755)
 
+    def test_publication_never_replaces_competing_destination(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "artifact.tar"
+            artifact.write_bytes(_tar_bytes([("safe/file", b"safe", 0o644, tarfile.REGTYPE)]))
+            destination = root / "out"
+            original = getattr(release_archives, "_exclusive_rename", None)
+
+            def race(parent_fd: int, stage_name: str, destination_name: str) -> None:
+                os.mkdir(destination_name, dir_fd=parent_fd)
+                if original is None:
+                    return
+                original(parent_fd, stage_name, destination_name)
+
+            with patch.object(release_archives, "_exclusive_rename", side_effect=race, create=True):
+                with self.assertRaises(ReleaseArchiveError):
+                    extract_regular_tar(artifact, destination)
+            self.assertTrue(destination.is_dir())
+            self.assertEqual(list(destination.iterdir()), [])
+
+    def test_destination_parent_identity_is_bound_across_open(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "artifact.tar"
+            artifact.write_bytes(_tar_bytes([("safe/file", b"safe", 0o644, tarfile.REGTYPE)]))
+            parent = root / "parent"
+            parent.mkdir()
+            destination = parent / "out"
+            parked = root / "parked"
+            real_open = os.open
+            swapped = False
+
+            def swap_open(file: object, flags: int, *args: object, **kwargs: object) -> int:
+                nonlocal swapped
+                if not swapped and file == parent:
+                    parent.rename(parked)
+                    parent.mkdir()
+                    swapped = True
+                return real_open(file, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+            with patch.object(release_archives.os, "open", side_effect=swap_open):
+                with self.assertRaises(ReleaseArchiveError):
+                    extract_regular_tar(artifact, destination)
+            self.assertFalse(destination.exists())
+
+    def test_cleanup_does_not_remove_replacement_at_staging_name(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "artifact.tar"
+            artifact.write_bytes(_tar_bytes([("safe/file", b"safe", 0o644, tarfile.REGTYPE)]))
+            destination = root / "out"
+            parked = root / "owned-parked"
+            real_open = os.open
+            replacement: Path | None = None
+
+            def fail_write(file: object, flags: int, *args: object, **kwargs: object) -> int:
+                nonlocal replacement
+                if flags & os.O_WRONLY and kwargs.get("dir_fd") is not None:
+                    stages = list(root.glob(".out.stage-*"))
+                    self.assertEqual(len(stages), 1)
+                    stage = stages[0]
+                    stage.rename(parked)
+                    stage.mkdir()
+                    (stage / "competitor.txt").write_text("keep\n", encoding="utf-8")
+                    replacement = stage
+                    raise OSError("synthetic write failure")
+                return real_open(file, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+            with patch.object(release_archives.os, "open", side_effect=fail_write):
+                with self.assertRaises(ReleaseArchiveError):
+                    extract_regular_tar(artifact, destination)
+            self.assertIsNotNone(replacement)
+            self.assertEqual((replacement / "competitor.txt").read_text(encoding="utf-8"), "keep\n")  # type: ignore[operator]
+
 
 class WheelContractTests(unittest.TestCase):
+    def test_wheel_rejects_source_swap_at_descriptor_open(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _make_wheel_source(root)
+            order, payloads = _wheel_payloads(source)
+            artifact = root / "valid.whl"
+            _write_wheel(artifact, order, payloads)
+            victim = source / "src/threadroot/__init__.py"
+            outside = root / "outside.py"
+            outside.write_bytes(victim.read_bytes())
+            original_open = os.open
+            changed = False
+
+            def racing_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+                nonlocal changed
+                if path == "__init__.py" and kwargs.get("dir_fd") is not None and not changed:
+                    changed = True
+                    victim.unlink()
+                    victim.symlink_to(outside)
+                return original_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+            with patch("scripts.release_archives.os.open", side_effect=racing_open), self.assertRaises(ReleaseArchiveError):
+                validate_wheel(artifact, source, "0.1.0", WHEEL_EPOCH)
+            self.assertTrue(changed)
+
+    def test_wheel_accepts_header_only_wheel_metadata_with_single_newline(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _make_wheel_source(root)
+            order, payloads = _wheel_payloads(source)
+            wheel_name = "threadroot-0.1.0.dist-info/WHEEL"
+            payloads[wheel_name] = payloads[wheel_name].rstrip(b"\n") + b"\n"
+            artifact = root / "header-only.whl"
+            _write_wheel(artifact, order, payloads)
+            validate_wheel(artifact, source, "0.1.0", WHEEL_EPOCH)
     def test_wheel_requires_exact_source_metadata_entry_point_license_and_record(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
