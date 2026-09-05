@@ -4,6 +4,9 @@
 
 **Status:** Approved
 
+**Artifact-identity amendment:** Draft for maintainer review; architectural
+direction approved 2026-09-06
+
 **Release:** `v0.1.0`
 **Repository:** `https://github.com/Will413028/threadroot`
 
@@ -37,6 +40,9 @@ Release readiness changes only:
   dependency used by that environment.
 - Add a dedicated reproducibility gate that builds all four artifacts from two
   independent exports of the same commit and compares them byte for byte.
+- Bind release inputs and both candidate sets once, carry immutable artifact
+  snapshots through every verification phase, and promote only from those
+  approved snapshots.
 - Rebuild and verify the existing wheel, source distribution, Claude Code ZIP,
   and Codex ZIP from the final release commit.
 - Publish one immutable `v0.1.0` tag and one GitHub Release containing exactly
@@ -61,6 +67,11 @@ This release does not add or change:
 - A promise that arbitrary Python, zlib, operating-system, locale, or build-tool
   versions produce identical bytes. Reproducibility is scoped to the recorded
   canonical release environment.
+- Resistance to a malicious Docker daemon, host root, or concurrent same-UID
+  process that can rewrite the dedicated build output while the release gate is
+  running. Those actors are inside the trusted local build boundary; stronger
+  isolation would require a dedicated build host or filesystem snapshot and is
+  deferred until the threat model requires it.
 - OpenAI universal Plugins Directory submission or any Claude marketplace
   submission.
 - A logo, standalone product website, privacy-policy site, terms site, support
@@ -260,6 +271,114 @@ A dedicated CI job runs the same checked-in build and verification entry point
 for relevant pull requests and `main`. It is separate from the supported-system
 test matrix, produces no GitHub Release, and fails on any byte, membership,
 metadata, privacy, or source-to-wheel mismatch.
+
+## Artifact identity and build trust amendment
+
+The release gate uses one ownership model from input binding through atomic
+promotion. Repeating pathname checks at individual phases is not sufficient:
+it can validate one inode, consume another, and lose the identity of candidate
+B after the byte comparison. The implementation therefore binds filesystem
+objects once and carries their identities and bytes forward instead of taking
+new path-based snapshots as each phase begins.
+
+### Canonical trust perimeter
+
+The outer release entry point is the isolation boundary. It must create both
+source exports itself and run the inner orchestrator with all of these
+properties at once:
+
+- `/source-a` and `/source-b` are distinct read-only bind mounts containing
+  safely extracted `git archive` trees of the same exact commit;
+- the container root filesystem is read-only, the artifact phase has no
+  network, all capabilities are dropped, `no-new-privileges` is set, and the
+  process runs as the invoking non-root UID/GID;
+- `/release-output` is the only writable bind mount and is dedicated to this
+  invocation; and
+- an optional denylist is a read-only regular-file mount at exactly
+  `/run/threadroot/denylist`.
+
+The maintainer account, host kernel, Docker daemon, dedicated output root, and
+reviewed build tools are trusted not to mutate these mounts concurrently or
+leave hostile background writers. A detected accidental drift still fails the
+run and must never produce `selected/`, but candidate and evidence directories
+may remain for diagnosis. The gate does not claim to defeat a malicious host
+actor able to write between the last filesystem check and a kernel rename.
+
+### Bound inputs and source snapshots
+
+The inner orchestrator owns a single run-scoped binding object managed by one
+`ExitStack`. It opens and retains descriptors for both source roots and the
+output root. Every root is opened with directory and no-follow semantics and
+its pathname entry is matched to the held descriptor. A missing output leaf is
+created only beneath a held real parent with exclusive `mkdirat` semantics; an
+existing empty output is opened and checked through its held descriptor. The
+orchestrator never adopts an entry that appears during creation and never uses
+`mkdir(..., exist_ok=True)` to cross this boundary.
+
+Release-relevant source files are read component by component relative to the
+held source descriptors. Each directory component and regular-file leaf is
+opened without following links and is checked before and after the read. The
+result is an immutable release-source snapshot containing only the files
+required by the wheel, sdist, host ZIP, scanner, Dockerfile, and release lock
+contracts. Both exports must produce identical builder-definition bytes and
+the lock must contain exactly the approved option and complete package map.
+
+Task 3 gains narrow snapshot-oriented entry points that share the existing
+validation and extraction cores. The existing Path APIs remain available for
+post-download and standalone validation, while the inner orchestrator passes
+captured archive bytes and the immutable release-source snapshot. There is one
+metadata, membership, path-safety, and extraction implementation—not a second
+validator and not an archive canonicalizer.
+
+### Candidate snapshots and verification flow
+
+After each independent build, the orchestrator opens the candidate directory
+and exactly four regular, single-link artifact members relative to that held
+directory. For every member it records the original device, inode, file type,
+permission mode, link count, size, mtime, ctime, streamed SHA-256, and immutable
+payload bytes. Candidate A and B become a verified pair only when corresponding
+payload bytes match exactly; `filecmp.cmp(..., shallow=False)` remains an
+additional required comparison, not the identity authority.
+
+All subsequent archive validation and extraction consumes the captured source
+and artifact snapshots. Sdist replay captures its sole regular wheel and
+compares it with candidate A's approved wheel payload. The public scanner still
+receives the two canonical read-only source mount paths, four packed paths, and
+four unpacked roots because it is a separate path-based process; bindings and
+all eight candidate snapshots are revalidated immediately before and after
+that subprocess.
+
+Before evidence or promotion, candidate A and B must both retain exact
+membership, pathname-to-descriptor identity, full recorded metadata, and
+approved hashes. Any byte, inode, mode, link, timestamp, or membership drift
+fails without `selected/`. Evidence is serialized only from the already-bound
+Dockerfile, lock, source, and artifact snapshots; it never reopens a pathname
+to establish a new authority.
+
+### Promotion and failure semantics
+
+Promotion copies candidate A's immutable approved payloads into an owned
+`selected.pending/`; it does not reopen candidate A to choose publication
+bytes. Short writes are handled explicitly. Immediately before publication,
+the exclusive primitive verifies through held descriptors that pending has
+exactly four regular, single-link `0644` files, that each directory entry still
+names the opened inode, and that every size and hash equals the approved A
+snapshot. It then uses Linux `renameat2(RENAME_NOREPLACE)` or Darwin
+`renameatx_np(RENAME_EXCL)`. An existing, broken-link, or raced `selected/` is
+never replaced.
+
+All acquired descriptors are registered with the run's `ExitStack` as soon as
+they are opened and close on every success and failure path. Scanner or
+validation failure creates neither promotion directory. A copy or pending
+write failure leaves the owned `selected.pending/` visible for diagnosis, as
+required by the existing failure policy. An identity mismatch never deletes a
+replacement object whose ownership cannot be proven.
+
+This amendment expands the implementation scope narrowly to
+`scripts/release_archives.py`, `tests/test_release_archives.py`,
+`scripts/release_artifacts.py`, and `tests/test_release_artifacts.py`, plus the
+binding spec and implementation plan. It does not change runtime CLI behavior,
+artifact formats, product manifests, dependency policy, or release bytes.
 
 ## Release artifacts
 
