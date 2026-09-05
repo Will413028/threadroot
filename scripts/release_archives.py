@@ -4,6 +4,7 @@ import binascii
 import base64
 import ctypes
 import csv
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.parser import BytesParser
 from email.policy import default as email_policy
@@ -25,6 +26,18 @@ class ReleaseArchiveError(RuntimeError):
     def __init__(self, code: str, message: str) -> None:
         self.code = code
         super().__init__(message)
+
+
+@dataclass(frozen=True)
+class ReleaseSourceEntry:
+    path: str
+    payload: bytes
+    mode: int
+
+
+@dataclass(frozen=True)
+class ReleaseSourceSnapshot:
+    entries: tuple[ReleaseSourceEntry, ...]
 
 
 def _fail(code: str, message: str) -> ReleaseArchiveError:
@@ -191,8 +204,11 @@ def _validate_zip_structure(payload: bytes, infos: list[zipfile.ZipInfo]) -> Non
 
 
 def _load_zip_members(artifact: Path) -> list[tuple[PurePosixPath, bool, int, bytes]]:
+    return _load_zip_members_payload(_read_artifact(artifact))
+
+
+def _load_zip_members_payload(raw: bytes) -> list[tuple[PurePosixPath, bool, int, bytes]]:
     try:
-        raw = _read_artifact(artifact)
         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
             infos = archive.infolist()
             _validate_zip_structure(raw, infos)
@@ -258,9 +274,15 @@ def _load_tar_members(
     artifact: Path,
     expected_global_comment: str | None,
 ) -> list[tuple[PurePosixPath, bool, int, bytes]]:
+    return _load_tar_members_payload(_read_artifact(artifact), expected_global_comment)
+
+
+def _load_tar_members_payload(
+    raw: bytes,
+    expected_global_comment: str | None,
+) -> list[tuple[PurePosixPath, bool, int, bytes]]:
     try:
-        raw_artifact = _read_artifact(artifact)
-        raw_tar = _gzip_payload(raw_artifact) if raw_artifact.startswith(b"\x1f\x8b") else raw_artifact
+        raw_tar = _gzip_payload(raw) if raw.startswith(b"\x1f\x8b") else raw
         _validate_tar_boundary(raw_tar)
         with tarfile.open(fileobj=io.BytesIO(raw_tar), mode="r:") as archive:
             expected_pax = {} if expected_global_comment is None else {"comment": expected_global_comment}
@@ -492,13 +514,30 @@ def extract_regular_tar(
     destination: Path,
     expected_global_comment: str | None = None,
 ) -> None:
-    members = _load_tar_members(Path(artifact), expected_global_comment)
+    extract_regular_tar_payload(_read_artifact(Path(artifact)), destination, expected_global_comment)
+
+
+def extract_regular_tar_payload(
+    artifact: bytes,
+    destination: Path,
+    expected_global_comment: str | None = None,
+) -> None:
+    members = _load_tar_members_payload(artifact, expected_global_comment)
     _extract_members(Path(destination), members)
 
 
 def extract_regular_zip(artifact: Path, destination: Path) -> None:
-    members = _load_zip_members(Path(artifact))
+    extract_regular_zip_payload(_read_artifact(Path(artifact)), destination)
+
+
+def extract_regular_zip_payload(artifact: bytes, destination: Path) -> None:
+    members = _load_zip_members_payload(artifact)
     _extract_members(Path(destination), members)
+
+
+def _source_file_signature(metadata: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+    return (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_nlink,
+            metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns)
 
 
 def _read_regular_at(parent_fd: int, name: str) -> tuple[bytes, int]:
@@ -508,15 +547,15 @@ def _read_regular_at(parent_fd: int, name: str) -> tuple[bytes, int]:
     descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), dir_fd=parent_fd)
     try:
         opened = os.fstat(descriptor)
-        if not _same_identity(before, opened):
+        if _source_file_signature(before) != _source_file_signature(opened):
             raise OSError("source changed before open")
         chunks: list[bytes] = []
         while chunk := os.read(descriptor, 1024 * 1024):
             chunks.append(chunk)
         after = os.fstat(descriptor)
         current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        signature = lambda value: (value.st_dev, value.st_ino, value.st_mode, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
-        if signature(after) != signature(opened) or signature(current) != signature(opened):
+        if (_source_file_signature(after) != _source_file_signature(opened)
+                or _source_file_signature(current) != _source_file_signature(opened)):
             raise OSError("source changed while reading")
         return b"".join(chunks), 0o755 if opened.st_mode & 0o111 else 0o644
     finally:
@@ -529,9 +568,12 @@ def _open_relative_directory(root_fd: int, parts: tuple[str, ...]) -> int:
         for part in parts:
             before = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
             child = _open_directory(descriptor, part)
-            if not stat.S_ISDIR(before.st_mode) or not _same_identity(before, os.fstat(child)):
+            try:
+                if not stat.S_ISDIR(before.st_mode) or not _same_identity(before, os.fstat(child)):
+                    raise OSError("unsafe source directory")
+            except BaseException:
                 os.close(child)
-                raise OSError("unsafe source directory")
+                raise
             os.close(descriptor)
             descriptor = child
         return descriptor
@@ -551,6 +593,7 @@ def _walk_regular(descriptor: int, prefix: PurePosixPath) -> dict[str, tuple[byt
                 if not _same_identity(metadata, os.fstat(child)):
                     raise OSError("source directory changed")
                 result.update(_walk_regular(child, relative))
+                _check_source_directory(descriptor, name, child, metadata)
             finally:
                 os.close(child)
         elif stat.S_ISREG(metadata.st_mode):
@@ -560,37 +603,69 @@ def _walk_regular(descriptor: int, prefix: PurePosixPath) -> dict[str, tuple[byt
     return result
 
 
-def _source_snapshot(source: Path, roots: list[str]) -> dict[str, tuple[bytes, int]]:
+def _source_directory_signature(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (metadata.st_dev, metadata.st_ino, metadata.st_mode,
+            metadata.st_mtime_ns, metadata.st_ctime_ns)
+
+
+def _check_source_directory(parent_fd: int, name: str, descriptor: int, expected: os.stat_result) -> None:
+    current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if (_source_directory_signature(current) != _source_directory_signature(expected)
+            or _source_directory_signature(os.fstat(descriptor)) != _source_directory_signature(expected)):
+        raise OSError("source directory changed")
+
+
+def _capture_source_roots(source_fd: int, roots: list[str]) -> ReleaseSourceSnapshot:
     root_fd: int | None = None
     try:
-        before = os.lstat(source)
-        root_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
-        if not stat.S_ISDIR(before.st_mode) or not _same_identity(before, os.fstat(root_fd)):
+        root_fd = os.dup(source_fd)
+        root_metadata = os.fstat(root_fd)
+        if not stat.S_ISDIR(root_metadata.st_mode):
             raise OSError("unsafe source root")
         result: dict[str, tuple[bytes, int]] = {}
-        try:
-            for root_name in roots:
-                relative = validate_archive_name(root_name)
-                parent_fd = _open_relative_directory(root_fd, relative.parts[:-1])
+        selected_roots: set[str] = set()
+        for root_name in roots:
+            relative = validate_archive_name(root_name)
+            if any(root_name == other or root_name.startswith(other + "/") or other.startswith(root_name + "/")
+                   for other in selected_roots):
+                raise OSError("duplicate source selection")
+            selected_roots.add(root_name)
+            parent_fd = _open_relative_directory(root_fd, relative.parts[:-1])
+            try:
+                parent_metadata = os.fstat(parent_fd)
+                metadata = os.stat(relative.parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+                if stat.S_ISREG(metadata.st_mode):
+                    additions = {relative.as_posix(): _read_regular_at(parent_fd, relative.parts[-1])}
+                elif stat.S_ISDIR(metadata.st_mode):
+                    child = _open_directory(parent_fd, relative.parts[-1])
+                    try:
+                        if not _same_identity(metadata, os.fstat(child)):
+                            raise OSError("source directory changed")
+                        additions = _walk_regular(child, relative)
+                        _check_source_directory(parent_fd, relative.parts[-1], child, metadata)
+                    finally:
+                        os.close(child)
+                else:
+                    raise OSError("unsafe source member")
+                if result.keys() & additions.keys():
+                    raise OSError("duplicate source member")
+                result.update(additions)
+                if _source_directory_signature(os.fstat(parent_fd)) != _source_directory_signature(parent_metadata):
+                    raise OSError("source parent changed")
+                checked_parent = _open_relative_directory(root_fd, relative.parts[:-1])
                 try:
-                    metadata = os.stat(relative.parts[-1], dir_fd=parent_fd, follow_symlinks=False)
-                    if stat.S_ISREG(metadata.st_mode):
-                        result[relative.as_posix()] = _read_regular_at(parent_fd, relative.parts[-1])
-                    elif stat.S_ISDIR(metadata.st_mode):
-                        child = _open_directory(parent_fd, relative.parts[-1])
-                        try:
-                            if not _same_identity(metadata, os.fstat(child)):
-                                raise OSError("source directory changed")
-                            result.update(_walk_regular(child, relative))
-                        finally:
-                            os.close(child)
-                    else:
-                        raise OSError("unsafe source member")
+                    if _source_directory_signature(os.fstat(checked_parent)) != _source_directory_signature(parent_metadata):
+                        raise OSError("source parent changed")
                 finally:
-                    os.close(parent_fd)
-            return result
-        finally:
-            pass
+                    os.close(checked_parent)
+            finally:
+                os.close(parent_fd)
+        if _source_directory_signature(os.fstat(root_fd)) != _source_directory_signature(root_metadata):
+            raise OSError("source root changed")
+        return ReleaseSourceSnapshot(tuple(
+            ReleaseSourceEntry(name, payload, mode)
+            for name, (payload, mode) in sorted(result.items())
+        ))
     except (OSError, ReleaseArchiveError):
         raise _fail("source_mismatch", "source tree is missing, changed, or unsafe") from None
     finally:
@@ -598,9 +673,41 @@ def _source_snapshot(source: Path, roots: list[str]) -> dict[str, tuple[bytes, i
             os.close(root_fd)
 
 
-def _source_regular_files(source: Path, relative: str) -> dict[str, tuple[bytes, int]]:
-    prefix = validate_archive_name(relative).as_posix() + "/"
-    return {name.removeprefix(prefix): value for name, value in _source_snapshot(source, [relative]).items()}
+def capture_release_source(source_fd: int) -> ReleaseSourceSnapshot:
+    """Capture the exact release union without closing the caller's root fd."""
+    return _capture_source_roots(source_fd, [*SDIST_ROOTS, ".gitignore", "pyproject.toml"])
+
+
+def _capture_path_source(source: Path, roots: list[str]) -> ReleaseSourceSnapshot:
+    root_fd: int | None = None
+    try:
+        before = os.lstat(source)
+        root_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+        if not stat.S_ISDIR(before.st_mode) or not _same_identity(before, os.fstat(root_fd)):
+            raise OSError("unsafe source root")
+        snapshot = _capture_source_roots(root_fd, roots)
+        _check_source_directory(root_fd, ".", root_fd, before)
+        if not _same_identity(os.lstat(source), before):
+            raise OSError("source root changed")
+        return snapshot
+    except (OSError, ReleaseArchiveError):
+        raise _fail("source_mismatch", "source tree is missing, changed, or unsafe") from None
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+
+
+def _source_mapping(source: ReleaseSourceSnapshot) -> dict[str, tuple[bytes, int]]:
+    return {entry.path: (entry.payload, entry.mode) for entry in source.entries}
+
+
+def _source_snapshot(source: Path, roots: list[str]) -> dict[str, tuple[bytes, int]]:
+    return _source_mapping(_capture_path_source(source, roots))
+
+
+def _select_source_files(source: dict[str, tuple[bytes, int]], roots: list[str]) -> dict[str, tuple[bytes, int]]:
+    return {name: value for name, value in source.items()
+            if any(name == root or name.startswith(root + "/") for root in roots)}
 
 
 def _expected_dos_timestamp(epoch: int) -> tuple[int, int, int, int, int, int]:
@@ -691,10 +798,14 @@ def hashlib_sha256(payload: bytes) -> bytes:
 
 
 def validate_wheel(artifact: Path, source: Path, version: str, epoch: int) -> None:
-    artifact = Path(artifact)
-    source = Path(source)
-    package_source = _source_regular_files(source, "src/threadroot")
-    supporting_source = _source_snapshot(source, ["README.md", "LICENSE"])
+    snapshot = _capture_path_source(Path(source), ["src/threadroot", "README.md", "LICENSE"])
+    validate_wheel_payload(_read_artifact(Path(artifact)), snapshot, version, epoch)
+
+
+def validate_wheel_payload(artifact: bytes, source: ReleaseSourceSnapshot, version: str, epoch: int) -> None:
+    supporting_source = _source_mapping(source)
+    package_source = {name.removeprefix("src/threadroot/"): value
+                      for name, value in supporting_source.items() if name.startswith("src/threadroot/")}
     package_names = sorted(f"threadroot/{name}" for name in package_source)
     prefix = f"threadroot-{version}.dist-info/"
     metadata_names = [
@@ -706,7 +817,7 @@ def validate_wheel(artifact: Path, source: Path, version: str, epoch: int) -> No
     ]
     expected_order = package_names + metadata_names
     try:
-        raw = _read_artifact(artifact)
+        raw = artifact
         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
             infos = archive.infolist()
             _validate_zip_structure(raw, infos)
@@ -770,10 +881,6 @@ def validate_wheel(artifact: Path, source: Path, version: str, epoch: int) -> No
     _validate_record(contents[prefix + "RECORD"], expected_order, contents)
 
 
-def _selected_source_files(source: Path, roots: list[str]) -> dict[str, tuple[bytes, int]]:
-    return _source_snapshot(source, [*roots, ".gitignore", "pyproject.toml"])
-
-
 SDIST_ROOTS = [
     ".claude-plugin", ".codex-plugin", ".dockerignore", "AGENTS.md", "CONTRIBUTING.md",
     "LICENSE", "README.md", "SECURITY.md", "docs", "requirements", "scripts", "skills",
@@ -782,23 +889,27 @@ SDIST_ROOTS = [
 
 
 def validate_sdist(artifact: Path, source: Path, version: str, epoch: int) -> None:
-    artifact = Path(artifact)
-    source = Path(source)
+    snapshot = _capture_path_source(Path(source), [*SDIST_ROOTS, ".gitignore", "pyproject.toml"])
+    validate_sdist_payload(_read_artifact(Path(artifact)), snapshot, version, epoch)
+
+
+def validate_sdist_payload(artifact: bytes, source: ReleaseSourceSnapshot, version: str, epoch: int) -> None:
+    source_mapping = _source_mapping(source)
     try:
-        config = _source_snapshot(source, ["pyproject.toml"])["pyproject.toml"][0]
+        config = source_mapping["pyproject.toml"][0]
         project = tomllib.loads(config.decode("utf-8"))
         roots = project["tool"]["hatch"]["build"]["targets"]["sdist"]["only-include"]
         if roots != SDIST_ROOTS:
             raise KeyError("only-include")
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError, KeyError, TypeError):
         raise _fail("source_mismatch", "invalid sdist source configuration") from None
-    source_files = _selected_source_files(source, roots)
+    source_files = _select_source_files(source_mapping, [*roots, ".gitignore", "pyproject.toml"])
     prefix = f"threadroot-{version}/"
     pkg_name = "PKG-INFO"
     expected_names = set(source_files) | {pkg_name}
 
     try:
-        raw_gzip = _read_artifact(artifact)
+        raw_gzip = artifact
         if len(raw_gzip) < 10 or raw_gzip[:3] != b"\x1f\x8b\x08":
             raise _fail("invalid_archive", "invalid gzip header")
         flags = raw_gzip[3]
@@ -857,19 +968,24 @@ def validate_sdist(artifact: Path, source: Path, version: str, epoch: int) -> No
     _validate_python_metadata(contents[pkg_name], source_files["README.md"][0], version)
 
 
-def _host_source_files(source: Path, host: str) -> dict[str, bytes]:
+def validate_host_zip(artifact: Path, source: Path, host: str) -> None:
     if host not in HOST_MANIFESTS:
         raise _fail("unsupported_host", "unsupported release host")
     selected = [*COMMON_ROOTS, MARKETPLACE, HOST_MANIFESTS[host]]
-    snapshot = _source_snapshot(source, [item.as_posix() for item in selected])
-    return {name: value[0] for name, value in snapshot.items()}
+    snapshot = _capture_path_source(Path(source), [item.as_posix() for item in selected])
+    validate_host_zip_payload(_read_artifact(Path(artifact)), snapshot, host)
 
 
-def validate_host_zip(artifact: Path, source: Path, host: str) -> None:
-    expected = _host_source_files(Path(source), host)
+def validate_host_zip_payload(artifact: bytes, source: ReleaseSourceSnapshot, host: str) -> None:
+    if host not in HOST_MANIFESTS:
+        raise _fail("unsupported_host", "unsupported release host")
+    selected = [*COMMON_ROOTS, MARKETPLACE, HOST_MANIFESTS[host]]
+    expected = {name: value[0] for name, value in _select_source_files(
+        _source_mapping(source), [item.as_posix() for item in selected]
+    ).items()}
     expected_names = sorted(expected)
     try:
-        raw = _read_artifact(Path(artifact))
+        raw = artifact
         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
             infos = archive.infolist()
             _validate_zip_structure(raw, infos)

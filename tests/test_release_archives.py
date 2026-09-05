@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import base64
+from dataclasses import FrozenInstanceError
 import gzip
 import hashlib
 import os
@@ -19,12 +20,20 @@ from scripts import release_archives
 from scripts.build_release import build_archive
 from scripts.release_archives import (
     ReleaseArchiveError,
+    ReleaseSourceEntry,
+    ReleaseSourceSnapshot,
+    capture_release_source,
     extract_regular_tar,
+    extract_regular_tar_payload,
     extract_regular_zip,
+    extract_regular_zip_payload,
     validate_archive_name,
     validate_host_zip,
+    validate_host_zip_payload,
     validate_sdist,
+    validate_sdist_payload,
     validate_wheel,
+    validate_wheel_payload,
 )
 
 
@@ -983,6 +992,472 @@ class HostZipContractTests(unittest.TestCase):
                         _rewrite_host_zip(valid[host], artifact, mutation=mutation)
                         with self.assertRaises(ReleaseArchiveError):
                             validate_host_zip(artifact, source, host)
+
+
+def _make_release_source(root: Path) -> Path:
+    source = _make_sdist_source(root)
+    for name in (".claude-plugin", ".codex-plugin"):
+        (source / name).unlink()
+        (source / name).mkdir()
+    for name in (
+        ".claude-plugin/plugin.json", ".claude-plugin/marketplace.json",
+        ".codex-plugin/plugin.json", "docs/testing.md", "requirements/release.txt",
+        "tools/release/Dockerfile", "scripts/check_public.py", "scripts/build_release.py",
+    ):
+        (source / name).write_bytes(f"synthetic {name}\n".encode())
+    (source / "src/threadroot/cli.py").write_bytes(b"def main():\n    return 0\n")
+    return source
+
+
+def _capture_fixture(source: Path) -> ReleaseSourceSnapshot:
+    descriptor = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        return capture_release_source(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+class ReleaseSourceSnapshotTests(unittest.TestCase):
+    def test_capture_is_exact_sorted_immutable_union_with_normalized_modes(self) -> None:
+        with TemporaryDirectory() as directory:
+            source = _make_release_source(Path(directory))
+            (source / "outside-union.txt").write_bytes(b"not selected")
+            (source / "outside-link").symlink_to("outside-union.txt")
+            (source / "scripts/check_public.py").chmod(0o775)
+            (source / "README.md").chmod(0o664)
+            snapshot = _capture_fixture(source)
+            expected = {
+                ".claude-plugin/plugin.json", ".claude-plugin/marketplace.json",
+                ".codex-plugin/plugin.json", ".dockerignore", ".gitignore", "AGENTS.md",
+                "CONTRIBUTING.md", "LICENSE", "README.md", "SECURITY.md", "pyproject.toml",
+                "docs/fixture.txt", "docs/testing.md", "requirements/fixture.txt",
+                "requirements/release.txt", "scripts/fixture.txt", "scripts/check_public.py",
+                "scripts/build_release.py", "skills/fixture.txt", "templates/fixture.txt",
+                "tests/fixture.txt", "tools/release/fixture.txt", "tools/release/Dockerfile",
+                "src/threadroot/__init__.py", "src/threadroot/cli.py",
+            }
+            self.assertIsInstance(snapshot.entries, tuple)
+            self.assertEqual([entry.path for entry in snapshot.entries], sorted(expected))
+            for entry in snapshot.entries:
+                self.assertIsInstance(entry, ReleaseSourceEntry)
+                self.assertIsInstance(entry.payload, bytes)
+                self.assertEqual(entry.payload, (source / entry.path).read_bytes())
+                self.assertEqual(entry.mode, 0o755 if entry.path == "scripts/check_public.py" else 0o644)
+            with self.assertRaises(FrozenInstanceError):
+                snapshot.entries = ()
+            with self.assertRaises(FrozenInstanceError):
+                snapshot.entries[0].payload = b"changed"
+            (source / "README.md").write_bytes(b"changed after capture")
+            self.assertEqual(next(entry.payload for entry in snapshot.entries if entry.path == "README.md"),
+                             b"# Synthetic Threadroot\n")
+
+    def test_capture_uses_held_root_after_pathname_replacement(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _make_release_source(root)
+            descriptor = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                source.rename(root / "parked")
+                source.mkdir()
+                snapshot = capture_release_source(descriptor)
+                self.assertIn("README.md", [entry.path for entry in snapshot.entries])
+                self.assertTrue(stat.S_ISDIR(os.fstat(descriptor).st_mode))
+                self.assertEqual(list(source.iterdir()), [])
+            finally:
+                os.close(descriptor)
+
+    def test_capture_rejects_intermediate_symlink_and_keeps_root_fd_open(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _make_release_source(root)
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "release.txt").write_bytes(b"outside")
+            (source / "requirements").rename(source / "requirements.real")
+            (source / "requirements").symlink_to(outside, target_is_directory=True)
+            descriptor = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                with self.assertRaisesRegex(ReleaseArchiveError, "source tree") as raised:
+                    capture_release_source(descriptor)
+                self.assertEqual(raised.exception.code, "source_mismatch")
+                os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+
+    def test_capture_rejects_leaf_links_special_files_and_non_directory_fd(self) -> None:
+        for mutation in ("symlink", "fifo", "regular-root"):
+            with self.subTest(mutation=mutation), TemporaryDirectory() as directory:
+                source = _make_release_source(Path(directory))
+                if mutation == "regular-root":
+                    descriptor = os.open(source / "README.md", os.O_RDONLY | os.O_NOFOLLOW)
+                else:
+                    leaf = source / "scripts/check_public.py"
+                    leaf.unlink()
+                    if mutation == "symlink":
+                        leaf.symlink_to(source / "README.md")
+                    else:
+                        os.mkfifo(leaf)
+                    descriptor = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    with self.assertRaises(ReleaseArchiveError) as raised:
+                        capture_release_source(descriptor)
+                    self.assertEqual(raised.exception.code, "source_mismatch")
+                    os.fstat(descriptor)
+                finally:
+                    os.close(descriptor)
+
+    def test_capture_rejects_directory_replacement_during_read_and_closes_owned_fds(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _make_release_source(root)
+            descriptor = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            real_read, real_open, real_dup = os.read, os.open, os.dup
+            opened: list[int] = []
+            changed = False
+            victim_identity = (source / "requirements/release.txt").stat()
+
+            def track_open(*args: object, **kwargs: object) -> int:
+                result = real_open(*args, **kwargs)
+                opened.append(result)
+                return result
+
+            def track_dup(fd: int) -> int:
+                result = real_dup(fd)
+                opened.append(result)
+                return result
+
+            def race(fd: int, size: int) -> bytes:
+                nonlocal changed
+                payload = real_read(fd, size)
+                current = os.fstat(fd)
+                if payload and not changed and (current.st_dev, current.st_ino) == (victim_identity.st_dev, victim_identity.st_ino):
+                    changed = True
+                    (source / "requirements").rename(root / "parked-requirements")
+                    (source / "requirements").mkdir()
+                return payload
+
+            try:
+                with patch.object(release_archives.os, "open", side_effect=track_open), patch.object(
+                    release_archives.os, "dup", side_effect=track_dup
+                ), patch.object(release_archives.os, "read", side_effect=race):
+                    with self.assertRaises(ReleaseArchiveError) as raised:
+                        capture_release_source(descriptor)
+                self.assertTrue(changed)
+                self.assertEqual(raised.exception.code, "source_mismatch")
+                os.fstat(descriptor)
+                for fd in set(opened):
+                    with self.assertRaises(OSError):
+                        os.fstat(fd)
+            finally:
+                os.close(descriptor)
+
+    def test_capture_rejects_overlapping_roots_instead_of_collapsing_duplicates(self) -> None:
+        with TemporaryDirectory() as directory:
+            source = _make_release_source(Path(directory))
+            descriptor = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                with self.assertRaises(ReleaseArchiveError) as raised:
+                    release_archives._capture_source_roots(descriptor, ["scripts", "scripts/check_public.py"])
+                self.assertEqual(raised.exception.code, "source_mismatch")
+                os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+
+    def test_capture_rejects_leaf_mode_change_between_stat_and_open(self) -> None:
+        with TemporaryDirectory() as directory:
+            source = _make_release_source(Path(directory))
+            victim = source / "scripts/check_public.py"
+            original_open = os.open
+            changed = False
+
+            def race(path: object, flags: int, *args: object, **kwargs: object) -> int:
+                nonlocal changed
+                if path == "check_public.py" and kwargs.get("dir_fd") is not None and not changed:
+                    changed = True
+                    victim.chmod(0o755)
+                return original_open(path, flags, *args, **kwargs)
+
+            with patch.object(release_archives.os, "open", side_effect=race):
+                with self.assertRaises(ReleaseArchiveError) as raised:
+                    _capture_fixture(source)
+            self.assertTrue(changed)
+            self.assertEqual(raised.exception.code, "source_mismatch")
+
+    def test_capture_closes_intermediate_directory_if_fstat_fails(self) -> None:
+        with TemporaryDirectory() as directory:
+            source = _make_release_source(Path(directory))
+            original_open, original_fstat = os.open, os.fstat
+            child_fd: int | None = None
+            failed = False
+
+            def track_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+                nonlocal child_fd
+                fd = original_open(path, flags, *args, **kwargs)
+                if path == "src" and kwargs.get("dir_fd") is not None:
+                    child_fd = fd
+                return fd
+
+            def fail_once(fd: int) -> os.stat_result:
+                nonlocal failed
+                if fd == child_fd and not failed:
+                    failed = True
+                    raise OSError("synthetic fstat failure")
+                return original_fstat(fd)
+
+            descriptor = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                with patch.object(release_archives.os, "open", side_effect=track_open), patch.object(
+                    release_archives.os, "fstat", side_effect=fail_once
+                ), self.assertRaises(ReleaseArchiveError) as raised:
+                    capture_release_source(descriptor)
+                self.assertTrue(failed)
+                self.assertEqual(raised.exception.code, "source_mismatch")
+                os.fstat(descriptor)
+                with self.assertRaises(OSError):
+                    os.fstat(child_fd)
+            finally:
+                os.close(descriptor)
+                if child_fd is not None:
+                    try:
+                        os.close(child_fd)
+                    except OSError:
+                        pass
+
+
+class PayloadArchiveApiTests(unittest.TestCase):
+    def test_validators_accept_same_valid_archives_without_reopening_captured_sources(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _make_release_source(root)
+            snapshot = _capture_fixture(source)
+            wheel = root / "valid.whl"
+            order, payloads = _wheel_payloads(source)
+            _write_wheel(wheel, order, payloads)
+            sdist = root / "valid.tar.gz"
+            _write_sdist(sdist, _sdist_entries(source))
+            with patch.object(build_release, "REPOSITORY_ROOT", source):
+                hosts = {host: build_archive(host, root / "hosts") for host in ("claude", "codex")}
+            validate_wheel(wheel, source, "0.1.0", WHEEL_EPOCH)
+            validate_sdist(sdist, source, "0.1.0", WHEEL_EPOCH)
+            for host, artifact in hosts.items():
+                validate_host_zip(artifact, source, host)
+            captured_wheel, captured_sdist = wheel.read_bytes(), sdist.read_bytes()
+            captured_hosts = {host: artifact.read_bytes() for host, artifact in hosts.items()}
+            source.rename(root / "parked-source")
+            wheel.unlink()
+            sdist.unlink()
+            for artifact in hosts.values():
+                artifact.unlink()
+            validate_wheel_payload(captured_wheel, snapshot, "0.1.0", WHEEL_EPOCH)
+            validate_sdist_payload(captured_sdist, snapshot, "0.1.0", WHEEL_EPOCH)
+            for host, payload in captured_hosts.items():
+                validate_host_zip_payload(payload, snapshot, host)
+
+    def test_wheel_payload_preserves_metadata_membership_source_record_and_boundary_errors(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _make_release_source(root)
+            snapshot = _capture_fixture(source)
+            order, original = _wheel_payloads(source)
+            prefix = "threadroot-0.1.0.dist-info/"
+            for mutation, code in (
+                ("boundary", "invalid_archive"), ("membership", "membership_mismatch"),
+                ("metadata", "metadata_mismatch"), ("source", "source_mismatch"),
+                ("record", "record_mismatch"),
+            ):
+                with self.subTest(mutation=mutation):
+                    payloads, changed_order = dict(original), list(order)
+                    if mutation == "membership":
+                        changed_order.remove(prefix + "WHEEL")
+                    elif mutation == "metadata":
+                        payloads[prefix + "WHEEL"] += b"nonempty body\n"
+                    elif mutation == "source":
+                        payloads["threadroot/cli.py"] += b"# changed\n"
+                    elif mutation == "record":
+                        payloads[prefix + "RECORD"] = payloads[prefix + "RECORD"].replace(b"sha256=", b"sha256=x", 1)
+                    artifact = root / f"{mutation}.whl"
+                    _write_wheel(artifact, changed_order, payloads, regenerate_record=mutation != "record")
+                    if mutation == "boundary":
+                        artifact.write_bytes(artifact.read_bytes() + b"JUNK")
+                    with self.assertRaises(ReleaseArchiveError) as path_error:
+                        validate_wheel(artifact, source, "0.1.0", WHEEL_EPOCH)
+                    with self.assertRaises(ReleaseArchiveError) as payload_error:
+                        validate_wheel_payload(artifact.read_bytes(), snapshot, "0.1.0", WHEEL_EPOCH)
+                    self.assertEqual(path_error.exception.code, code)
+                    self.assertEqual(payload_error.exception.code, code)
+
+    def test_sdist_payload_preserves_duplicate_member_type_mode_and_path_errors(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _make_release_source(root)
+            snapshot = _capture_fixture(source)
+            original = _sdist_entries(source)
+            for mutation, code in (
+                ("duplicate", "duplicate_member"), ("type", "unsupported_member"),
+                ("mode", "unsupported_mode"), ("path", "unsafe_path"),
+            ):
+                with self.subTest(mutation=mutation):
+                    entries = [dict(entry) for entry in original]
+                    if mutation == "duplicate":
+                        entries.append(dict(entries[0]))
+                    elif mutation == "type":
+                        entries[0].update(kind=tarfile.FIFOTYPE, payload=b"")
+                    elif mutation == "mode":
+                        entries[0]["mode"] = 0o600
+                    else:
+                        entries[0]["name"] = "../escape"
+                    artifact = root / f"{mutation}.tar.gz"
+                    _write_sdist(artifact, entries)
+                    with self.assertRaises(ReleaseArchiveError) as path_error:
+                        validate_sdist(artifact, source, "0.1.0", WHEEL_EPOCH)
+                    with self.assertRaises(ReleaseArchiveError) as payload_error:
+                        validate_sdist_payload(artifact.read_bytes(), snapshot, "0.1.0", WHEEL_EPOCH)
+                    self.assertEqual(path_error.exception.code, code)
+                    self.assertEqual(payload_error.exception.code, code)
+
+    def test_host_payload_preserves_unsupported_host_and_source_errors(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _make_release_source(root)
+            snapshot = _capture_fixture(source)
+            with patch.object(build_release, "REPOSITORY_ROOT", source):
+                valid = build_archive("claude", root / "hosts")
+            changed = root / "changed.zip"
+            _rewrite_host_zip(valid, changed, mutation="source-byte")
+            for host, artifact, code in (("unknown", valid, "unsupported_host"), ("claude", changed, "source_mismatch")):
+                with self.subTest(host=host):
+                    with self.assertRaises(ReleaseArchiveError) as path_error:
+                        validate_host_zip(artifact, source, host)
+                    with self.assertRaises(ReleaseArchiveError) as payload_error:
+                        validate_host_zip_payload(artifact.read_bytes(), snapshot, host)
+                    self.assertEqual(path_error.exception.code, code)
+                    self.assertEqual(payload_error.exception.code, code)
+
+    def test_payload_extractors_preserve_content_and_normalized_modes(self) -> None:
+        tar_payload = _tar_bytes([("safe/", b"", 0o775, tarfile.DIRTYPE),
+                                  ("safe/run.sh", b"#!/bin/sh\n", 0o775, tarfile.REGTYPE)])
+        zip_payload = _zip_bytes([("safe/", b"", stat.S_IFDIR | 0o775),
+                                  ("safe/run.sh", b"#!/bin/sh\n", stat.S_IFREG | 0o775)])
+        for payload, path_api, payload_api in (
+            (tar_payload, extract_regular_tar, extract_regular_tar_payload),
+            (zip_payload, extract_regular_zip, extract_regular_zip_payload),
+        ):
+            with self.subTest(api=payload_api.__name__), TemporaryDirectory() as directory:
+                root = Path(directory)
+                artifact = root / "artifact"
+                artifact.write_bytes(payload)
+                path_api(artifact, root / "path-out")
+                payload_api(payload, root / "payload-out")
+                for name in ("path-out", "payload-out"):
+                    self.assertEqual((root / name / "safe/run.sh").read_bytes(), b"#!/bin/sh\n")
+                    self.assertEqual(stat.S_IMODE((root / name / "safe/run.sh").stat().st_mode), 0o755)
+                    self.assertEqual(stat.S_IMODE((root / name).stat().st_mode), 0o755)
+
+    def test_payload_extractors_validate_members_before_destination_access(self) -> None:
+        for api, payload, code in (
+            (extract_regular_tar_payload, _tar_bytes([("../escape", b"x", 0o644, tarfile.REGTYPE)]), "unsafe_path"),
+            (extract_regular_tar_payload, _tar_bytes([("fifo", b"", 0o644, tarfile.FIFOTYPE)]), "unsupported_member"),
+            (extract_regular_zip_payload, _zip_bytes([("../escape", b"x", stat.S_IFREG | 0o644)]), "unsafe_path"),
+            (extract_regular_zip_payload, _zip_bytes([("link", b"x", stat.S_IFLNK | 0o777)]), "unsupported_member"),
+        ):
+            with self.subTest(api=api.__name__, code=code), TemporaryDirectory() as directory:
+                destination = Path(directory) / "out"
+                with patch.object(release_archives.os, "lstat", side_effect=AssertionError("destination accessed")):
+                    with self.assertRaises(ReleaseArchiveError) as raised:
+                        api(payload, destination)
+                self.assertEqual(raised.exception.code, code)
+                self.assertFalse(destination.exists())
+
+    def test_payload_extractors_preserve_destination_rejections(self) -> None:
+        for api, payload in (
+            (extract_regular_tar_payload, _tar_bytes([("safe/file", b"safe", 0o644, tarfile.REGTYPE)])),
+            (extract_regular_zip_payload, _zip_bytes([("safe/file", b"safe", stat.S_IFREG | 0o644)])),
+        ):
+            for state in ("empty", "nonempty", "symlink-parent"):
+                with self.subTest(api=api.__name__, state=state), TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    if state == "symlink-parent":
+                        (root / "real").mkdir()
+                        (root / "linked").symlink_to(root / "real", target_is_directory=True)
+                        destination = root / "linked/out"
+                    else:
+                        destination = root / "out"
+                        destination.mkdir()
+                        if state == "nonempty":
+                            (destination / "keep").write_bytes(b"keep")
+                    with self.assertRaises(ReleaseArchiveError) as raised:
+                        api(payload, destination)
+                    self.assertEqual(raised.exception.code, "unsafe_destination")
+                    if state == "nonempty":
+                        self.assertEqual((destination / "keep").read_bytes(), b"keep")
+                    elif state == "symlink-parent":
+                        self.assertEqual(list((root / "real").iterdir()), [])
+
+    def test_payload_extractors_preserve_raced_destination_and_cleanup_owned_staging(self) -> None:
+        for api, payload in (
+            (extract_regular_tar_payload, _tar_bytes([("safe/file", b"safe", 0o644, tarfile.REGTYPE)])),
+            (extract_regular_zip_payload, _zip_bytes([("safe/file", b"safe", stat.S_IFREG | 0o644)])),
+        ):
+            with self.subTest(api=api.__name__), TemporaryDirectory() as directory:
+                root = Path(directory)
+                original = release_archives._exclusive_rename
+                raced = False
+
+                def race(parent_fd: int, stage: str, destination: str, stage_fd: int, identity: os.stat_result) -> None:
+                    nonlocal raced
+                    raced = True
+                    os.mkdir(destination, dir_fd=parent_fd)
+                    original(parent_fd, stage, destination, stage_fd, identity)
+
+                with patch.object(release_archives, "_exclusive_rename", side_effect=race):
+                    with self.assertRaises(ReleaseArchiveError) as raised:
+                        api(payload, root / "out")
+                self.assertTrue(raced)
+                self.assertEqual(raised.exception.code, "unsafe_destination")
+                self.assertEqual(list((root / "out").iterdir()), [])
+                self.assertEqual(list(root.glob(".out.stage-*")), [])
+
+    def test_payload_extractors_never_cleanup_replacement_staging(self) -> None:
+        for api, payload in (
+            (extract_regular_tar_payload, _tar_bytes([("safe/file", b"safe", 0o644, tarfile.REGTYPE)])),
+            (extract_regular_zip_payload, _zip_bytes([("safe/file", b"safe", stat.S_IFREG | 0o644)])),
+        ):
+            with self.subTest(api=api.__name__), TemporaryDirectory() as directory:
+                root = Path(directory)
+                original = release_archives._exclusive_rename
+                replacement: Path | None = None
+
+                def race(parent_fd: int, stage: str, destination: str, stage_fd: int, identity: os.stat_result) -> None:
+                    nonlocal replacement
+                    (root / stage).rename(root / "parked")
+                    replacement = root / stage
+                    replacement.mkdir()
+                    (replacement / "keep").write_bytes(b"competitor")
+                    original(parent_fd, stage, destination, stage_fd, identity)
+
+                with patch.object(release_archives, "_exclusive_rename", side_effect=race):
+                    with self.assertRaises(ReleaseArchiveError) as raised:
+                        api(payload, root / "out")
+                self.assertEqual(raised.exception.code, "unsafe_destination")
+                self.assertIsNotNone(replacement)
+                self.assertEqual((replacement / "keep").read_bytes(), b"competitor")
+                self.assertFalse((root / "out").exists())
+
+    def test_tar_payload_preserves_exact_global_pax_comment(self) -> None:
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w", format=tarfile.PAX_FORMAT,
+                          pax_headers={"comment": "commit-sha"}) as archive:
+            info = tarfile.TarInfo("safe.txt")
+            info.mode, info.size = 0o644, 4
+            archive.addfile(info, io.BytesIO(b"safe"))
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            extract_regular_tar_payload(output.getvalue(), root / "valid", "commit-sha")
+            self.assertEqual((root / "valid/safe.txt").read_bytes(), b"safe")
+            with self.assertRaises(ReleaseArchiveError) as raised:
+                extract_regular_tar_payload(output.getvalue(), root / "invalid")
+            self.assertEqual(raised.exception.code, "invalid_archive")
+            self.assertFalse((root / "invalid").exists())
 
 
 def _tar_entry(name: str, kind: bytes) -> tuple[str, bytes, int, bytes]:
