@@ -31,15 +31,18 @@ packages = ["src/threadroot"]
 only-include = [
   ".claude-plugin",
   ".codex-plugin",
+  ".dockerignore",
   "AGENTS.md",
   "CONTRIBUTING.md",
   "LICENSE",
   "README.md",
   "SECURITY.md",
   "docs",
+  "requirements",
   "scripts",
   "skills",
   "src/threadroot",
   "templates",
   "tests",
+  "tools/release",
 ]

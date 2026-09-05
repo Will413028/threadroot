@@ -21,17 +21,20 @@ EXPECTED_PROJECT_URLS = {
 EXPECTED_SDIST_ROOTS = [
     ".claude-plugin",
     ".codex-plugin",
+    ".dockerignore",
     "AGENTS.md",
     "CONTRIBUTING.md",
     "LICENSE",
     "README.md",
     "SECURITY.md",
     "docs",
+    "requirements",
     "scripts",
     "skills",
     "src/threadroot",
     "templates",
     "tests",
+    "tools/release",
 ]
 
 
