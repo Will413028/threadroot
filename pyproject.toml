@@ -12,6 +12,11 @@ license = "Apache-2.0"
 authors = [{ name = "Threadroot contributors" }]
 dependencies = []
 
+[project.urls]
+Homepage = "https://github.com/Will413028/threadroot"
+Repository = "https://github.com/Will413028/threadroot"
+Issues = "https://github.com/Will413028/threadroot/issues"
+
 [project.scripts]
 threadroot = "threadroot.cli:main"
 
