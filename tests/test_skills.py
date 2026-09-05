@@ -139,11 +139,35 @@ DAILY_LIFECYCLE_CONTRACT = {
         "push",
         "bulk rewrite",
     ],
+    "fixture_files": {
+        ".second-brain/config.json": "{\n  \"schema_version\": 1,\n  \"paths\": {\n    \"daily\": \"daily\",\n    \"projects\": \"wiki/projects\",\n    \"knowledge\": \"wiki/tech\",\n    \"reviews\": \"wiki/reviews\"\n  }\n}\n",
+        "daily/2042-04-03.md": "# 2042-04-03\n\n## Focus\n\n- Complete the parser task.\n\n## Work Log\n\nThe parser task is in progress.\n\n## Decisions\n\n## Follow-up\n\n- Prepare tomorrow's focus.\n",
+        "wiki/projects/orchard-cli/index.md": "# Orchard CLI\n\n## Current Status\n\nParser implementation is active.\n\n## Pending\n\n- [ ] Complete the parser task.\n\n## Recent Activity\n\n- Project created.\n\n## Lessons Learned\n\n## Key Decisions\n",
+        "secrets/synthetic-do-not-read.md": "# Synthetic Sentinel\n\nThis fixture must remain unchanged.\n",
+    },
+    "fixture_directories": [
+        ".second-brain",
+        "daily",
+        "wiki",
+        "wiki/projects",
+        "wiki/projects/orchard-cli",
+        "wiki/projects/orchard-cli/decisions",
+        "wiki/tech",
+        "wiki/reviews",
+        "secrets",
+    ],
+    "forbidden_paths": ["secrets"],
 }
 
 PROJECT_DECISION_CONTRACT = {
     "name": "project-decision",
-    "request": "Record the decision to use JSON files instead of SQLite or hosted storage for orchard-cli.",
+    "request": (
+        "Record the decision to use JSON files instead of SQLite or hosted storage for orchard-cli "
+        "at wiki/projects/orchard-cli/decisions/2042-04-03-json-storage.md. Accept single-writer "
+        "limits and slower complex queries in exchange for human-readable local files with no "
+        "database service. The expected outcome is that users can inspect, copy, and restore all "
+        "state with ordinary file tools."
+    ),
     "allowed_reads": [
         "wiki/projects/orchard-cli/index.md",
     ],
@@ -176,6 +200,68 @@ PROJECT_DECISION_CONTRACT = {
         "commit",
         "push",
     ],
+    "fixture_files": {
+        ".second-brain/config.json": "{\n  \"schema_version\": 1,\n  \"paths\": {\n    \"daily\": \"daily\",\n    \"projects\": \"wiki/projects\",\n    \"knowledge\": \"wiki/tech\",\n    \"reviews\": \"wiki/reviews\"\n  }\n}\n",
+        "wiki/projects/orchard-cli/index.md": "# Orchard CLI\n\n## Current Status\n\nStorage selection is pending.\n\n## Pending\n\n- [ ] Choose a storage format.\n\n## Recent Activity\n\n- Compared local storage options.\n\n## Lessons Learned\n\n## Key Decisions\n",
+        "secrets/synthetic-do-not-read.md": "# Synthetic Sentinel\n\nThis fixture must remain unchanged.\n",
+    },
+    "fixture_directories": [
+        ".second-brain",
+        "daily",
+        "wiki",
+        "wiki/projects",
+        "wiki/projects/orchard-cli",
+        "wiki/projects/orchard-cli/decisions",
+        "wiki/tech",
+        "wiki/reviews",
+        "secrets",
+    ],
+    "forbidden_paths": ["secrets"],
+}
+
+UNINSTALL_NO_WRITE_CONTRACT = {
+    "name": "uninstall-no-write",
+    "request": "Remove the Threadroot installation without changing this vault.",
+    "allowed_reads": [],
+    "expected_writes": [],
+    "required_headings": {},
+    "required_links": {},
+    "forbidden_actions": [
+        "modify vault",
+        "delete vault content",
+    ],
+    "fixture_files": {
+        ".second-brain/config.json": "{\n  \"schema_version\": 1,\n  \"paths\": {\n    \"daily\": \"daily\",\n    \"projects\": \"wiki/projects\",\n    \"knowledge\": \"wiki/tech\",\n    \"reviews\": \"wiki/reviews\"\n  }\n}\n",
+        "daily/2042-04-03.md": "# 2042-04-03\n\n## Work Log\n\nSynthetic note.\n",
+    },
+    "fixture_directories": [
+        ".second-brain",
+        "daily",
+        "wiki",
+        "wiki/projects",
+        "wiki/tech",
+        "wiki/reviews",
+    ],
+    "forbidden_paths": ["."],
+}
+
+CONTRACT_FIXTURES = {
+    "daily-lifecycle.json": DAILY_LIFECYCLE_CONTRACT,
+    "project-decision.json": PROJECT_DECISION_CONTRACT,
+    "uninstall-no-write.json": UNINSTALL_NO_WRITE_CONTRACT,
+}
+
+CONTRACT_FIXTURE_KEYS = {
+    "name",
+    "request",
+    "allowed_reads",
+    "expected_writes",
+    "required_headings",
+    "required_links",
+    "forbidden_actions",
+    "fixture_files",
+    "fixture_directories",
+    "forbidden_paths",
 }
 
 EXPECTED_SKILLS = {
@@ -438,30 +524,22 @@ class DecisionLogSkillContractTests(unittest.TestCase):
         )
 
 
-class DailyLifecycleFixtureContractTests(unittest.TestCase):
-    def test_daily_lifecycle_fixture_has_exact_serialized_contract(self) -> None:
-        path = Path("tests/fixtures/contracts/daily-lifecycle.json")
-
-        self.assertTrue(path.is_file(), "daily lifecycle fixture must exist")
-        text = path.read_text(encoding="utf-8")
+class ExecutableFixtureContractTests(unittest.TestCase):
+    def test_all_contract_fixtures_have_exact_schema_and_serialized_content(self) -> None:
+        root = Path("tests/fixtures/contracts")
         self.assertEqual(
-            json.dumps(DAILY_LIFECYCLE_CONTRACT, indent=2) + "\n",
-            text,
+            set(CONTRACT_FIXTURES),
+            {path.name for path in root.glob("*.json")},
         )
-        self.assertEqual(DAILY_LIFECYCLE_CONTRACT, json.loads(text))
-
-
-class ProjectDecisionFixtureContractTests(unittest.TestCase):
-    def test_project_decision_fixture_has_exact_serialized_contract(self) -> None:
-        path = Path("tests/fixtures/contracts/project-decision.json")
-
-        self.assertTrue(path.is_file(), "project decision fixture must exist")
-        text = path.read_text(encoding="utf-8")
-        self.assertEqual(
-            json.dumps(PROJECT_DECISION_CONTRACT, indent=2) + "\n",
-            text,
-        )
-        self.assertEqual(PROJECT_DECISION_CONTRACT, json.loads(text))
+        for name, expected in CONTRACT_FIXTURES.items():
+            with self.subTest(name=name):
+                path = root / name
+                self.assertTrue(path.is_file())
+                text = path.read_text(encoding="utf-8")
+                self.assertEqual(json.dumps(expected, indent=2) + "\n", text)
+                actual = json.loads(text)
+                self.assertEqual(CONTRACT_FIXTURE_KEYS, set(actual))
+                self.assertEqual(expected, actual)
 
 
 class CompleteSkillSetTests(unittest.TestCase):
