@@ -1,5 +1,12 @@
 # Threadroot v0.1.0 Release Readiness Implementation Plan
 
+> **Architecture amendment (2026-09-05):** Tasks 1-4 below are retained as
+> completed historical work. Tasks 5-12 and every Setuptools release command in
+> this document are superseded and must not be executed. Continue with
+> [`2026-09-05-threadroot-reproducible-release-build.md`](2026-09-05-threadroot-reproducible-release-build.md),
+> which implements the approved Hatchling and canonical-builder design and
+> carries the release through the remaining authorization gates.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (- [ ]) syntax for tracking.
 
 **Goal:** Publish Threadroot v0.1.0 as the first verified GitHub Release from the exact reviewed remote main commit.
