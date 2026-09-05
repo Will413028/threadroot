@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 
 from . import __version__
-from .operations import run_adopt, run_doctor, run_init
+from .operations import run_adopt, run_doctor, run_init, run_claim
 from .paths import resolve_vault, filesystem_error
 from .results import CommandResult, ExitCode, Issue, ThreadrootError
 
@@ -22,13 +22,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser = _ArgumentParser(prog="threadroot", allow_abbrev=False)
     parser.add_argument("--version", action="store_true")
     subparsers = parser.add_subparsers(dest="command")
-    for command in ("init", "adopt", "doctor"):
+    for command in ("init", "adopt", "doctor", "claim"):
         subparser = subparsers.add_parser(command, allow_abbrev=False)
         subparser.add_argument("--vault")
         subparser.add_argument("--json", action="store_true")
-        if command in ("init", "adopt"):
+        if command in ("init", "adopt", "claim"):
             subparser.add_argument("--apply", action="store_true")
+        if command in ("init", "adopt"):
             subparser.add_argument("--set-default", action="store_true")
+        if command == "claim":
+            subparser.add_argument("--path", required=True)
     return parser
 
 
@@ -39,7 +42,7 @@ def execute(
     home: Path,
 ) -> CommandResult:
     command = args.command
-    if command not in ("init", "adopt", "doctor"):
+    if command not in ("init", "adopt", "doctor", "claim"):
         raise ThreadrootError(ExitCode.USAGE, "usage.invalid", "A command is required.")
 
     root: Path | None = None
@@ -49,6 +52,8 @@ def execute(
             return run_init(root, args.apply, args.set_default, environ, home)
         if command == "adopt":
             return run_adopt(root, args.apply, args.set_default, environ, home)
+        if command == "claim":
+            return run_claim(root, args.path, args.apply)
         return run_doctor(root)
     except (ThreadrootError, OSError) as caught:
         error = caught if isinstance(caught, ThreadrootError) else filesystem_error()

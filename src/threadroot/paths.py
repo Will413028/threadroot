@@ -96,6 +96,33 @@ def find_upward(start: Path) -> Path | None:
         current = current.parent
 
 
+def ensure_claim_target(
+    root: Path, relative: str, content_paths: Mapping[str, str]
+) -> Path:
+    if not relative or "\x00" in relative:
+        raise _unsafe_path()
+    candidate = Path(relative)
+    if candidate.parts[:1] == (".second-brain",):
+        raise _unsafe_path()
+    root = resolve_path(root)
+    resolved = ensure_outside_secrets(root, relative)
+    lexical = normalized_absolute(root / candidate)
+    marker = resolve_path(root / ".second-brain")
+    if resolved == marker or marker in resolved.parents:
+        raise _unsafe_path()
+    lexical_keys = {
+        key for key, value in content_paths.items()
+        if normalized_absolute(root / value) in lexical.parents
+    }
+    resolved_keys = {
+        key for key, value in content_paths.items()
+        if resolve_path(root / value) in resolved.parents
+    }
+    if len(lexical_keys) != 1 or lexical_keys != resolved_keys:
+        raise _unsafe_path()
+    return lexical
+
+
 def default_pointer_path(environ: Mapping[str, str], home: Path) -> Path:
     xdg_config_home = environ.get("XDG_CONFIG_HOME")
     if xdg_config_home:

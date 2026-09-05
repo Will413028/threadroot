@@ -15,6 +15,7 @@ from .paths import (
     default_pointer_path,
     ensure_within,
     ensure_outside_secrets,
+    ensure_claim_target,
     filesystem_error,
     normalized_absolute,
     resolve_path,
@@ -212,6 +213,33 @@ def _changes_with_status(
     )
 
 
+def plan_claim(vault: Path, relative: str) -> tuple[PlannedChange, ...]:
+    root = resolve_path(vault)
+    config = load_config(root)
+    content_paths = {key: getattr(config.paths, key)
+                     for key in ("daily", "projects", "knowledge", "reviews")}
+    target = ensure_claim_target(root, relative, content_paths)
+    public_path = target.relative_to(root).as_posix()
+    if os.path.lexists(target):
+        raise ThreadrootError(ExitCode.CONFLICT, "target.conflict",
+                              "Target already exists; choose another path.", public_path)
+    if not target.parent.is_dir():
+        raise ThreadrootError(ExitCode.IO_OR_DRIFT, "filesystem.failed",
+                              "Claim requires an existing directory parent.", public_path)
+    return (PlannedChange("create_file", target, public_path, ""),)
+
+
+def _validate_claim(vault: Path, change: PlannedChange) -> None:
+    config = load_config(vault)
+    content_paths = {key: getattr(config.paths, key)
+                     for key in ("daily", "projects", "knowledge", "reviews")}
+    target = ensure_claim_target(vault, change.public_path, content_paths)
+    if target != change.target:
+        raise ValueError("claim target changed")
+    _require_directory(vault)
+    _require_directory(target.parent)
+
+
 def _safe_resolve(path: Path, *, strict: bool) -> Path:
     try:
         return path.resolve(strict=strict)
@@ -288,6 +316,8 @@ def apply_plan(
     completed = 0
     for change in plan:
         try:
+            if command == "claim":
+                _validate_claim(root, change)
             if change.action == "create_directory" and change.public_path == ".":
                 _validate_root_creation(root, change)
             else:
@@ -300,6 +330,13 @@ def apply_plan(
                     output.write(change.content)
             else:
                 raise ValueError("invalid planned action")
+        except ThreadrootError as error:
+            return CommandResult(
+                ok=False, command=command, applied=True, vault=str(root),
+                changes=_changes_with_status(plan, completed),
+                issues=(Issue("error", error.code, error.message, error.path),),
+                exit_code=error.exit_code,
+            )
         except (FileExistsError, FileNotFoundError, NotADirectoryError, ValueError):
             return CommandResult(
                 ok=False,
@@ -396,6 +433,20 @@ def _error_result(command: CommandName, vault: Path | None, error: ThreadrootErr
         issues=(Issue("error", error.code, error.message, error.path),),
         exit_code=error.exit_code,
     )
+
+
+def run_claim(vault: Path, relative: str, apply: bool) -> CommandResult:
+    root = None
+    try:
+        root = resolve_path(vault)
+        plan = plan_claim(root, relative)
+    except (ThreadrootError, OSError) as caught:
+        error = caught if isinstance(caught, ThreadrootError) else filesystem_error()
+        return _error_result("claim", root, error)
+    if not apply:
+        return CommandResult(ok=True, command="claim", applied=False,
+                             vault=str(root), changes=_planned_changes(plan))
+    return apply_plan("claim", root, plan)
 
 
 def run_init(

@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 from enum import IntEnum
 from typing import Literal
 
-CommandName = Literal["init", "adopt", "doctor"]
+CommandName = Literal["init", "adopt", "doctor", "claim"]
 ActionName = Literal["create_directory", "create_file", "write_default_pointer"]
 ChangeStatus = Literal["planned", "completed", "unexecuted"]
 IssueLevel = Literal["error", "warning", "info"]

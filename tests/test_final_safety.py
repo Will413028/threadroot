@@ -127,7 +127,7 @@ class PathBoundaryTests(unittest.TestCase):
 
     def test_configured_secret_symlink_and_component_negative_control(self):
         for secret in (True, False):
-            with self.subTest(secret=secret), TemporaryDirectory() as temporary:
+            with self.subTest(uses_reserved_component=secret), TemporaryDirectory() as temporary:
                 root = Path(temporary).resolve()
                 (root / ".second-brain").mkdir()
                 destination = root / ("secrets" if secret else "daily-secrets")
