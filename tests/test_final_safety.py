@@ -178,3 +178,117 @@ class PathBoundaryTests(unittest.TestCase):
             with patch.object(Path, "exists", side_effect=PermissionError("synthetic inspection")):
                 result = run_doctor(root)
             self.assertEqual(result.exit_code, ExitCode.IO_OR_DRIFT)
+
+
+class PointerSafetyTests(unittest.TestCase):
+    def test_direct_and_parent_symlink_overlap_are_zero_write(self):
+        for operation in (run_init, run_adopt):
+            for apply in (False, True):
+                for symlink_parent in (False, True):
+                    with self.subTest(operation=operation.__name__, apply=apply,
+                                      symlink_parent=symlink_parent), TemporaryDirectory() as temporary:
+                        base = Path(temporary).resolve()
+                        vault = base / "vault"
+                        self.assertTrue(run_init(vault, True, False, {}, base / "home").ok)
+                        (vault / "threadroot").mkdir()
+                        protected = vault / "threadroot/config.json"
+                        protected.write_bytes(b"synthetic vault content")
+                        xdg = base / "xdg"
+                        if symlink_parent:
+                            xdg.mkdir()
+                            (xdg / "threadroot").symlink_to(vault / "threadroot", target_is_directory=True)
+                        else:
+                            xdg = vault
+                        before = protected.read_bytes(), protected.stat().st_mtime_ns
+                        with patch("threadroot.operations.os.replace") as replace:
+                            result = operation(vault, apply, True,
+                                               {"XDG_CONFIG_HOME": str(xdg)}, base / "home")
+                        self.assertEqual(result.exit_code, ExitCode.UNSAFE_PATH)
+                        self.assertFalse(result.applied)
+                        self.assertEqual(result.changes, ())
+                        replace.assert_not_called()
+                        self.assertEqual(before, (protected.read_bytes(), protected.stat().st_mtime_ns))
+
+    def test_replace_failure_preserves_old_pointer_and_cleans_only_owned_temp(self):
+        with TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            vault = base / "vault"
+            vault.mkdir()
+            pointer = base / "xdg/threadroot/config.json"
+            pointer.parent.mkdir(parents=True)
+            pointer.write_bytes(b'{"default_vault":"/synthetic/previous"}\n')
+            sentinel = pointer.parent / "keep.tmp"
+            sentinel.write_bytes(b"unrelated")
+            before = pointer.read_bytes(), pointer.stat().st_mtime_ns
+            with patch("threadroot.operations.os.replace", side_effect=OSError("synthetic replace")):
+                with self.assertRaises(OSError):
+                    write_default_pointer(vault, {"XDG_CONFIG_HOME": str(base / "xdg")}, base / "home")
+            self.assertEqual(before, (pointer.read_bytes(), pointer.stat().st_mtime_ns))
+            self.assertEqual({"config.json", "keep.tmp"}, {p.name for p in pointer.parent.iterdir()})
+            self.assertEqual(sentinel.read_bytes(), b"unrelated")
+
+    def test_initial_overlap_does_not_create_vault_or_pointer_parents(self):
+        with TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            vault = base / "vault"
+            for apply in (False, True):
+                result = run_init(vault, apply, True,
+                                  {"XDG_CONFIG_HOME": str(vault)}, base / "home")
+                self.assertEqual(result.exit_code, ExitCode.UNSAFE_PATH)
+                self.assertFalse(vault.exists())
+
+    def test_pointer_destination_equal_to_vault_is_unsafe(self):
+        with TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            (base / "xdg/threadroot").mkdir(parents=True)
+            vault = base / "xdg/threadroot/config.json"
+            result = run_init(vault, True, True,
+                              {"XDG_CONFIG_HOME": str(base / "xdg")}, base / "home")
+            self.assertEqual(result.exit_code, ExitCode.UNSAFE_PATH)
+            self.assertFalse(vault.exists())
+
+    def test_apply_revalidates_before_first_write(self):
+        from threadroot import operations
+        self.assertTrue(callable(getattr(operations, "validate_default_pointer", None)))
+        for operation in (run_init, run_adopt):
+            with self.subTest(operation=operation.__name__), TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                vault = base / "vault"
+                if operation is run_adopt:
+                    self.assertTrue(run_init(vault, True, False, {}, base / "home").ok)
+                pointer = base / "xdg/threadroot/config.json"
+                failure = ThreadrootError(ExitCode.UNSAFE_PATH, "path.unsafe", "Synthetic overlap.")
+                with patch("threadroot.operations.validate_default_pointer", side_effect=[pointer, failure]), \
+                     patch("threadroot.operations.apply_plan") as apply_plan:
+                    result = operation(vault, True, True,
+                                       {"XDG_CONFIG_HOME": str(base / "xdg")}, base / "home")
+                self.assertEqual(result.exit_code, ExitCode.UNSAFE_PATH)
+                self.assertFalse(result.applied)
+                apply_plan.assert_not_called()
+
+    def test_writer_revalidates_before_mkdir_and_replace(self):
+        from threadroot import operations
+        self.assertTrue(callable(getattr(operations, "validate_default_pointer", None)))
+        for stage in (1, 2, 3):
+            with self.subTest(stage=stage), TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                vault = base / "vault"
+                vault.mkdir()
+                pointer = base / "xdg/threadroot/config.json"
+                pointer.parent.mkdir(parents=True)
+                pointer.write_bytes(b"synthetic previous pointer")
+                failure = ThreadrootError(ExitCode.UNSAFE_PATH, "path.unsafe", "Synthetic overlap.")
+                events = []
+                real_mkdir = Path.mkdir
+                def mkdir(path, *args, **kwargs):
+                    events.append("mkdir")
+                    return real_mkdir(path, *args, **kwargs)
+                with patch("threadroot.operations.validate_default_pointer",
+                           side_effect=[pointer] * (stage - 1) + [failure]), \
+                     patch.object(Path, "mkdir", mkdir), patch("threadroot.operations.os.replace") as replace:
+                    with self.assertRaises(ThreadrootError):
+                        write_default_pointer(vault, {"XDG_CONFIG_HOME": str(base / "xdg")}, base / "home")
+                replace.assert_not_called()
+                self.assertEqual(events, [] if stage == 1 else ["mkdir"])
+                self.assertEqual(pointer.read_bytes(), b"synthetic previous pointer")
+                self.assertEqual(["config.json"], [p.name for p in pointer.parent.iterdir()])

@@ -107,6 +107,18 @@ def default_pointer_path(environ: Mapping[str, str], home: Path) -> Path:
     return base / "threadroot" / "config.json"
 
 
+def validate_default_pointer(vault: Path, pointer: Path) -> Path:
+    root = resolve_path(vault)
+    destination = resolve_path(pointer)
+    if destination == root or root in destination.parents:
+        raise ThreadrootError(
+            ExitCode.UNSAFE_PATH, "path.unsafe",
+            "Default pointer must stay outside the vault; choose another config directory.",
+            "machine-default-pointer",
+        )
+    return pointer
+
+
 def read_default_pointer(path: Path) -> Path | None:
     if not path.exists():
         return None

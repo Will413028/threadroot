@@ -18,6 +18,7 @@ from .paths import (
     filesystem_error,
     normalized_absolute,
     resolve_path,
+    validate_default_pointer,
 )
 from .results import (
     ActionName,
@@ -350,16 +351,18 @@ def write_default_pointer(
     home: Path,
 ) -> None:
     pointer = default_pointer_path(environ, home)
-    pointer.parent.mkdir(parents=True, exist_ok=True)
     content = json.dumps(
         {"default_vault": str(_safe_resolve(Path(vault), strict=True))},
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     ) + "\n"
+    validate_default_pointer(vault, pointer)
+    pointer.parent.mkdir(parents=True, exist_ok=True)
     temporary: Path | None = None
     descriptor: int | None = None
     try:
+        validate_default_pointer(vault, pointer)
         descriptor, name = tempfile.mkstemp(
             prefix=f".{pointer.name}.", suffix=".tmp", dir=pointer.parent
         )
@@ -367,6 +370,7 @@ def write_default_pointer(
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as output:
             descriptor = None
             output.write(content)
+        validate_default_pointer(vault, pointer)
         os.replace(temporary, pointer)
         temporary = None
     finally:
@@ -408,7 +412,7 @@ def run_init(
         pointer_change = (
             PlannedChange(
                 "write_default_pointer",
-                default_pointer_path(environ, home),
+                validate_default_pointer(root, default_pointer_path(environ, home)),
                 "machine-default-pointer",
             )
             if set_default
@@ -428,6 +432,12 @@ def run_init(
             changes=_planned_changes(full_plan),
         )
 
+    try:
+        if pointer_change is not None:
+            validate_default_pointer(root, pointer_change.target)
+    except (ThreadrootError, OSError) as caught:
+        error = caught if isinstance(caught, ThreadrootError) else filesystem_error()
+        return _error_result("init", root, error)
     result = apply_plan("init", root, vault_plan)
     if not result.ok:
         if set_default:
@@ -447,7 +457,8 @@ def run_init(
         return result
     try:
         write_default_pointer(root, environ, home)
-    except OSError:
+    except (ThreadrootError, OSError) as caught:
+        error = caught if isinstance(caught, ThreadrootError) else filesystem_error()
         return CommandResult(
             ok=False,
             command="init",
@@ -458,12 +469,12 @@ def run_init(
             issues=(
                 Issue(
                     "error",
-                    "filesystem.failed",
-                    "The default vault pointer could not be written.",
+                    error.code,
+                    error.message,
                     "machine-default-pointer",
                 ),
             ),
-            exit_code=ExitCode.IO_OR_DRIFT,
+            exit_code=error.exit_code,
         )
     return CommandResult(
         ok=True,
@@ -489,7 +500,7 @@ def run_adopt(
         pointer_change = (
             PlannedChange(
                 "write_default_pointer",
-                default_pointer_path(environ, home),
+                validate_default_pointer(root, default_pointer_path(environ, home)),
                 "machine-default-pointer",
             )
             if set_default
@@ -509,6 +520,12 @@ def run_adopt(
             changes=_planned_changes(full_plan),
         )
 
+    try:
+        if pointer_change is not None:
+            validate_default_pointer(root, pointer_change.target)
+    except (ThreadrootError, OSError) as caught:
+        error = caught if isinstance(caught, ThreadrootError) else filesystem_error()
+        return _error_result("adopt", root, error)
     result = apply_plan("adopt", root, vault_plan)
     if not result.ok:
         if set_default:
@@ -528,7 +545,8 @@ def run_adopt(
         return result
     try:
         write_default_pointer(root, environ, home)
-    except OSError:
+    except (ThreadrootError, OSError) as caught:
+        error = caught if isinstance(caught, ThreadrootError) else filesystem_error()
         return CommandResult(
             ok=False,
             command="adopt",
@@ -539,12 +557,12 @@ def run_adopt(
             issues=(
                 Issue(
                     "error",
-                    "filesystem.failed",
-                    "The default vault pointer could not be written.",
+                    error.code,
+                    error.message,
                     "machine-default-pointer",
                 ),
             ),
-            exit_code=ExitCode.IO_OR_DRIFT,
+            exit_code=error.exit_code,
         )
     return CommandResult(
         ok=True,
