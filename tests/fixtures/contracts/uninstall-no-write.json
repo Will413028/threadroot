@@ -1,0 +1,27 @@
+{
+  "name": "uninstall-no-write",
+  "request": "Remove the Threadroot installation without changing this vault.",
+  "allowed_reads": [],
+  "expected_writes": [],
+  "required_headings": {},
+  "required_links": {},
+  "forbidden_actions": [
+    "modify vault",
+    "delete vault content"
+  ],
+  "fixture_files": {
+    ".second-brain/config.json": "{\n  \"schema_version\": 1,\n  \"paths\": {\n    \"daily\": \"daily\",\n    \"projects\": \"wiki/projects\",\n    \"knowledge\": \"wiki/tech\",\n    \"reviews\": \"wiki/reviews\"\n  }\n}\n",
+    "daily/2042-04-03.md": "# 2042-04-03\n\n## Work Log\n\nSynthetic note.\n"
+  },
+  "fixture_directories": [
+    ".second-brain",
+    "daily",
+    "wiki",
+    "wiki/projects",
+    "wiki/tech",
+    "wiki/reviews"
+  ],
+  "forbidden_paths": [
+    "."
+  ]
+}

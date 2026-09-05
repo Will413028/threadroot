@@ -19,6 +19,7 @@ The v0 product is an installable tool, not a hosted memory service, context prot
 - `init` supports only new or empty targets, previews by default, writes only with explicit apply intent, and never overwrites existing files.
 - `adopt` validates recognized layouts, remains read-only by default, and may add only `.second-brain/config.json` when explicitly applied. It must not move or rewrite existing content.
 - `doctor` is always read-only and fails closed for unsupported schema versions or unsafe paths.
+- `claim` previews by default and, only with explicit apply intent, exclusively reserves one empty regular file within exactly one configured content root. It receives no note bytes and creates no parents. New-file skills require claim, native same-identity/empty verification, then native semantic edit; failed gates stop with visible partial state.
 - Defer `migrate`, transaction journals, rollback hashes, MCP, RAG, GUI, telemetry, and background synchronization until a demonstrated use case requires them.
 
 ## Safety and Privacy
@@ -26,6 +27,7 @@ The v0 product is an installable tool, not a hosted memory service, context prot
 - Default to no network access and no telemetry.
 - Use only synthetic fixtures in tests, examples, logs, and release artifacts.
 - Reject absolute paths, path traversal, and configured paths that escape the resolved vault root.
+- Reject lexical/resolved exact secrets components and content access through the marker namespace. Default-pointer destinations must remain outside the selected vault, including after parent-symlink resolution, before setup writes begin.
 - Re-read a target before writing and stop on concurrent drift rather than guessing a merge.
 - Leave partial failures visible and inspectable; do not hide them with automatic cleanup or rollback machinery.
 - Never commit secrets, private paths, identities, company material, or real vault excerpts.
