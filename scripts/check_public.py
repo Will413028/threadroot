@@ -66,6 +66,15 @@ class PublicScanError(RuntimeError):
         super().__init__("public scan failed")
 
 
+class _ArgumentParseError(Exception):
+    pass
+
+
+class _SilentArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise _ArgumentParseError() from None
+
+
 @dataclass(frozen=True)
 class Finding:
     code: str
@@ -815,24 +824,52 @@ def _render(finding: Finding) -> str:
     return f"{location}: {finding.code}: {finding.message}"
 
 
-def _write_public_line(
+def _write_public_text(
     value: str,
     denied_terms: tuple[str, ...],
     stream: TextIO,
+    *,
+    preserve_line_breaks: bool = False,
 ) -> None:
-    sanitized = _sanitize_display(value, denied_terms)
-    if sanitized != "":
-        print(sanitized, file=stream)
+    lines = value.split("\n") if preserve_line_breaks else [value]
+    if preserve_line_breaks and lines[-1] == "":
+        lines.pop()
+    for line in lines:
+        sanitized = _sanitize_display(line, denied_terms)
+        if sanitized != "":
+            print(sanitized, file=stream)
+        elif preserve_line_breaks and line == "":
+            print(file=stream)
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser()
+    parser = _SilentArgumentParser(prog="check_public.py", add_help=False)
+    parser.add_argument(
+        "-h",
+        "--help",
+        action="store_true",
+        dest="show_help",
+        help="show this help message and exit",
+    )
     parser.add_argument("--denylist", type=Path)
     parser.add_argument("paths", nargs="*", type=Path)
-    args = parser.parse_args(argv)
-    denied_terms: tuple[str, ...] = ()
+    try:
+        args = parser.parse_args(argv)
+    except _ArgumentParseError:
+        return 2
     try:
         denied_terms = _read_denylist(args.denylist)
+    except (OSError, UnicodeError):
+        return 2
+    if args.show_help:
+        _write_public_text(
+            parser.format_help(),
+            denied_terms,
+            sys.stdout,
+            preserve_line_breaks=True,
+        )
+        return 0
+    try:
         paths = args.paths or [Path(".")]
         findings: list[Finding] = []
         for index, scan_target in enumerate(paths, start=1):
@@ -850,10 +887,10 @@ def main(argv: list[str] | None = None) -> int:
             findings.extend(scanned)
         findings.sort(key=_sort_key)
     except (OSError, UnicodeError, PublicScanError):
-        _write_public_line("public scan failed", denied_terms, sys.stderr)
+        _write_public_text("public scan failed", denied_terms, sys.stderr)
         return 2
     for finding in findings:
-        _write_public_line(_render(finding), denied_terms, sys.stdout)
+        _write_public_text(_render(finding), denied_terms, sys.stdout)
     return 1 if findings else 0
 
 

@@ -45,7 +45,10 @@ def credential_line() -> str:
     return "api" + "_key = synthetic-value"
 
 
-def run_public_cli(*arguments: str | Path) -> subprocess.CompletedProcess[str]:
+def run_public_cli(
+    *arguments: str | Path,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
             sys.executable,
@@ -55,6 +58,36 @@ def run_public_cli(*arguments: str | Path) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
         check=False,
+        cwd=cwd,
+    )
+
+
+def run_public_main_with_argv0(
+    argv0: str,
+    *arguments: str | Path,
+) -> subprocess.CompletedProcess[str]:
+    repository_root = Path(__file__).parents[1]
+    environment = os.environ.copy()
+    existing_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        item
+        for item in (str(repository_root), existing_pythonpath)
+        if item
+    )
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; from scripts.check_public import main; "
+            "sys.argv = sys.argv[1:]; raise SystemExit(main())",
+            argv0,
+            *(str(argument) for argument in arguments),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=repository_root,
+        env=environment,
     )
 
 
@@ -1355,6 +1388,145 @@ class PublicSafetyTests(unittest.TestCase):
             completed.stdout,
             "ordinary.txt:1: private_key: private-key header detected\n",
         )
+
+    def test_cli_bare_option_like_real_filename_parse_error_is_silent(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            denied = "unsafe-marker"
+            filename = f"--{denied}-\x1b.txt"
+            (root / filename).write_text(
+                private_key_header() + "\n",
+                encoding="utf-8",
+            )
+            denylist = root / "denylist.txt"
+            denylist.write_text(denied + "\n", encoding="utf-8")
+
+            completed = run_public_cli(
+                "--denylist",
+                denylist.name,
+                filename,
+                cwd=root,
+            )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stdout, "")
+        self.assertEqual(completed.stderr, "")
+
+    def test_cli_malformed_options_are_silent(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            denylist = root / "denylist.txt"
+            denylist.write_text("unsafe-marker\n", encoding="utf-8")
+            cases = (
+                (
+                    "unknown-option",
+                    ("--denylist", denylist, "--unsafe-marker-\x1b"),
+                ),
+                ("missing-denylist-value", ("--denylist",)),
+            )
+            for label, arguments in cases:
+                with self.subTest(case=label):
+                    completed = run_public_cli(*arguments, cwd=root)
+
+                    self.assertEqual(completed.returncode, 2)
+                    self.assertEqual(completed.stdout, "")
+                    self.assertEqual(completed.stderr, "")
+
+    def test_cli_help_uses_fixed_safe_program_name(self) -> None:
+        unsafe_prog = "unsafe-marker-\x1b"
+
+        completed = run_public_main_with_argv0(unsafe_prog, "--help")
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stderr, "")
+        self.assertIn("usage: check_public.py", completed.stdout)
+        self.assertNotIn("unsafe-marker", completed.stdout)
+        self.assertNotIn("\x1b", completed.stdout)
+
+    def test_cli_short_and_long_help_are_useful(self) -> None:
+        for option in ("-h", "--help"):
+            with self.subTest(option=option):
+                completed = run_public_cli(option)
+
+                self.assertEqual(completed.returncode, 0)
+                self.assertEqual(completed.stderr, "")
+                self.assertIn("usage: check_public.py", completed.stdout)
+                self.assertIn("--denylist", completed.stdout)
+                self.assertIn("-h, --help", completed.stdout)
+
+    def test_cli_help_sanitizes_denylist_collisions(self) -> None:
+        cases = (
+            (("usage",), "[redacted]: check_public.py"),
+            (("redacted", "usage"), None),
+        )
+        for denied_terms, expected_fragment in cases:
+            with self.subTest(denied_terms=denied_terms), TemporaryDirectory() as directory:
+                root = Path(directory)
+                denylist = root / "denylist.txt"
+                denylist.write_text("\n".join(denied_terms) + "\n", encoding="utf-8")
+
+                completed = run_public_cli(
+                    "--denylist",
+                    denylist,
+                    "--help",
+                )
+
+                self.assertEqual(completed.returncode, 0)
+                self.assertEqual(completed.stderr, "")
+                self.assertNotEqual(completed.stdout, "")
+                for denied in denied_terms:
+                    self.assertNotIn(denied, completed.stdout)
+                if expected_fragment is not None:
+                    self.assertIn(expected_fragment, completed.stdout)
+
+    def test_cli_help_denylist_preload_failure_is_silent(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            invalid = root / "invalid.txt"
+            invalid.write_bytes(b"\xff")
+            for label, denylist in (
+                ("missing", root / "missing.txt"),
+                ("invalid-utf8", invalid),
+            ):
+                with self.subTest(case=label):
+                    completed = run_public_cli(
+                        "--denylist",
+                        denylist,
+                        "--help",
+                    )
+
+                    self.assertEqual(completed.returncode, 2)
+                    self.assertEqual(completed.stdout, "")
+                    self.assertEqual(completed.stderr, "")
+
+    def test_cli_double_dash_scans_and_sanitizes_option_like_filename(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            denied = "unsafe-marker"
+            filename = f"--{denied}-\x1b.txt"
+            (root / filename).write_text(
+                private_key_header() + "\n",
+                encoding="utf-8",
+            )
+            denylist = root / "denylist.txt"
+            denylist.write_text(denied + "\n", encoding="utf-8")
+
+            completed = run_public_cli(
+                "--denylist",
+                denylist.name,
+                "--",
+                filename,
+                cwd=root,
+            )
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(completed.stderr, "")
+        self.assertNotEqual(completed.stdout, "")
+        self.assertIn("denied_term", completed.stdout)
+        self.assertIn("private_key", completed.stdout)
+        self.assertIn(r"\u001b", completed.stdout)
+        self.assertNotIn(denied, completed.stdout)
+        self.assertNotIn("\x1b", completed.stdout)
 
     def test_cli_disambiguates_same_basename_inputs(self) -> None:
         with TemporaryDirectory() as directory:
