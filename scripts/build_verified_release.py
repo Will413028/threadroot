@@ -252,7 +252,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             if not args.authority_record:
                 raise ValueError
-            authority_record = validate_authority_path(Path(args.authority_record), Path(args.output))
+            authority_record = validate_authority_path(args.authority_record, Path(args.output))
         except Exception:
             raise VerifiedReleaseError("candidate integrity verification failed") from None
         if _git("status", "--porcelain=v1", "--untracked-files=all"):

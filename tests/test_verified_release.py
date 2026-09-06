@@ -163,7 +163,7 @@ def validate(argv, context):
 
 class VerifiedReleaseTests(unittest.TestCase):
     def test_outer_mode_requires_an_absolute_missing_external_authority_record(self):
-        for kind in ("missing", "relative", "existing", "repository", "candidate", "parent", "control", "symlink"):
+        for kind in ("missing", "relative", "existing", "repository", "candidate", "parent", "control", "symlink", "dot-component", "trailing-slash"):
             with self.subTest(kind=kind), outer_fixture() as fixture:
                 value = fixture.authority
                 if kind == "relative": value = Path("authority.json")
@@ -173,6 +173,8 @@ class VerifiedReleaseTests(unittest.TestCase):
                 elif kind == "parent": value = fixture.root / "missing/authority.json"
                 elif kind == "control": value = fixture.root / "secret\nname"
                 elif kind == "symlink": value.symlink_to(fixture.root / "absent")
+                elif kind == "dot-component": value = str(fixture.root) + "/./authority.json"
+                elif kind == "trailing-slash": value = str(fixture.authority) + "/"
                 args = outer_args(fixture, **{"authority-record": value})
                 if kind == "missing": args = args[:-2]
                 self.assert_rejected(fixture, args, "candidate integrity verification failed")
