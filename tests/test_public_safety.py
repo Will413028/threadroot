@@ -30,6 +30,7 @@ from tests.test_release_archives import (
     _prepend_gnu_longname_header,
     _prepend_tar_metadata_header,
     _tar_bytes,
+    _zip_directory_bytes,
 )
 
 
@@ -166,6 +167,44 @@ def gzip_with_metadata(
 
 
 class PublicSafetyTests(unittest.TestCase):
+    def test_zip_scanner_rejects_directory_payload_as_unreadable(self) -> None:
+        denied = "Synthetic " + "Directory Payload"
+        for method in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+            with self.subTest(method=method), TemporaryDirectory() as directory:
+                artifact = Path(directory) / "archive.data"
+                artifact.write_bytes(_zip_directory_bytes(denied.encode(), method))
+
+                with self.assertRaisesRegex(RuntimeError, "public scan failed"):
+                    scan_path(artifact, denied_terms=(denied,))
+
+    def test_cli_directory_payload_failure_is_sanitized_and_exit_two(self) -> None:
+        denied = "Synthetic " + "Directory Payload"
+        member = "safe/"
+        internal_error = "ZIP directory payload must be empty"
+        for method in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+            with self.subTest(method=method), TemporaryDirectory() as directory:
+                root = Path(directory)
+                artifact = root / "unsafe-archive-\x1b.data"
+                artifact.write_bytes(_zip_directory_bytes(denied.encode(), method))
+                denylist = root / "denylist.txt"
+                denylist.write_text(denied + "\n", encoding="utf-8")
+
+                completed = run_public_cli(
+                    "--denylist",
+                    denylist,
+                    artifact,
+                )
+
+                self.assertEqual(completed.returncode, 2)
+                self.assertEqual(completed.stdout, "")
+                self.assertEqual(completed.stderr, "public scan failed\n")
+                for stream in (completed.stdout, completed.stderr):
+                    self.assertNotIn(denied, stream)
+                    self.assertNotIn(artifact.name, stream)
+                    self.assertNotIn(member, stream)
+                    self.assertNotIn("\x1b", stream)
+                    self.assertNotIn(internal_error, stream)
+
     def test_finding_is_frozen(self) -> None:
         finding = Finding("code", "path", None, "message")
         with self.assertRaises(FrozenInstanceError):

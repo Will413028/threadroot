@@ -72,6 +72,17 @@ def _zip_bytes(entries: list[tuple[str, bytes, int]]) -> bytes:
     return output.getvalue()
 
 
+def _zip_directory_bytes(payload: bytes, method: int) -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as archive:
+        info = zipfile.ZipInfo("safe/", (1980, 1, 1, 0, 0, 0))
+        info.create_system = 3
+        info.external_attr = (stat.S_IFDIR | 0o755) << 16
+        info.compress_type = method
+        archive.writestr(info, payload)
+    return output.getvalue()
+
+
 WHEEL_EPOCH = 1_700_000_000
 WHEEL_TIMESTAMP = (2023, 11, 14, 22, 13, 20)
 
@@ -597,6 +608,50 @@ def _mutate_first_zip_declared_size(payload: bytes, size: int) -> bytes:
 
 
 class CommonArchiveTests(unittest.TestCase):
+    def test_zip_framing_rejects_stored_directory_with_payload(self) -> None:
+        payload = _zip_directory_bytes(b"synthetic payload", zipfile.ZIP_STORED)
+
+        with self.assertRaises(ReleaseArchiveError) as raised:
+            release_archives.validate_zip_framing(payload)
+
+        self.assertEqual(raised.exception.code, "invalid_archive")
+
+    def test_zip_framing_rejects_deflated_directory_with_payload(self) -> None:
+        payload = _zip_directory_bytes(b"synthetic payload", zipfile.ZIP_DEFLATED)
+
+        with self.assertRaises(ReleaseArchiveError) as raised:
+            release_archives.validate_zip_framing(payload)
+
+        self.assertEqual(raised.exception.code, "invalid_archive")
+
+    def test_zip_framing_accepts_empty_stored_and_deflated_directories(self) -> None:
+        for method in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+            with self.subTest(method=method):
+                members = release_archives.validate_zip_framing(
+                    _zip_directory_bytes(b"", method)
+                )
+
+                self.assertEqual(
+                    members,
+                    (release_archives.ValidatedZipMember("safe/", b"safe/"),),
+                )
+
+    def test_zip_loader_rejects_directory_payload_before_interpretation(self) -> None:
+        for method in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+            with self.subTest(method=method):
+                with patch.object(
+                    release_archives,
+                    "_member_path",
+                    side_effect=AssertionError("member must not be interpreted"),
+                ) as member_path:
+                    with self.assertRaises(ReleaseArchiveError) as raised:
+                        release_archives._load_zip_members_payload(
+                            _zip_directory_bytes(b"synthetic payload", method)
+                        )
+
+                self.assertEqual(raised.exception.code, "invalid_archive")
+                member_path.assert_not_called()
+
     def test_artifact_same_size_rewrite_with_restored_mtime_is_rejected(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

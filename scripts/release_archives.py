@@ -289,7 +289,6 @@ def _validate_zip_structure(
             )
         ):
             raise _fail("invalid_archive", "invalid stored ZIP size")
-        validated_members.append(ValidatedZipMember(decoded, craw_name))
         _validate_zip_member_stream(
             payload[compressed_start:local_cursor],
             cmethod,
@@ -297,6 +296,9 @@ def _validate_zip_structure(
             ccrc,
             max_member_size,
         )
+        if info.is_dir() and info.file_size != 0:
+            raise _fail("invalid_archive", "ZIP directory payload must be empty")
+        validated_members.append(ValidatedZipMember(decoded, craw_name))
     if local_cursor != central_offset or central_cursor != marker:
         raise _fail("invalid_archive", "ZIP contains unowned or interstitial bytes")
     return tuple(validated_members)
