@@ -130,6 +130,40 @@ class VerifiedReleaseTests(unittest.TestCase):
             self.assertNotEqual(first, second)
             self.assertNotEqual(second, entry.canonical_image_tag(dockerfile, lock))
 
+    def test_builder_image_requires_exact_approved_tag_before_argv_acceptance(self):
+        prefix = "threadroot-release-builder:"
+        for image in (IMAGE, prefix + "0123456789abcdef" * 4):
+            with self.subTest(valid=image):
+                context = {**CONTEXT, "image": image}
+                argv = entry.docker_run_argv(**context)
+                self.assertIn(image, argv)
+                validate(argv, context)
+        baseline = entry.docker_run_argv(**CONTEXT)
+        for image in ("--privileged", "--network=host", "", "other-builder:" + "a" * 64,
+                      prefix + "a" * 63, prefix + "A" * 64, prefix + "g" * 64):
+            context = {**CONTEXT, "image": image}
+            with self.subTest(image=image, boundary="public builder"):
+                with self.assertRaises(entry.VerifiedReleaseError) as raised:
+                    entry.docker_run_argv(**context)
+                self.assertEqual(str(raised.exception), "invalid builder image")
+            # A matching malicious context must not legitimize an option token.
+            mutated = list(baseline)
+            mutated[baseline.index(IMAGE)] = image
+            with self.subTest(image=image, boundary="perimeter validator"):
+                with self.assertRaises(entry.VerifiedReleaseError) as raised:
+                    validate(mutated, context)
+                self.assertEqual(str(raised.exception), "invalid builder image")
+
+    def test_invalid_builder_image_stops_main_before_any_docker_subprocess(self):
+        with outer_fixture() as fixture:
+            with patch.object(entry, "canonical_image_tag", return_value="--privileged") as image_tag:
+                result = invoke(outer_args(fixture))
+            source = fixture.output / "source-a"
+            image_tag.assert_called_once_with(source / "tools/release/Dockerfile", source / "requirements/release.txt")
+            with self.subTest(check="stable public error"):
+                self.assertEqual(result, (1, "", "invalid builder image\n"))
+            fixture.run.assert_not_called()
+
     def test_docker_run_is_offline_read_only_and_unprivileged(self):
         argv = entry.docker_run_argv(**CONTEXT)
         self.assertEqual(argv[:20], ["docker", "run", "--rm", "--platform", "linux/amd64",

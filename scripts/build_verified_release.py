@@ -73,6 +73,8 @@ def _mount(path: Path, destination: str, readonly: bool = True) -> str:
 def _canonical_run_argv(image: str, source_a: Path, source_b: Path, output: Path,
                         commit: str, epoch: int, uid: int, gid: int,
                         denylist: Path | None) -> list[str]:
+    if not isinstance(image, str) or not re.fullmatch(r"threadroot-release-builder:[0-9a-f]{64}", image):
+        raise VerifiedReleaseError("invalid builder image")
     _validate_identity(uid, gid)
     if not re.fullmatch(r"[0-9a-f]{40}", commit) or epoch < 0:
         raise VerifiedReleaseError("invalid commit or epoch")
