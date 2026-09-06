@@ -12,6 +12,9 @@ from scripts.build_release import build_archive
 
 
 RELEASE_NOTES = Path("docs/releases/v0.1.0.md")
+REPRODUCIBLE_RELEASE_PLAN = Path(
+    "docs/superpowers/plans/2026-09-05-threadroot-reproducible-release-build.md"
+)
 EXPECTED_RELEASE_ASSETS = {
     "threadroot-0.1.0-py3-none-any.whl",
     "threadroot-0.1.0.tar.gz",
@@ -504,6 +507,38 @@ class DocumentationTests(unittest.TestCase):
                 with patch.object(Path, "read_text", new=controlled_read_text):
                     with self.assertRaises(AssertionError):
                         self.test_ci_has_exact_matrix_pins_and_validation_commands()
+
+    def test_task_7_local_matrix_command_uses_src_layout(self) -> None:
+        plan = REPRODUCIBLE_RELEASE_PLAN.read_text(encoding="utf-8")
+        task = re.search(
+            r"^### Task 7:[^\n]*$\n(?P<body>.*?)(?=^### Task 8:|\Z)",
+            plan,
+            re.MULTILINE | re.DOTALL,
+        )
+        if task is None:
+            self.fail("missing Task 7")
+        step = re.search(
+            r"^- \[ \] \*\*Step 1:[^\n]*$\n(?P<body>.*?)(?=^- \[ \] \*\*Step 2:)",
+            task.group("body"),
+            re.MULTILINE | re.DOTALL,
+        )
+        if step is None:
+            self.fail("missing Task 7 Step 1")
+
+        self.assertEqual(
+            re.findall(
+                r"^```bash\s*$\n(.*?)^```\s*$",
+                step.group("body"),
+                re.MULTILINE | re.DOTALL,
+            ),
+            [
+                "for threadroot_python in python3.11 python3.12 python3.13 python3.14; do\n"
+                '  PYTHONPATH=src:. "$threadroot_python" -m unittest discover '
+                "-s tests -v\n"
+                '  "$threadroot_python" -m compileall -q src scripts tests\n'
+                "done\n"
+            ],
+        )
 
     def test_canonical_release_build_is_documented(self) -> None:
         testing = Path("docs/testing.md").read_text(encoding="utf-8")

@@ -1354,7 +1354,7 @@ Run from the repository root:
 
 ```bash
 for threadroot_python in python3.11 python3.12 python3.13 python3.14; do
-  "$threadroot_python" -m unittest discover -s tests -v
+  PYTHONPATH=src:. "$threadroot_python" -m unittest discover -s tests -v
   "$threadroot_python" -m compileall -q src scripts tests
 done
 ```
