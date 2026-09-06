@@ -80,10 +80,13 @@ def _active_terms(denied_terms: tuple[str, ...] | list[str]) -> tuple[str, ...]:
 def _sanitize_display(value: str, denied_terms: tuple[str, ...]) -> str:
     for term in denied_terms:
         value = value.replace(term, "[redacted]")
-    return "".join(
+    sanitized = "".join(
         {"\n": r"\n", "\r": r"\r", "\t": r"\t"}.get(character, character)
         for character in value
     )
+    if any(term and term in sanitized for term in denied_terms):
+        return ""
+    return sanitized
 
 
 def _finding(

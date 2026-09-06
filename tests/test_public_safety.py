@@ -244,6 +244,19 @@ class PublicSafetyTests(unittest.TestCase):
         )
         self.assertNotIn(denied, repr(findings))
 
+    def test_finding_path_suppresses_placeholder_conflicting_terms(self) -> None:
+        for denied in ("redacted", "act"):
+            with self.subTest(denied=denied), TemporaryDirectory() as directory:
+                target = Path(directory) / f"{denied}.txt"
+                target.write_text("safe\n", encoding="utf-8")
+
+                findings = scan_path(target, denied_terms=(denied,))
+
+                self.assertEqual(len(findings), 1)
+                self.assertEqual(findings[0].code, "denied_term")
+                self.assertNotIn(denied, findings[0].path)
+                self.assertNotIn(denied, repr(findings))
+
     def test_denied_term_is_detected_in_each_filesystem_path_component(self) -> None:
         denied = "Synthetic " + "Juniper Works"
         with TemporaryDirectory() as directory:
@@ -1093,6 +1106,34 @@ class PublicSafetyTests(unittest.TestCase):
         lines = completed.stdout.splitlines()
         self.assertIn("denied_term", lines[0])
         self.assertIn("absolute_home_path", lines[1])
+
+    def test_cli_never_echoes_placeholder_conflicting_terms(self) -> None:
+        for denied in ("redacted", "act"):
+            with self.subTest(denied=denied), TemporaryDirectory() as directory:
+                root = Path(directory)
+                target = root / f"{denied}.txt"
+                target.write_text("safe\n", encoding="utf-8")
+                denylist = root / "denylist.txt"
+                denylist.write_text(denied + "\n", encoding="utf-8")
+
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        str(Path(__file__).parents[1] / "scripts/check_public.py"),
+                        "--denylist",
+                        str(denylist),
+                        str(target),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+                self.assertEqual(completed.returncode, 1)
+                self.assertEqual(completed.stderr, "")
+                self.assertIn("denied_term", completed.stdout)
+                self.assertNotIn(denied, completed.stdout)
+                self.assertNotIn(denied, completed.stderr)
 
     def test_cli_disambiguates_same_basename_inputs(self) -> None:
         with TemporaryDirectory() as directory:
