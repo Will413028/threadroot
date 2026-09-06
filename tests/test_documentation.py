@@ -304,6 +304,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import sys
 
 args = sys.argv[1:]
@@ -335,6 +336,14 @@ elif args[:2] == ["release", "create"]:
 elif args[:2] == ["release", "view"]:
     release_json = os.environ.get("FAKE_RELEASE_JSON")
     print(Path(release_json).read_text(encoding="utf-8") if release_json else "{}")
+elif args[:2] == ["release", "download"]:
+    if os.environ.get("FAKE_RELEASE_DOWNLOAD_EXIT"):
+        print("synthetic release download failure", file=sys.stderr)
+        raise SystemExit(int(os.environ["FAKE_RELEASE_DOWNLOAD_EXIT"]))
+    pattern = args[args.index("--pattern") + 1]
+    destination = Path(args[args.index("--dir") + 1])
+    source = Path(os.environ["FAKE_DRAFT_ASSET_ROOT"]) / pattern
+    shutil.copyfile(source, destination / pattern)
 elif args[:2] == ["release", "edit"]:
     print("published")
 else:
@@ -1311,6 +1320,7 @@ exit 97
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertNotIn("unsupported fake", result.stderr)
             self.assertNotIn("gh release edit", calls)
+            self.assertFalse((state_root / "publish-download-root.txt").exists())
 
     def test_task_12_publish_rehashes_current_selected_assets(self) -> None:
         plan = REPRODUCIBLE_RELEASE_PLAN.read_text(encoding="utf-8")
@@ -1356,6 +1366,232 @@ exit 97
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertNotIn("unsupported fake", result.stderr)
             self.assertNotIn("gh release edit", calls)
+            self.assertFalse((state_root / "publish-download-root.txt").exists())
+
+    def test_task_12_publish_rejects_same_size_current_draft_byte_drift(
+        self,
+    ) -> None:
+        plan = REPRODUCIBLE_RELEASE_PLAN.read_text(encoding="utf-8")
+        block = _release_plan_bash_block(plan, 12, 2)
+        reviewed_head = "1" * 40
+        release_commit = "3" * 40
+        with TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            fake_bin, call_log = _fake_release_commands(directory)
+            state_root = directory / "threadroot-v010-release-state-20260905"
+            final_root = directory / "final"
+            selected = final_root / "build" / "selected"
+            prior_download = directory / "draft-download"
+            current_draft = directory / "current-draft"
+            _write_selected_artifacts(selected, b"approved")
+            _write_selected_artifacts(prior_download, b"approved")
+            _write_selected_artifacts(current_draft, b"approved")
+            _write_sha256sums(
+                final_root / "build" / "evidence" / "SHA256SUMS", selected
+            )
+            drifted_asset = current_draft / "threadroot-codex-0.1.0.zip"
+            original = drifted_asset.read_bytes()
+            drifted_asset.write_bytes(bytes([original[0] ^ 1]) + original[1:])
+            self.assertEqual(
+                drifted_asset.stat().st_size,
+                (selected / drifted_asset.name).stat().st_size,
+            )
+            state_root.mkdir()
+            for name, value in (
+                ("reviewed-head.txt", reviewed_head),
+                ("approved-pr-head.txt", reviewed_head),
+                ("release-commit.txt", release_commit),
+                ("final-root.txt", str(final_root)),
+                ("draft-download-root.txt", str(prior_download)),
+            ):
+                (state_root / name).write_text(f"{value}\n", encoding="utf-8")
+            release_json = _write_release_contract(state_root, selected)
+
+            result = _run_release_plan_block(
+                block,
+                directory,
+                fake_bin,
+                call_log,
+                FAKE_GIT_HEAD=reviewed_head,
+                FAKE_RELEASE_COMMIT=release_commit,
+                FAKE_RELEASE_JSON=str(release_json),
+                FAKE_DRAFT_ASSET_ROOT=str(current_draft),
+            )
+
+            calls = call_log.read_text(encoding="utf-8") if call_log.exists() else ""
+            downloads = [
+                call
+                for call in calls.splitlines()
+                if call.startswith("gh release download ")
+            ]
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn("unsupported fake", result.stderr)
+            self.assertEqual(len(downloads), 4)
+            self.assertNotIn("gh release edit", calls)
+            self.assertFalse((state_root / "publish-download-root.txt").exists())
+
+    def test_task_12_publish_redownloads_current_draft_before_mutation(self) -> None:
+        plan = REPRODUCIBLE_RELEASE_PLAN.read_text(encoding="utf-8")
+        block = _release_plan_bash_block(plan, 12, 2)
+        reviewed_head = "1" * 40
+        release_commit = "3" * 40
+        with TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            fake_bin, call_log = _fake_release_commands(directory)
+            state_root = directory / "threadroot-v010-release-state-20260905"
+            final_root = directory / "final"
+            selected = final_root / "build" / "selected"
+            prior_download = directory / "draft-download"
+            current_draft = directory / "current-draft"
+            _write_selected_artifacts(selected, b"approved")
+            _write_selected_artifacts(prior_download, b"approved")
+            _write_selected_artifacts(current_draft, b"approved")
+            _write_sha256sums(
+                final_root / "build" / "evidence" / "SHA256SUMS", selected
+            )
+            state_root.mkdir()
+            for name, value in (
+                ("reviewed-head.txt", reviewed_head),
+                ("approved-pr-head.txt", reviewed_head),
+                ("release-commit.txt", release_commit),
+                ("final-root.txt", str(final_root)),
+                ("draft-download-root.txt", str(prior_download)),
+            ):
+                (state_root / name).write_text(f"{value}\n", encoding="utf-8")
+            release_json = _write_release_contract(state_root, selected)
+
+            result = _run_release_plan_block(
+                block,
+                directory,
+                fake_bin,
+                call_log,
+                FAKE_GIT_HEAD=reviewed_head,
+                FAKE_RELEASE_COMMIT=release_commit,
+                FAKE_RELEASE_JSON=str(release_json),
+                FAKE_DRAFT_ASSET_ROOT=str(current_draft),
+            )
+
+            calls = call_log.read_text(encoding="utf-8").splitlines()
+            downloads = [
+                call for call in calls if call.startswith("gh release download ")
+            ]
+            edits = [call for call in calls if call.startswith("gh release edit ")]
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn("unsupported fake", result.stderr)
+            self.assertEqual(len(downloads), 4)
+            self.assertEqual(len(edits), 1)
+            self.assertLess(calls.index(downloads[-1]), calls.index(edits[0]))
+            publication_root = Path(
+                (state_root / "publish-download-root.txt")
+                .read_text(encoding="utf-8")
+                .strip()
+            )
+            self.assertTrue(publication_root.is_dir())
+            for name in EXPECTED_RELEASE_ASSETS:
+                self.assertEqual(
+                    (publication_root / name).read_bytes(),
+                    (selected / name).read_bytes(),
+                )
+
+    def test_task_12_publish_download_failure_skips_mutator_and_binding(
+        self,
+    ) -> None:
+        plan = REPRODUCIBLE_RELEASE_PLAN.read_text(encoding="utf-8")
+        block = _release_plan_bash_block(plan, 12, 2)
+        reviewed_head = "1" * 40
+        release_commit = "3" * 40
+        with TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            fake_bin, call_log = _fake_release_commands(directory)
+            state_root = directory / "threadroot-v010-release-state-20260905"
+            final_root = directory / "final"
+            selected = final_root / "build" / "selected"
+            prior_download = directory / "draft-download"
+            current_draft = directory / "current-draft"
+            _write_selected_artifacts(selected, b"approved")
+            _write_selected_artifacts(prior_download, b"approved")
+            _write_selected_artifacts(current_draft, b"approved")
+            _write_sha256sums(
+                final_root / "build" / "evidence" / "SHA256SUMS", selected
+            )
+            state_root.mkdir()
+            for name, value in (
+                ("reviewed-head.txt", reviewed_head),
+                ("approved-pr-head.txt", reviewed_head),
+                ("release-commit.txt", release_commit),
+                ("final-root.txt", str(final_root)),
+                ("draft-download-root.txt", str(prior_download)),
+            ):
+                (state_root / name).write_text(f"{value}\n", encoding="utf-8")
+            release_json = _write_release_contract(state_root, selected)
+
+            result = _run_release_plan_block(
+                block,
+                directory,
+                fake_bin,
+                call_log,
+                FAKE_GIT_HEAD=reviewed_head,
+                FAKE_RELEASE_COMMIT=release_commit,
+                FAKE_RELEASE_JSON=str(release_json),
+                FAKE_DRAFT_ASSET_ROOT=str(current_draft),
+                FAKE_RELEASE_DOWNLOAD_EXIT="42",
+            )
+
+            calls = call_log.read_text(encoding="utf-8") if call_log.exists() else ""
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("synthetic release download failure", result.stderr)
+            self.assertIn("gh release download", calls)
+            self.assertNotIn("gh release edit", calls)
+            self.assertFalse((state_root / "publish-download-root.txt").exists())
+
+    def test_task_12_publish_refuses_to_overwrite_existing_binding(self) -> None:
+        plan = REPRODUCIBLE_RELEASE_PLAN.read_text(encoding="utf-8")
+        block = _release_plan_bash_block(plan, 12, 2)
+        reviewed_head = "1" * 40
+        release_commit = "3" * 40
+        with TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            fake_bin, call_log = _fake_release_commands(directory)
+            state_root = directory / "threadroot-v010-release-state-20260905"
+            final_root = directory / "final"
+            selected = final_root / "build" / "selected"
+            prior_download = directory / "draft-download"
+            current_draft = directory / "current-draft"
+            _write_selected_artifacts(selected, b"approved")
+            _write_selected_artifacts(prior_download, b"approved")
+            _write_selected_artifacts(current_draft, b"approved")
+            _write_sha256sums(
+                final_root / "build" / "evidence" / "SHA256SUMS", selected
+            )
+            state_root.mkdir()
+            for name, value in (
+                ("reviewed-head.txt", reviewed_head),
+                ("approved-pr-head.txt", reviewed_head),
+                ("release-commit.txt", release_commit),
+                ("final-root.txt", str(final_root)),
+                ("draft-download-root.txt", str(prior_download)),
+            ):
+                (state_root / name).write_text(f"{value}\n", encoding="utf-8")
+            binding = state_root / "publish-download-root.txt"
+            binding.write_text("existing authority\n", encoding="utf-8")
+            release_json = _write_release_contract(state_root, selected)
+
+            result = _run_release_plan_block(
+                block,
+                directory,
+                fake_bin,
+                call_log,
+                FAKE_GIT_HEAD=reviewed_head,
+                FAKE_RELEASE_COMMIT=release_commit,
+                FAKE_RELEASE_JSON=str(release_json),
+                FAKE_DRAFT_ASSET_ROOT=str(current_draft),
+            )
+
+            calls = call_log.read_text(encoding="utf-8") if call_log.exists() else ""
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn("gh release download", calls)
+            self.assertNotIn("gh release edit", calls)
+            self.assertEqual(binding.read_text(encoding="utf-8"), "existing authority\n")
 
     def test_task_12_public_binding_reloads_successful_candidate_in_new_shell(
         self,

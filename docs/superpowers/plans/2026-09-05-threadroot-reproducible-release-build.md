@@ -2638,10 +2638,12 @@ threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit
 threadroot_final_root="$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
 threadroot_draft_download="$(tr -d '\n' < "$threadroot_state_root/draft-download-root.txt")"
 threadroot_selected="$threadroot_final_root/build/selected"
+threadroot_publish_binding="$threadroot_state_root/publish-download-root.txt"
 test "$threadroot_approved_head" = "$threadroot_reviewed_head"
 test "$(git rev-parse HEAD)" = "$threadroot_reviewed_head"
 git merge-base --is-ancestor \
   "$threadroot_reviewed_head" "$threadroot_release_commit"
+test ! -e "$threadroot_publish_binding"
 git fetch --no-tags origin \
   refs/heads/main:refs/remotes/origin/main
 test "$(git rev-parse refs/remotes/origin/main)" \
@@ -2659,6 +2661,14 @@ for threadroot_asset in \
   cmp "$threadroot_selected/$threadroot_asset" \
     "$threadroot_draft_download/$threadroot_asset"
 done
+(
+  cd "$threadroot_selected"
+  shasum -a 256 \
+    threadroot-0.1.0-py3-none-any.whl \
+    threadroot-0.1.0.tar.gz \
+    threadroot-claude-0.1.0.zip \
+    threadroot-codex-0.1.0.zip | LC_ALL=C sort -k 2
+) | cmp - "$threadroot_final_root/build/evidence/SHA256SUMS"
 
 threadroot_previous_account="$(gh api user --jq .login)"
 threadroot_restore_account() {
@@ -2667,6 +2677,49 @@ threadroot_restore_account() {
 trap threadroot_restore_account EXIT
 gh auth switch --hostname github.com --user Will413028
 test "$(gh api user --jq .login)" = "Will413028"
+threadroot_publish_download="$(mktemp -d /private/tmp/threadroot-v010-publish-download-20260905-XXXXXX)"
+for threadroot_asset in \
+  threadroot-0.1.0-py3-none-any.whl \
+  threadroot-0.1.0.tar.gz \
+  threadroot-claude-0.1.0.zip \
+  threadroot-codex-0.1.0.zip; do
+  gh release download v0.1.0 \
+    --repo Will413028/threadroot \
+    --pattern "$threadroot_asset" \
+    --dir "$threadroot_publish_download"
+done
+python3 - "$threadroot_publish_download" <<'PY'
+from pathlib import Path
+import stat
+import sys
+
+root = Path(sys.argv[1])
+expected = [
+    "threadroot-0.1.0-py3-none-any.whl",
+    "threadroot-0.1.0.tar.gz",
+    "threadroot-claude-0.1.0.zip",
+    "threadroot-codex-0.1.0.zip",
+]
+entries = list(root.iterdir())
+assert sorted(path.name for path in entries) == expected
+assert all(
+    stat.S_ISREG(path.stat(follow_symlinks=False).st_mode)
+    for path in entries
+)
+PY
+test "$threadroot_approved_head" = "$threadroot_reviewed_head"
+test "$(git rev-parse HEAD)" = "$threadroot_reviewed_head"
+git merge-base --is-ancestor \
+  "$threadroot_reviewed_head" "$threadroot_release_commit"
+git fetch --no-tags origin \
+  refs/heads/main:refs/remotes/origin/main
+test "$(git rev-parse refs/remotes/origin/main)" \
+  = "$threadroot_release_commit"
+test "$(git rev-parse 'refs/tags/v0.1.0^{}')" \
+  = "$threadroot_release_commit"
+test "$(git ls-remote --tags origin \
+  'refs/tags/v0.1.0^{}' | awk '{print $1}')" \
+  = "$threadroot_release_commit"
 gh release view v0.1.0 \
   --repo Will413028/threadroot \
   --json assets,body,isDraft,isPrerelease,name,tagName,url \
@@ -2684,6 +2737,25 @@ cmp "$threadroot_state_root/draft-after-contract.json" \
     threadroot-claude-0.1.0.zip \
     threadroot-codex-0.1.0.zip | LC_ALL=C sort -k 2
 ) | cmp - "$threadroot_final_root/build/evidence/SHA256SUMS"
+(
+  cd "$threadroot_publish_download"
+  shasum -a 256 \
+    threadroot-0.1.0-py3-none-any.whl \
+    threadroot-0.1.0.tar.gz \
+    threadroot-claude-0.1.0.zip \
+    threadroot-codex-0.1.0.zip | LC_ALL=C sort -k 2
+) | cmp - "$threadroot_final_root/build/evidence/SHA256SUMS"
+for threadroot_asset in \
+  threadroot-0.1.0-py3-none-any.whl \
+  threadroot-0.1.0.tar.gz \
+  threadroot-claude-0.1.0.zip \
+  threadroot-codex-0.1.0.zip; do
+  cmp "$threadroot_selected/$threadroot_asset" \
+    "$threadroot_publish_download/$threadroot_asset"
+done
+python3 -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
+  "$threadroot_publish_binding" \
+  "$threadroot_publish_download"
 gh release edit v0.1.0 \
   --repo Will413028/threadroot \
   --draft=false \
@@ -2692,10 +2764,14 @@ threadroot_restore_account
 trap - EXIT
 ```
 
-Do not upload, rebuild, replace, or retarget during this step. The final
-checksum pipeline re-reads all four selected files after draft metadata
-validation and immediately before the sole publish mutation; matching a stale
-checksum copy or a jointly drifted selected/download pair cannot authorize
+Do not upload, rebuild, replace, or retarget during this step. The block creates
+a new download root after checking that `publish-download-root.txt` is absent,
+downloads the current four draft assets, requires exact regular-file
+membership, revalidates metadata and commit/tag authority, and compares both
+the selected and newly downloaded bytes with canonical evidence immediately
+before the sole publish mutation. It binds that verified root with an
+exclusive `open("x")`; a stale checksum, jointly drifted selected/old-download
+pair, current draft replacement, or failed download cannot authorize
 publication.
 
 - [ ] **Step 3: Verify unauthenticated public downloads**
