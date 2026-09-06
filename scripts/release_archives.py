@@ -208,8 +208,8 @@ def _validate_zip_structure(payload: bytes, infos: list[zipfile.ZipInfo]) -> Non
             raise _fail("invalid_archive", "invalid ZIP central record")
         central = struct.unpack_from("<4s6H3L5H2L", payload, central_cursor)
         (
-            _csig, _made, _needed, cflags, cmethod, ctime, cdate, ccrc, ccsize, cusize,
-            cnlen, cxlen, cclen, _disk, _internal, cexternal, coffset,
+            _csig, made, needed, cflags, cmethod, ctime, cdate, ccrc, ccsize, cusize,
+            cnlen, cxlen, cclen, disk_start, internal_attrs, cexternal, coffset,
         ) = central
         cstart = central_cursor + 46
         craw_name = payload[cstart : cstart + cnlen]
@@ -221,7 +221,7 @@ def _validate_zip_structure(payload: bytes, infos: list[zipfile.ZipInfo]) -> Non
         if local_cursor + 30 > central_offset or payload[local_cursor : local_cursor + 4] != b"PK\x03\x04":
             raise _fail("invalid_archive", "invalid ZIP local record")
         local = struct.unpack_from("<4s5H3L2H", payload, local_cursor)
-        _lsig, _lneeded, lflags, lmethod, ltime, ldate, lcrc, lcsize, lusize, lnlen, lxlen = local
+        _lsig, lneeded, lflags, lmethod, ltime, ldate, lcrc, lcsize, lusize, lnlen, lxlen = local
         lstart = local_cursor + 30
         lraw_name = payload[lstart : lstart + lnlen]
         lextra = payload[lstart + lnlen : lstart + lnlen + lxlen]
@@ -230,9 +230,19 @@ def _validate_zip_structure(payload: bytes, infos: list[zipfile.ZipInfo]) -> Non
         if local_cursor > central_offset:
             raise _fail("invalid_archive", "invalid ZIP compressed boundary")
         decoded = _decode_zip_name(craw_name, cflags)
+        info_made = (info.create_system << 8) | info.create_version
         if (
             decoded != info.filename
             or lraw_name != craw_name
+            or made != info_made
+            or needed != info.extract_version
+            or disk_start != info.volume
+            or internal_attrs != info.internal_attr
+            or made != 0x0314
+            or needed != 20
+            or lneeded != needed
+            or disk_start != 0
+            or internal_attrs != 0
             or (lflags, lmethod, ltime, ldate, lcrc, lcsize, lusize)
             != (cflags, cmethod, ctime, cdate, ccrc, ccsize, cusize)
             or lextra != cextra
@@ -413,6 +423,8 @@ def _validate_tar_boundary(
     raw: bytes,
     expected_global_comment: str | None = None,
 ) -> None:
+    if len(raw) % 512 != 0:
+        raise _fail("invalid_archive", "unaligned tar boundary")
     offset = 0
     saw_global_comment = False
     while offset + 512 <= len(raw):

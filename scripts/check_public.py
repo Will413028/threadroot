@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import bz2
 from dataclasses import dataclass
-import gzip
 import io
 import lzma
 import os
@@ -12,7 +11,9 @@ import re
 import stat
 import sys
 import tarfile
+from typing import BinaryIO
 import zipfile
+import zlib
 
 if __package__:
     from scripts.release_archives import validate_tar_framing, validate_zip_framing
@@ -40,11 +41,12 @@ ZIP_STRUCTURAL_SIGNATURES = (
     b"PK\x05\x06",
     b"PK\x07\x08",
 )
-COMPRESSION_DECODERS = (
-    (b"\x1f\x8b", gzip.decompress),
-    (b"BZh", bz2.decompress),
-    (b"\xfd7zXZ\x00", lzma.decompress),
+COMPRESSION_SIGNATURES = (
+    ("gzip", b"\x1f\x8b"),
+    ("bzip2", b"BZh"),
+    ("xz", b"\xfd7zXZ\x00"),
 )
+MAX_DECOMPRESSED_BYTES = 64 * 1024 * 1024
 READ_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
 DIRECTORY_FLAGS = READ_FLAGS | os.O_DIRECTORY
 
@@ -171,6 +173,36 @@ def _scan_text(
     return findings
 
 
+def _scan_denied_metadata(
+    value: str | bytes,
+    display_path: str,
+    denied_terms: tuple[str, ...],
+) -> list[Finding]:
+    try:
+        detected = (
+            any(term in value for term in denied_terms)
+            if isinstance(value, str)
+            else any(term.encode("utf-8") in value for term in denied_terms)
+        )
+    except UnicodeError:
+        raise PublicScanError() from None
+    if not detected:
+        return []
+    return [_finding("denied_term", display_path, None, denied_terms)]
+
+
+def _read_bounded(stream: BinaryIO, expected_size: int) -> bytes:
+    if expected_size < 0 or expected_size > MAX_DECOMPRESSED_BYTES:
+        raise PublicScanError()
+    try:
+        payload = stream.read(MAX_DECOMPRESSED_BYTES + 1)
+    except Exception:
+        raise PublicScanError() from None
+    if len(payload) != expected_size or len(payload) > MAX_DECOMPRESSED_BYTES:
+        raise PublicScanError()
+    return payload
+
+
 def _normalized_archive_path(name: str) -> str:
     return name.replace("\\", "/")
 
@@ -222,8 +254,36 @@ def _scan_zip(
     findings: list[Finding] = []
     try:
         with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            findings.extend(
+                _scan_denied_metadata(
+                    archive.comment,
+                    _archive_display(display_path, "<archive-comment>"),
+                    denied_terms,
+                )
+            )
             for info in sorted(archive.infolist(), key=lambda item: item.filename):
                 member_display = _archive_display(display_path, info.filename)
+                findings.extend(
+                    _scan_denied_metadata(
+                        info.filename,
+                        member_display,
+                        denied_terms,
+                    )
+                )
+                findings.extend(
+                    _scan_denied_metadata(
+                        info.comment,
+                        _archive_display(member_display, "<comment>"),
+                        denied_terms,
+                    )
+                )
+                findings.extend(
+                    _scan_denied_metadata(
+                        info.extra,
+                        _archive_display(member_display, "<extra>"),
+                        denied_terms,
+                    )
+                )
                 unsafe = _member_name_is_unsafe(info.filename)
                 mode = info.external_attr >> 16
                 is_link = stat.S_ISLNK(mode)
@@ -232,7 +292,16 @@ def _scan_zip(
                         _finding("path_escape", member_display, None, denied_terms)
                     )
                 if is_link:
-                    target = archive.read(info).decode("utf-8")
+                    with archive.open(info) as stream:
+                        target_payload = _read_bounded(stream, info.file_size)
+                    findings.extend(
+                        _scan_denied_metadata(
+                            target_payload,
+                            _archive_display(member_display, "<link-target>"),
+                            denied_terms,
+                        )
+                    )
+                    target = target_payload.decode("utf-8")
                     if not unsafe and target and _link_escapes(
                         info.filename, target, relative_to_member=True
                     ):
@@ -242,7 +311,8 @@ def _scan_zip(
                     continue
                 if info.is_dir():
                     continue
-                member_payload = archive.read(info)
+                with archive.open(info) as stream:
+                    member_payload = _read_bounded(stream, info.file_size)
                 findings.extend(
                     _scan_text(member_payload, member_display, denied_terms)
                 )
@@ -258,14 +328,65 @@ def _scan_open_tar(
 ) -> list[Finding]:
     findings: list[Finding] = []
     try:
+        for key, value in sorted(archive.pax_headers.items()):
+            findings.extend(
+                _scan_denied_metadata(
+                    key,
+                    _archive_display(display_path, "<pax-key>"),
+                    denied_terms,
+                )
+            )
+            findings.extend(
+                _scan_denied_metadata(
+                    value,
+                    _archive_display(display_path, "<pax-value>"),
+                    denied_terms,
+                )
+            )
         for member in sorted(archive.getmembers(), key=lambda item: item.name):
             member_display = _archive_display(display_path, member.name)
+            findings.extend(
+                _scan_denied_metadata(member.name, member_display, denied_terms)
+            )
+            for field, value in (
+                ("uname", member.uname),
+                ("gname", member.gname),
+            ):
+                findings.extend(
+                    _scan_denied_metadata(
+                        value,
+                        _archive_display(member_display, f"<{field}>"),
+                        denied_terms,
+                    )
+                )
+            for key, value in sorted(member.pax_headers.items()):
+                findings.extend(
+                    _scan_denied_metadata(
+                        key,
+                        _archive_display(member_display, "<pax-key>"),
+                        denied_terms,
+                    )
+                )
+                findings.extend(
+                    _scan_denied_metadata(
+                        value,
+                        _archive_display(member_display, "<pax-value>"),
+                        denied_terms,
+                    )
+                )
             unsafe = _member_name_is_unsafe(member.name)
             if unsafe:
                 findings.append(
                     _finding("path_escape", member_display, None, denied_terms)
                 )
             if member.issym() or member.islnk():
+                findings.extend(
+                    _scan_denied_metadata(
+                        member.linkname,
+                        _archive_display(member_display, "<link-target>"),
+                        denied_terms,
+                    )
+                )
                 if not unsafe and _link_escapes(
                     member.name,
                     member.linkname,
@@ -280,7 +401,13 @@ def _scan_open_tar(
             stream = archive.extractfile(member)
             if stream is None:
                 raise PublicScanError()
-            findings.extend(_scan_text(stream.read(), member_display, denied_terms))
+            findings.extend(
+                _scan_text(
+                    _read_bounded(stream, member.size),
+                    member_display,
+                    denied_terms,
+                )
+            )
     except Exception:
         raise PublicScanError() from None
     return findings
@@ -293,15 +420,87 @@ def _has_tar_structure(payload: bytes) -> bool:
     )
 
 
-def _decompress_archive_envelope(payload: bytes) -> bytes | None:
-    for signature, decompress in COMPRESSION_DECODERS:
-        if not payload.startswith(signature):
+def _gzip_metadata_fields(payload: bytes) -> tuple[tuple[str, bytes], ...]:
+    if (
+        len(payload) < 18
+        or payload[:3] != b"\x1f\x8b\x08"
+        or payload[3] & 0xE0
+    ):
+        raise PublicScanError()
+    flags = payload[3]
+    cursor = 10
+    fields: list[tuple[str, bytes]] = []
+    if flags & 0x04:
+        if cursor + 2 > len(payload) - 8:
+            raise PublicScanError()
+        size = int.from_bytes(payload[cursor : cursor + 2], "little")
+        cursor += 2
+        if cursor + size > len(payload) - 8:
+            raise PublicScanError()
+        fields.append(("gzip-extra", payload[cursor : cursor + size]))
+        cursor += size
+    for flag, label in ((0x08, "gzip-filename"), (0x10, "gzip-comment")):
+        if not flags & flag:
             continue
-        try:
-            return decompress(payload)
-        except Exception:
-            raise PublicScanError() from None
-    return None
+        end = payload.find(b"\0", cursor, len(payload) - 8)
+        if end < 0:
+            raise PublicScanError()
+        fields.append((label, payload[cursor:end]))
+        cursor = end + 1
+    if flags & 0x02:
+        cursor += 2
+    if cursor > len(payload) - 8:
+        raise PublicScanError()
+    return tuple(fields)
+
+
+def _decompress_archive_envelope(
+    payload: bytes,
+) -> tuple[bytes, tuple[tuple[str, bytes], ...]] | None:
+    kind = next(
+        (
+            name
+            for name, signature in COMPRESSION_SIGNATURES
+            if payload.startswith(signature)
+        ),
+        None,
+    )
+    if kind is None:
+        return None
+    try:
+        if kind == "gzip":
+            metadata = _gzip_metadata_fields(payload)
+            decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            expanded = decompressor.decompress(
+                payload,
+                MAX_DECOMPRESSED_BYTES + 1,
+            )
+            complete = (
+                decompressor.eof
+                and not decompressor.unused_data
+                and not decompressor.unconsumed_tail
+            )
+        elif kind == "bzip2":
+            metadata = ()
+            bzip2 = bz2.BZ2Decompressor()
+            expanded = bzip2.decompress(
+                payload,
+                max_length=MAX_DECOMPRESSED_BYTES + 1,
+            )
+            complete = bzip2.eof and not bzip2.unused_data
+        else:
+            metadata = ()
+            xz = lzma.LZMADecompressor()
+            expanded = xz.decompress(
+                payload,
+                max_length=MAX_DECOMPRESSED_BYTES + 1,
+            )
+            complete = xz.eof and not xz.unused_data
+    except Exception:
+        raise PublicScanError() from None
+    if len(expanded) > MAX_DECOMPRESSED_BYTES or not complete:
+        raise PublicScanError()
+    return expanded, metadata
 
 
 def _scan_regular_payload(
@@ -317,24 +516,40 @@ def _scan_regular_payload(
         return _scan_zip(payload, display_path, denied_terms)
     if payload.startswith(ZIP_STRUCTURAL_SIGNATURES):
         raise PublicScanError()
+    envelope = _decompress_archive_envelope(payload)
+    archive_payload = payload if envelope is None else envelope[0]
+    envelope_findings: list[Finding] = []
+    if envelope is not None:
+        for label, value in envelope[1]:
+            envelope_findings.extend(
+                _scan_denied_metadata(
+                    value,
+                    _archive_display(display_path, f"<{label}>"),
+                    denied_terms,
+                )
+            )
     try:
-        archive = tarfile.open(fileobj=io.BytesIO(payload), mode="r:*")
+        archive = tarfile.open(fileobj=io.BytesIO(archive_payload), mode="r:")
     except tarfile.ReadError:
-        expanded = _decompress_archive_envelope(payload)
-        if _has_tar_structure(payload) or (
-            expanded is not None and _has_tar_structure(expanded)
-        ):
+        if _has_tar_structure(archive_payload):
             raise PublicScanError() from None
-        return _scan_text(payload, display_path, denied_terms)
+        return envelope_findings + _scan_text(
+            archive_payload,
+            display_path,
+            denied_terms,
+        )
     except Exception:
         raise PublicScanError() from None
     with archive:
         try:
-            expanded = _decompress_archive_envelope(payload)
-            validate_tar_framing(payload if expanded is None else expanded)
+            validate_tar_framing(archive_payload)
         except Exception:
             raise PublicScanError() from None
-        return _scan_open_tar(archive, display_path, denied_terms)
+        return envelope_findings + _scan_open_tar(
+            archive,
+            display_path,
+            denied_terms,
+        )
 
 
 def _stat_signature(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
@@ -407,6 +622,7 @@ def _scan_directory(
     findings: list[Finding] = []
     for name in names:
         display = name if not prefix else f"{prefix}/{name}"
+        findings.extend(_scan_denied_metadata(name, display, denied_terms))
         metadata = _lstat_at(descriptor, name)
         if name in SKIPPED_DIRECTORIES and not stat.S_ISLNK(metadata.st_mode):
             continue
@@ -462,13 +678,15 @@ def scan_path(
 ) -> list[Finding]:
     path = Path(path)
     terms = _active_terms(denied_terms)
+    findings = _scan_denied_metadata(path.name, path.name, terms)
     metadata = _current_root(path)
     if stat.S_ISLNK(metadata.st_mode):
-        return [_finding("symlink_entry", path.name, None, terms)]
+        findings.append(_finding("symlink_entry", path.name, None, terms))
+        return sorted(findings, key=_sort_key)
     if stat.S_ISDIR(metadata.st_mode):
         descriptor = _open_root(path, metadata, DIRECTORY_FLAGS)
         try:
-            findings = _scan_directory(descriptor, "", terms)
+            findings.extend(_scan_directory(descriptor, "", terms))
             current = _current_root(path)
             if _stat_signature(current) != _stat_signature(metadata):
                 raise PublicScanError()
@@ -492,10 +710,10 @@ def scan_path(
             raise PublicScanError() from None
         finally:
             os.close(descriptor)
-        return sorted(
-            _scan_regular_payload(b"".join(chunks), path.name, terms),
-            key=_sort_key,
+        findings.extend(
+            _scan_regular_payload(b"".join(chunks), path.name, terms)
         )
+        return sorted(findings, key=_sort_key)
     raise PublicScanError()
 
 

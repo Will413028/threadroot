@@ -521,6 +521,43 @@ def _mutate_local_zip(payload: bytes, mutation: str) -> bytes:
     return result
 
 
+def _mutate_zip_fixed_header(payload: bytes, mutation: str) -> bytes:
+    changed = bytearray(payload)
+    eocd = _eocd_offset(changed)
+    central = int.from_bytes(changed[eocd + 16 : eocd + 20], "little")
+    if changed[central : central + 4] != b"PK\x01\x02":
+        raise AssertionError("fixture has no first central header")
+    local = int.from_bytes(changed[central + 42 : central + 46], "little")
+    if changed[local : local + 4] != b"PK\x03\x04":
+        raise AssertionError("fixture has no matching local header")
+
+    mutations = {
+        "local-needed": ((local + 4, b"\x15\x00"),),
+        "central-needed": ((central + 6, b"\x15\x00"),),
+        "consistent-needed": (
+            (local + 4, b"\x15\x00"),
+            (central + 6, b"\x15\x00"),
+        ),
+        "made-version": ((central + 4, b"\x15"),),
+        "made-system": ((central + 5, b"\x04"),),
+        "disk-start": ((central + 34, b"\x01\x00"),),
+        "internal-attrs": ((central + 36, b"\x01\x00"),),
+    }
+    try:
+        edits = mutations[mutation]
+    except KeyError:
+        raise AssertionError(mutation) from None
+    for offset, value in edits:
+        changed[offset : offset + len(value)] = value
+    result = bytes(changed)
+    if result == payload:
+        raise AssertionError("mutation did not change fixture")
+    with zipfile.ZipFile(io.BytesIO(result)) as archive:
+        info = archive.infolist()[0]
+        archive.read(info)
+    return result
+
+
 class CommonArchiveTests(unittest.TestCase):
     def test_artifact_same_size_rewrite_with_restored_mtime_is_rejected(self) -> None:
         with TemporaryDirectory() as directory:
@@ -744,6 +781,93 @@ class CommonArchiveTests(unittest.TestCase):
                 b"safe\n",
             )
 
+    def test_tar_framing_rejects_every_unaligned_zero_suffix(self) -> None:
+        original = _tar_bytes(
+            [("safe/file.txt", b"safe\n", 0o644, tarfile.REGTYPE)]
+        )
+        self.assertEqual(len(original) % 512, 0)
+        for suffix_size in range(1, 512):
+            with self.subTest(suffix_size=suffix_size):
+                with self.assertRaises(ReleaseArchiveError) as raised:
+                    release_archives.validate_tar_framing(
+                        original + bytes(suffix_size)
+                    )
+                self.assertEqual(raised.exception.code, "invalid_archive")
+
+    def test_tar_extractors_reject_unaligned_zero_suffix_before_destination(self) -> None:
+        original = _tar_bytes(
+            [("safe/file.txt", b"safe\n", 0o644, tarfile.REGTYPE)]
+        )
+        for suffix_size in (1, 511):
+            payload = original + bytes(suffix_size)
+            for api in ("path", "payload"):
+                with self.subTest(
+                    suffix_size=suffix_size,
+                    api=api,
+                ), TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    artifact = root / "artifact.tar"
+                    artifact.write_bytes(payload)
+                    destination = root / "out"
+                    with self.assertRaises(ReleaseArchiveError) as raised:
+                        if api == "path":
+                            extract_regular_tar(artifact, destination)
+                        else:
+                            extract_regular_tar_payload(payload, destination)
+                    self.assertEqual(raised.exception.code, "invalid_archive")
+                    self.assertFalse(destination.exists())
+
+    def test_tar_framing_accepts_standard_library_and_real_git_archives(self) -> None:
+        standard = _tar_bytes(
+            [("safe/file.txt", b"safe\n", 0o644, tarfile.REGTYPE)]
+        )
+        release_archives.validate_tar_framing(standard)
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repository"
+            repository.mkdir()
+            (repository / "safe.txt").write_bytes(b"safe\n")
+            for command in (
+                ["git", "init", "-q"],
+                ["git", "add", "safe.txt"],
+                [
+                    "git",
+                    "-c",
+                    "user.name=Synthetic Test",
+                    "-c",
+                    "user.email=synthetic@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-qm",
+                    "test: synthetic fixture",
+                ],
+            ):
+                subprocess.run(
+                    command,
+                    cwd=repository,
+                    check=True,
+                    capture_output=True,
+                )
+            commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            archived = subprocess.run(
+                ["git", "archive", "--format=tar", "HEAD"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+            ).stdout
+            self.assertEqual(len(archived) % 512, 0)
+            destination = root / "git-out"
+            extract_regular_tar_payload(archived, destination, commit)
+            self.assertEqual((destination / "safe.txt").read_bytes(), b"safe\n")
+
     def test_tar_extractors_reject_nonzero_padding_and_regular_linkname(self) -> None:
         original = _tar_bytes([("safe/file.txt", b"safe\n", 0o644, tarfile.REGTYPE)])
         mutations = {
@@ -906,6 +1030,25 @@ class CommonArchiveTests(unittest.TestCase):
                 artifact.write_bytes(_mutate_local_zip(valid, mutation))
                 with self.assertRaises(ReleaseArchiveError):
                     extract_regular_zip(artifact, root / "out")
+
+    def test_zip_framing_rejects_noncanonical_fixed_header_fields(self) -> None:
+        original = _zip_bytes(
+            [("safe/file.txt", b"safe\n", stat.S_IFREG | 0o644)]
+        )
+        for mutation in (
+            "local-needed",
+            "central-needed",
+            "consistent-needed",
+            "made-version",
+            "made-system",
+            "disk-start",
+            "internal-attrs",
+        ):
+            payload = _mutate_zip_fixed_header(original, mutation)
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(ReleaseArchiveError) as raised:
+                    release_archives.validate_zip_framing(payload)
+                self.assertEqual(raised.exception.code, "invalid_archive")
 
     def test_zip_extractors_reject_bytes_after_member_deflate_eof(self) -> None:
         original = _zip_bytes([("safe/file.txt", b"safe\n", stat.S_IFREG | 0o644)])
@@ -1236,6 +1379,48 @@ class CommonArchiveTests(unittest.TestCase):
 
 
 class WheelContractTests(unittest.TestCase):
+    def test_wheel_path_and_payload_validators_reject_fixed_header_covert_bytes(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _make_wheel_source(root)
+            snapshot = release_archives._capture_path_source(
+                source,
+                ["src/threadroot", "README.md", "LICENSE"],
+            )
+            order, payloads = _wheel_payloads(source)
+            valid = root / "valid.whl"
+            _write_wheel(valid, order, payloads)
+            for mutation in (
+                "local-needed",
+                "central-needed",
+                "consistent-needed",
+                "made-version",
+                "made-system",
+                "disk-start",
+                "internal-attrs",
+            ):
+                payload = _mutate_zip_fixed_header(valid.read_bytes(), mutation)
+                artifact = root / f"{mutation}.whl"
+                artifact.write_bytes(payload)
+                for api in ("path", "payload"):
+                    with self.subTest(mutation=mutation, api=api):
+                        with self.assertRaises(ReleaseArchiveError) as raised:
+                            if api == "path":
+                                validate_wheel(
+                                    artifact,
+                                    source,
+                                    "0.1.0",
+                                    WHEEL_EPOCH,
+                                )
+                            else:
+                                validate_wheel_payload(
+                                    payload,
+                                    snapshot,
+                                    "0.1.0",
+                                    WHEEL_EPOCH,
+                                )
+                        self.assertEqual(raised.exception.code, "invalid_archive")
+
     def test_source_root_identity_mismatch_closes_descriptor(self) -> None:
         with TemporaryDirectory() as directory:
             source = _make_wheel_source(Path(directory))
@@ -1431,6 +1616,42 @@ class WheelContractTests(unittest.TestCase):
 
 
 class SdistContractTests(unittest.TestCase):
+    def test_sdist_path_and_payload_validators_reject_unaligned_zero_suffix(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _make_sdist_source(root)
+            snapshot = release_archives._capture_path_source(
+                source,
+                [*release_archives.SDIST_ROOTS, ".gitignore", "pyproject.toml"],
+            )
+            valid = root / "valid.tar.gz"
+            _write_sdist(valid, _sdist_entries(source))
+            raw_tar = gzip.decompress(valid.read_bytes())
+            self.assertEqual(len(raw_tar) % 512, 0)
+            validate_sdist(valid, source, "0.1.0", WHEEL_EPOCH)
+            for suffix_size in (1, 511):
+                payload = _gzip_tar_payload(raw_tar + bytes(suffix_size))
+                artifact = root / f"suffix-{suffix_size}.tar.gz"
+                artifact.write_bytes(payload)
+                for api in ("path", "payload"):
+                    with self.subTest(suffix_size=suffix_size, api=api):
+                        with self.assertRaises(ReleaseArchiveError) as raised:
+                            if api == "path":
+                                validate_sdist(
+                                    artifact,
+                                    source,
+                                    "0.1.0",
+                                    WHEEL_EPOCH,
+                                )
+                            else:
+                                validate_sdist_payload(
+                                    payload,
+                                    snapshot,
+                                    "0.1.0",
+                                    WHEEL_EPOCH,
+                                )
+                        self.assertEqual(raised.exception.code, "invalid_archive")
+
     def test_sdist_path_and_payload_validators_require_canonical_regular_type(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1637,6 +1858,42 @@ class SdistContractTests(unittest.TestCase):
 
 
 class HostZipContractTests(unittest.TestCase):
+    def test_host_zip_path_and_payload_validators_reject_fixed_header_covert_bytes(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _make_host_source(root)
+            snapshot = release_archives._capture_path_source(
+                source,
+                [
+                    *(item.as_posix() for item in release_archives.COMMON_ROOTS),
+                    release_archives.MARKETPLACE.as_posix(),
+                    *(item.as_posix() for item in release_archives.HOST_MANIFESTS.values()),
+                ],
+            )
+            output = root / "artifacts"
+            with patch.object(build_release, "REPOSITORY_ROOT", source):
+                valid = build_archive("claude", output)
+            for mutation in (
+                "local-needed",
+                "central-needed",
+                "consistent-needed",
+                "made-version",
+                "made-system",
+                "disk-start",
+                "internal-attrs",
+            ):
+                payload = _mutate_zip_fixed_header(valid.read_bytes(), mutation)
+                artifact = root / f"{mutation}.zip"
+                artifact.write_bytes(payload)
+                for api in ("path", "payload"):
+                    with self.subTest(mutation=mutation, api=api):
+                        with self.assertRaises(ReleaseArchiveError) as raised:
+                            if api == "path":
+                                validate_host_zip(artifact, source, "claude")
+                            else:
+                                validate_host_zip_payload(payload, snapshot, "claude")
+                        self.assertEqual(raised.exception.code, "invalid_archive")
+
     def test_host_zip_path_and_payload_validators_reject_bytes_after_deflate_eof(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
