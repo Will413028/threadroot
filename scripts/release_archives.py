@@ -328,7 +328,11 @@ def _ensure_directory(root_fd: int, parts: tuple[str, ...]) -> int:
             except FileExistsError:
                 pass
             child = _open_directory(descriptor, part)
-            os.fchmod(child, 0o755)
+            try:
+                os.fchmod(child, 0o755)
+            except BaseException:
+                os.close(child)
+                raise
             os.close(descriptor)
             descriptor = child
         return descriptor
@@ -443,18 +447,17 @@ def _extract_members(
         raise _fail("unsafe_destination", "unsafe extraction destination")
 
     flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
-    try:
-        parent_fd = os.open(parent, flags)
-        if not _same_identity(parent_metadata, os.fstat(parent_fd)):
-            os.close(parent_fd)
-            raise OSError("destination parent changed before open")
-    except OSError:
-        raise _fail("unsafe_destination", "unsafe extraction destination") from None
     stage_name = f".{destination.name}.stage-{secrets.token_hex(8)}"
     created = False
     stage_fd: int | None = None
     stage_identity: os.stat_result | None = None
     try:
+        parent_fd = os.open(parent, flags)
+    except OSError:
+        raise _fail("unsafe_destination", "unsafe extraction destination") from None
+    try:
+        if not _same_identity(parent_metadata, os.fstat(parent_fd)):
+            raise OSError("destination parent changed before open")
         os.mkdir(stage_name, 0o700, dir_fd=parent_fd)
         pathname_identity = os.stat(stage_name, dir_fd=parent_fd, follow_symlinks=False)
         stage_identity = pathname_identity

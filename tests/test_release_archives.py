@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import base64
 from dataclasses import FrozenInstanceError
+import errno
 import gzip
 import hashlib
 import os
@@ -612,6 +613,116 @@ class CommonArchiveTests(unittest.TestCase):
                 self.assertEqual(stat.S_IMODE((destination / "safe").stat().st_mode), 0o755)
                 self.assertEqual(stat.S_IMODE((destination / "safe/plain.txt").stat().st_mode), 0o644)
                 self.assertEqual(stat.S_IMODE((destination / "safe/run.sh").stat().st_mode), 0o755)
+
+    def _assert_extraction_failure_closes_descriptors(self, failure: str) -> None:
+        payload = _tar_bytes([("safe/file", b"safe", 0o644, tarfile.REGTYPE)])
+        for api in ("path", "payload"):
+            for competitor in (False, True):
+                with self.subTest(api=api, competitor=competitor), TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    artifact = root / "artifact.tar"
+                    artifact.write_bytes(payload)
+                    destination = root / "out"
+                    (root / "caller-sentinel").write_bytes(b"keep caller")
+                    original_open, original_dup = os.open, os.dup
+                    original_fstat, original_fchmod = os.fstat, os.fchmod
+                    caller_fd = original_open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                    caller_identity = original_fstat(caller_fd)
+                    captured: list[int] = []
+                    target_fd: int | None = None
+                    failed = False
+                    replacement: Path | None = None
+
+                    def capture_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+                        nonlocal target_fd
+                        descriptor = original_open(path, flags, *args, **kwargs)
+                        captured.append(descriptor)
+                        if (failure == "parent-fstat" and path == root) or (
+                            failure == "child-fchmod" and path == "safe"
+                        ):
+                            target_fd = descriptor
+                        return descriptor
+
+                    def capture_dup(descriptor: int) -> int:
+                        duplicate = original_dup(descriptor)
+                        captured.append(duplicate)
+                        return duplicate
+
+                    def inject_failure() -> None:
+                        nonlocal failed, replacement
+                        failed = True
+                        if competitor:
+                            if failure == "parent-fstat":
+                                replacement = destination
+                            else:
+                                stages = list(root.glob(".out.stage-*"))
+                                self.assertEqual(len(stages), 1)
+                                replacement = stages[0]
+                                replacement.rename(root / "owned-parked")
+                            replacement.mkdir()
+                            (replacement / "competitor").write_bytes(b"keep competitor")
+                        raise OSError(errno.EIO, "injected extraction descriptor failure")
+
+                    def fail_fstat(descriptor: int) -> os.stat_result:
+                        if failure == "parent-fstat" and descriptor == target_fd and not failed:
+                            inject_failure()
+                        return original_fstat(descriptor)
+
+                    def fail_fchmod(descriptor: int, mode: int) -> None:
+                        if failure == "child-fchmod" and descriptor == target_fd and not failed:
+                            inject_failure()
+                        original_fchmod(descriptor, mode)
+
+                    try:
+                        with (
+                            patch("scripts.release_archives.os.open", side_effect=capture_open),
+                            patch("scripts.release_archives.os.dup", side_effect=capture_dup),
+                            patch("scripts.release_archives.os.fstat", side_effect=fail_fstat),
+                            patch("scripts.release_archives.os.fchmod", side_effect=fail_fchmod),
+                            self.assertRaises(ReleaseArchiveError) as raised,
+                        ):
+                            if api == "path":
+                                extract_regular_tar(artifact, destination)
+                            else:
+                                extract_regular_tar_payload(payload, destination)
+                        self.assertTrue(failed)
+                        self.assertIsNotNone(target_fd)
+                        self.assertIn(target_fd, captured)
+                        self.assertEqual(raised.exception.code, "unsafe_destination")
+                        caller_after = original_fstat(caller_fd)
+                        self.assertEqual(
+                            (caller_after.st_dev, caller_after.st_ino, caller_after.st_mode),
+                            (caller_identity.st_dev, caller_identity.st_ino, caller_identity.st_mode),
+                        )
+                        self.assertEqual((root / "caller-sentinel").read_bytes(), b"keep caller")
+                        if competitor:
+                            self.assertEqual((replacement / "competitor").read_bytes(), b"keep competitor")
+                            self.assertEqual(list(replacement.iterdir()), [replacement / "competitor"])
+                        else:
+                            self.assertFalse(destination.exists())
+                            self.assertEqual(list(root.glob(".out.stage-*")), [])
+                        if failure == "child-fchmod":
+                            self.assertFalse(destination.exists())
+                        for descriptor in set(captured):
+                            with self.subTest(descriptor=descriptor):
+                                with self.assertRaises(OSError) as closed:
+                                    original_fstat(descriptor)
+                                self.assertEqual(closed.exception.errno, errno.EBADF)
+                    finally:
+                        # Also release leaked descriptors when this regression test is RED.
+                        for descriptor in set(captured):
+                            try:
+                                os.close(descriptor)
+                            except OSError as error:
+                                if error.errno != errno.EBADF:
+                                    raise
+                        os.close(caller_fd)
+
+    def test_parent_fstat_failure_closes_extraction_descriptors(self) -> None:
+        self._assert_extraction_failure_closes_descriptors("parent-fstat")
+
+    def test_child_fchmod_failure_closes_extraction_descriptors(self) -> None:
+        self._assert_extraction_failure_closes_descriptors("child-fchmod")
 
     def test_publication_never_replaces_competing_destination(self) -> None:
         with TemporaryDirectory() as directory:
