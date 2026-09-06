@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -450,6 +451,159 @@ class CandidateAuthorityTests(unittest.TestCase):
             evidence.write_bytes(_canonical_json(data))
             with self.subTest(mutation=mutation), self.assertRaises(CandidateIntegrityError): self._bind()
             self.setUp()
+
+
+class SuccessfulAttemptTests(unittest.TestCase):
+    _git = CandidateManifestTests._git
+    _in_repository = CandidateManifestTests._in_repository
+    _prepare = CandidateAuthorityTests._prepare
+    _bind = CandidateAuthorityTests._bind
+
+    def setUp(self):
+        CandidateManifestTests.setUp(self)
+        self._prepare()
+        self._bind()
+        self.receipt = self.root / "success.json"
+
+    def _record_success(self):
+        with self._in_repository():
+            candidate_module.record_successful_attempt(self.record, self.commit, self.receipt)
+
+    def _verify_success(self):
+        with self._in_repository():
+            return candidate_module.verify_successful_attempt(
+                self.receipt, self.record, self.commit
+            )
+
+    def test_receipt_binds_exact_record_bytes_size_and_commit(self):
+        self._record_success()
+        data = json.loads(self.receipt.read_bytes())
+        self.assertEqual(data, {
+            "authority_record_sha256": hashlib.sha256(self.record.read_bytes()).hexdigest(),
+            "authority_record_size": len(self.record.read_bytes()),
+            "commit": self.commit,
+            "schema": 1,
+        })
+        self.assertEqual(self._verify_success(), self.candidate)
+
+    def test_raw_record_alone_is_not_successful_attempt_authority(self):
+        with self.assertRaises(CandidateIntegrityError):
+            self._verify_success()
+
+    def test_receipt_is_canonical_single_link_regular_0400_and_bounded(self):
+        self._record_success()
+        self.assertEqual(self.receipt.read_bytes(), _canonical_json(json.loads(self.receipt.read_bytes())))
+        self.assertTrue(stat.S_ISREG(self.receipt.stat().st_mode))
+        self.assertEqual(stat.S_IMODE(self.receipt.stat().st_mode), 0o400)
+        self.assertEqual(self.receipt.stat().st_nlink, 1)
+        self.assertLessEqual(self.receipt.stat().st_size, 4 * 1024)
+        self.receipt.chmod(0o600)
+        with self.assertRaises(CandidateIntegrityError): self._verify_success()
+        self.receipt.chmod(0o400)
+        os.link(self.receipt, self.root / "receipt-link")
+        with self.assertRaises(CandidateIntegrityError): self._verify_success()
+
+    def test_missing_malformed_noncanonical_changed_or_replaced_receipt_fails(self):
+        self._record_success()
+        original = self.receipt.read_bytes()
+        variants = (b"{}\n", original + b"\n", b'{"schema":1,"schema":1}\n')
+        for payload in variants:
+            self.receipt.chmod(0o600); self.receipt.write_bytes(payload); self.receipt.chmod(0o400)
+            with self.assertRaises(CandidateIntegrityError): self._verify_success()
+        self.receipt.chmod(0o600); self.receipt.write_bytes(original); self.receipt.chmod(0o400)
+        replacement = self.root / "replacement-receipt"
+        replacement.write_bytes(original); replacement.chmod(0o400)
+        real = candidate_module._verify_held_record
+        def replace(record, commit):
+            result = real(record, commit)
+            replacement.replace(self.receipt)
+            return result
+        with patch.object(candidate_module, "_verify_held_record", side_effect=replace):
+            with self.assertRaises(CandidateIntegrityError): self._verify_success()
+
+    def test_preexisting_receipt_and_publication_race_never_overwrite(self):
+        self.receipt.write_bytes(b"existing")
+        with self.assertRaises(CandidateIntegrityError): self._record_success()
+        self.assertEqual(self.receipt.read_bytes(), b"existing")
+        self.receipt.unlink()
+        real = candidate_module._rename_exclusive
+        def compete(fd, pending, leaf):
+            self.receipt.write_bytes(b"competitor")
+            return real(fd, pending, leaf)
+        with patch.object(candidate_module, "_rename_exclusive", side_effect=compete):
+            with self.assertRaises(CandidateIntegrityError): self._record_success()
+        self.assertEqual(self.receipt.read_bytes(), b"competitor")
+
+    def test_postpublication_failure_preserves_receipt_evidence(self):
+        real = candidate_module._verify_held_attempt
+        calls = 0
+        def fail_after_publication(receipt, record, commit):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise CandidateIntegrityError("injected")
+            return real(receipt, record, commit)
+        with patch.object(candidate_module, "_verify_held_attempt", side_effect=fail_after_publication):
+            with self.assertRaises(CandidateIntegrityError): self._record_success()
+        self.assertTrue(self.receipt.exists())
+        self.assertEqual(self._verify_success(), self.candidate)
+
+    def test_byte_identical_safe_record_and_receipt_copies_remain_valid(self):
+        self._record_success()
+        record_copy, receipt_copy = self.root / "record-copy", self.root / "receipt-copy"
+        record_copy.write_bytes(self.record.read_bytes()); record_copy.chmod(0o400)
+        receipt_copy.write_bytes(self.receipt.read_bytes()); receipt_copy.chmod(0o400)
+        with self._in_repository():
+            self.assertEqual(candidate_module.verify_successful_attempt(
+                receipt_copy, record_copy, self.commit), self.candidate)
+
+    def test_record_and_receipt_descriptors_are_held_through_complete_verification(self):
+        self._record_success()
+        original = self.record.read_bytes()
+        replacement = self.root / "replacement-record"
+        replacement.write_bytes(original); replacement.chmod(0o400)
+        real = candidate_module._require_git_sources
+        def replace(snapshot, commit):
+            real(snapshot, commit)
+            replacement.replace(self.record)
+        with patch.object(candidate_module, "_require_git_sources", side_effect=replace):
+            with self.assertRaises(CandidateIntegrityError): self._verify_success()
+
+
+class ReleaseCandidateCliTests(unittest.TestCase):
+    _git = CandidateManifestTests._git
+    _in_repository = CandidateManifestTests._in_repository
+    _prepare = CandidateAuthorityTests._prepare
+    _bind = CandidateAuthorityTests._bind
+
+    def setUp(self):
+        CandidateManifestTests.setUp(self)
+        self._prepare()
+        self._bind()
+        self.receipt = self.root / "success.json"
+
+    def _cli(self, *arguments):
+        environment = {**os.environ, "PYTHONPATH": str(Path(__file__).parents[1])}
+        return subprocess.run([sys.executable, "-B", "-m", "scripts.release_candidate", *arguments],
+                              cwd=self.repository, env=environment, capture_output=True, text=True)
+
+    def test_all_three_subcommands_are_silent_on_success(self):
+        verify = self._cli("verify", "--authority-record", str(self.record),
+                           "--expected-commit", self.commit)
+        record = self._cli("record-success", "--authority-record", str(self.record),
+                           "--expected-commit", self.commit, "--success-receipt", str(self.receipt))
+        success = self._cli("verify-success", "--authority-record", str(self.record),
+                            "--expected-commit", self.commit, "--success-receipt", str(self.receipt))
+        for result in (verify, record, success):
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+
+    def test_all_failures_emit_only_the_fixed_error_and_exit_nonzero(self):
+        commands = (("verify",), ("record-success",), ("verify-success",), ("unknown",), ())
+        for command in commands:
+            result = self._cli(*command)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(result.stderr, "candidate integrity verification failed\n")
 
 
 if __name__ == "__main__":

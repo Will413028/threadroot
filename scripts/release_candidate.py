@@ -11,6 +11,7 @@ import re
 import stat
 import subprocess
 import secrets
+import sys
 from typing import Any
 
 from scripts.release_archives import ReleaseArchiveError, _load_tar_members_payload
@@ -22,6 +23,7 @@ MAX_TOTAL_FILE_SIZE = 512 * 1024 * 1024
 MAX_PATH_BYTES = 4096
 MAX_MANIFEST_SIZE = 8 * 1024 * 1024
 MAX_RECORD_SIZE = 16 * 1024
+MAX_RECEIPT_SIZE = 4 * 1024
 MAX_UNSIGNED_64 = (1 << 64) - 1
 MIN_SIGNED_64 = -(1 << 63)
 MAX_SIGNED_64 = (1 << 63) - 1
@@ -745,3 +747,126 @@ def bind_candidate(candidate_root: Path, commit: str, authority_record: Path) ->
                 verify_candidate(destination, commit)
     except (OSError, ValueError, TypeError, KeyError, RecursionError, subprocess.SubprocessError) as error:
         raise _fail() from error
+
+
+def _parse_receipt(payload: bytes, expected_commit: str) -> dict[str, Any]:
+    data = _strict_document(payload, MAX_RECEIPT_SIZE)
+    if (set(data) != {"authority_record_sha256", "authority_record_size", "commit", "schema"}
+            or type(expected_commit) is not str or _COMMIT.fullmatch(expected_commit) is None
+            or data["commit"] != expected_commit
+            or type(data["commit"]) is not str or _COMMIT.fullmatch(data["commit"]) is None
+            or type(data["authority_record_sha256"]) is not str
+            or _DIGEST.fullmatch(data["authority_record_sha256"]) is None):
+        raise _fail()
+    _integer(data["schema"], 1, 1)
+    _integer(data["authority_record_size"], 1, MAX_RECORD_SIZE)
+    return data
+
+
+def _verify_held_attempt(receipt: _HeldFile, record: _HeldFile, expected_commit: str) -> Path:
+    data = _parse_receipt(receipt.payload, expected_commit)
+    if (data["authority_record_size"] != len(record.payload)
+            or data["authority_record_sha256"] != hashlib.sha256(record.payload).hexdigest()):
+        raise _fail()
+    root = _verify_held_record(record, expected_commit)
+    receipt.check()
+    record.check()
+    return root
+
+
+def record_successful_attempt(
+    authority_record: Path,
+    expected_commit: str,
+    success_receipt: Path,
+) -> None:
+    try:
+        record_path = _absolute_path(authority_record)
+        record_path = record_path.parent.resolve(strict=True) / record_path.name
+        with _hold_file(record_path, mode=0o400, maximum_size=MAX_RECORD_SIZE) as record:
+            root = _verify_held_record(record, expected_commit)
+            destination = validate_authority_path(success_receipt, root)
+            payload = _canonical_json({
+                "authority_record_sha256": hashlib.sha256(record.payload).hexdigest(),
+                "authority_record_size": len(record.payload),
+                "commit": expected_commit,
+                "schema": 1,
+            })
+            _parse_receipt(payload, expected_commit)
+            record.check()
+            _publish_exclusive(destination, payload, final_mode=0o400,
+                               maximum_size=MAX_RECEIPT_SIZE)
+            with _hold_file(destination, mode=0o400, maximum_size=MAX_RECEIPT_SIZE) as receipt:
+                _verify_held_attempt(receipt, record, expected_commit)
+    except (OSError, ValueError, TypeError, KeyError, RecursionError,
+            subprocess.SubprocessError) as error:
+        raise _fail() from error
+
+
+def verify_successful_attempt(
+    success_receipt: Path,
+    authority_record: Path,
+    expected_commit: str,
+) -> Path:
+    try:
+        record_path = _absolute_path(authority_record)
+        record_path = record_path.parent.resolve(strict=True) / record_path.name
+        receipt_path = _absolute_path(success_receipt)
+        receipt_path = receipt_path.parent.resolve(strict=True) / receipt_path.name
+        with ExitStack() as stack:
+            record = stack.enter_context(
+                _hold_file(record_path, mode=0o400, maximum_size=MAX_RECORD_SIZE)
+            )
+            receipt = stack.enter_context(
+                _hold_file(receipt_path, mode=0o400, maximum_size=MAX_RECEIPT_SIZE)
+            )
+            root = _verify_held_attempt(receipt, record, expected_commit)
+            if validate_authority_path(receipt_path, root, missing=False) != receipt_path:
+                raise _fail()
+            receipt.check()
+            record.check()
+            return root
+    except (OSError, ValueError, TypeError, KeyError, RecursionError,
+            subprocess.SubprocessError) as error:
+        raise _fail() from error
+
+
+def _cli_arguments(arguments: list[str]) -> tuple[str, dict[str, str]]:
+    if not arguments or arguments[0] not in {"verify", "record-success", "verify-success"}:
+        raise _fail()
+    command, tokens = arguments[0], arguments[1:]
+    required = {"--authority-record", "--expected-commit"}
+    if command != "verify":
+        required.add("--success-receipt")
+    if len(tokens) != 2 * len(required):
+        raise _fail()
+    values: dict[str, str] = {}
+    for index in range(0, len(tokens), 2):
+        option, value = tokens[index:index + 2]
+        if option not in required or option in values or not value:
+            raise _fail()
+        values[option] = value
+    if set(values) != required:
+        raise _fail()
+    return command, values
+
+
+def main(arguments: list[str] | None = None) -> int:
+    try:
+        command, values = _cli_arguments(sys.argv[1:] if arguments is None else arguments)
+        record = Path(values["--authority-record"])
+        commit = values["--expected-commit"]
+        if command == "verify":
+            verify_candidate(record, commit)
+        elif command == "record-success":
+            record_successful_attempt(record, commit, Path(values["--success-receipt"]))
+        else:
+            verify_successful_attempt(Path(values["--success-receipt"]), record, commit)
+        return 0
+    except (CandidateIntegrityError, OSError, ValueError, TypeError, KeyError,
+            RecursionError, subprocess.SubprocessError):
+        sys.stderr.write("candidate integrity verification failed\n")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
