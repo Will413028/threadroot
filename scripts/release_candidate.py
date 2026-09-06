@@ -12,7 +12,7 @@ import stat
 import subprocess
 import secrets
 import sys
-from typing import Any
+from typing import Any, Callable
 
 from scripts.release_archives import ReleaseArchiveError, _load_tar_members_payload
 
@@ -96,7 +96,7 @@ def _checked_path(path: PurePosixPath) -> str:
     value = path.as_posix()
     if (not value or value.startswith("/") or value in {".", ".."}
             or any(part in {"", ".", ".."} for part in path.parts)
-            or any(ord(character) < 32 or ord(character) == 127
+            or any(ord(character) < 32 or 127 <= ord(character) <= 159
                    or 0xD800 <= ord(character) <= 0xDFFF for character in value)
             or len(value.encode("utf-8")) > MAX_PATH_BYTES):
         raise _fail()
@@ -110,7 +110,10 @@ def _mode(metadata: os.stat_result) -> str:
     return f"0{permissions:03o}"
 
 
-def _open_dir_at(parent_fd: int, name: str) -> tuple[int, os.stat_result]:
+def _open_dir_at(
+    parent_fd: int, name: str, *,
+    identity: Callable[[os.stat_result], tuple[int, ...]] = _identity,
+) -> tuple[int, os.stat_result]:
     before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     if not stat.S_ISDIR(before.st_mode):
         raise _fail()
@@ -118,9 +121,12 @@ def _open_dir_at(parent_fd: int, name: str) -> tuple[int, os.stat_result]:
         name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
         dir_fd=parent_fd,
     )
-    if _identity(before) != _identity(os.fstat(descriptor)):
+    try:
+        if identity(before) != identity(os.fstat(descriptor)):
+            raise _fail()
+    except BaseException:
         os.close(descriptor)
-        raise _fail()
+        raise
     return descriptor, before
 
 
@@ -438,7 +444,7 @@ def _absolute_path(value: object) -> Path:
         raise _fail()
     raw = str(value)
     if (not raw or len(raw.encode("utf-8", errors="surrogatepass")) > MAX_PATH_BYTES
-            or any(ord(c) < 32 or ord(c) == 127 or 0xD800 <= ord(c) <= 0xDFFF for c in raw)):
+            or any(ord(c) < 32 or 127 <= ord(c) <= 159 or 0xD800 <= ord(c) <= 0xDFFF for c in raw)):
         raise _fail()
     path = Path(raw)
     if not path.is_absolute() or str(path) != raw or ".." in path.parts:
@@ -471,7 +477,7 @@ def _held_directory(path: Path):
         bindings = []
         for part in path.parts[1:]:
             parent = fd
-            fd, before = _open_dir_at(parent, part)
+            fd, before = _open_dir_at(parent, part, identity=_ancestor_identity)
             stack.callback(os.close, fd)
             bindings.append((parent, part, fd, _ancestor_identity(before)))
         def check():
@@ -853,14 +859,14 @@ def _cli_arguments(arguments: list[str]) -> tuple[str, dict[str, str]]:
 def main(arguments: list[str] | None = None) -> int:
     try:
         command, values = _cli_arguments(sys.argv[1:] if arguments is None else arguments)
-        record = Path(values["--authority-record"])
+        record = _absolute_path(values["--authority-record"])
         commit = values["--expected-commit"]
         if command == "verify":
             verify_candidate(record, commit)
         elif command == "record-success":
-            record_successful_attempt(record, commit, Path(values["--success-receipt"]))
+            record_successful_attempt(record, commit, _absolute_path(values["--success-receipt"]))
         else:
-            verify_successful_attempt(Path(values["--success-receipt"]), record, commit)
+            verify_successful_attempt(_absolute_path(values["--success-receipt"]), record, commit)
         return 0
     except (CandidateIntegrityError, OSError, ValueError, TypeError, KeyError,
             RecursionError, subprocess.SubprocessError):

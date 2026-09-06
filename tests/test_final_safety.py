@@ -28,6 +28,13 @@ DOCTOR_REMEDIATIONS = {
 }
 
 
+def _mutation_metadata(metadata):
+    """Reads may update atime; retain every field that represents mutation."""
+    return (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_nlink,
+            metadata.st_uid, metadata.st_gid, metadata.st_size,
+            metadata.st_mtime_ns, metadata.st_ctime_ns)
+
+
 class DoctorRemediationTests(unittest.TestCase):
     def test_content_inspection_io_preserves_exit_six(self):
         from threadroot import operations
@@ -36,12 +43,15 @@ class DoctorRemediationTests(unittest.TestCase):
             root = base / "vault"
             self.assertTrue(run_init(root, True, False, {}, base / "home").ok)
             real_check = operations.ensure_outside_secrets
+            config = root / ".second-brain/config.json"
+            config_bytes = config.read_bytes()
+            os.utime(config, ns=(1_000_000_000, config.stat().st_mtime_ns))
             def fail_content_check(vault, relative):
                 if relative == "daily":
                     raise ThreadrootError(ExitCode.IO_OR_DRIFT, "filesystem.failed",
                                           "Synthetic inspection failure.")
                 return real_check(vault, relative)
-            before = {path.relative_to(base): path.lstat()
+            before = {path.relative_to(base): _mutation_metadata(path.lstat())
                       for path in [base, *base.rglob("*")]}
             with patch.object(operations, "ensure_outside_secrets", side_effect=fail_content_check):
                 result = run_doctor(root)
@@ -51,8 +61,9 @@ class DoctorRemediationTests(unittest.TestCase):
             self.assertEqual(result.changes, ())
             self.assertEqual(result.issues[0].code, "filesystem.failed")
             self.assertTrue(result.issues[0].message.endswith(DOCTOR_REMEDIATIONS["filesystem.failed"]))
-            self.assertEqual(before, {path.relative_to(base): path.lstat()
+            self.assertEqual(before, {path.relative_to(base): _mutation_metadata(path.lstat())
                                       for path in [base, *base.rglob("*")]})
+            self.assertEqual(config.read_bytes(), config_bytes)
 
     def test_every_error_has_concrete_remediation(self):
         for scenario in ("missing-root", "file-root", "missing-marker", "malformed",
@@ -222,7 +233,10 @@ class EmptyPlanBoundaryTests(unittest.TestCase):
                     base = Path(temporary).resolve()
                     root = base / "vault"
                     self.assertTrue(run_init(root, True, False, {}, base / "home").ok)
-                    before = {path.relative_to(base): path.lstat()
+                    config = root / ".second-brain/config.json"
+                    config_bytes = config.read_bytes()
+                    os.utime(config, ns=(1_000_000_000, config.stat().st_mtime_ns))
+                    before = {path.relative_to(base): _mutation_metadata(path.lstat())
                               for path in [base, *base.rglob("*")]}
                     real_planned_root = operations._planned_root
                     def fail_resolution_at_apply(vault, plan):
@@ -244,8 +258,9 @@ class EmptyPlanBoundaryTests(unittest.TestCase):
                     }] if set_default else [])
                     self.assertEqual(result.issues[0].code, "filesystem.failed")
                     self.assertNotIn(str(root), render_json(result))
-                    self.assertEqual(before, {path.relative_to(base): path.lstat()
+                    self.assertEqual(before, {path.relative_to(base): _mutation_metadata(path.lstat())
                                               for path in [base, *base.rglob("*")]})
+                    self.assertEqual(config.read_bytes(), config_bytes)
 
     def test_empty_plan_keeps_success_and_categorized_errors(self):
         from threadroot import operations
@@ -459,7 +474,8 @@ class PointerSafetyTests(unittest.TestCase):
                             xdg = base / "xdg"
                             xdg.mkdir()
                             (xdg / "threadroot").symlink_to(pointer.parent, target_is_directory=True)
-                        before = pointer.lstat(), outside.stat(), outside.read_bytes()
+                        before = (_mutation_metadata(pointer.lstat()),
+                                  _mutation_metadata(outside.stat()), outside.read_bytes())
                         real_mkdir = Path.mkdir
                         mkdir_calls = []
                         def mkdir(path, *args, **kwargs):
@@ -478,7 +494,8 @@ class PointerSafetyTests(unittest.TestCase):
                         temporary_file.assert_not_called()
                         replace.assert_not_called()
                         self.assertTrue(pointer.is_symlink())
-                        self.assertEqual(before, (pointer.lstat(), outside.stat(), outside.read_bytes()))
+                        self.assertEqual(before, (_mutation_metadata(pointer.lstat()),
+                                                  _mutation_metadata(outside.stat()), outside.read_bytes()))
 
     def test_writer_rejects_terminal_entry_or_referent_inside_vault(self):
         for entry_inside, referent_inside in ((True, False), (False, True), (False, False)):
@@ -492,17 +509,19 @@ class PointerSafetyTests(unittest.TestCase):
                 pointer = xdg / "threadroot/config.json"
                 pointer.parent.mkdir(parents=True)
                 pointer.symlink_to(referent)
-                before = pointer.lstat(), referent.stat(), referent.read_bytes()
+                before = (_mutation_metadata(pointer.lstat()),
+                          _mutation_metadata(referent.stat()), referent.read_bytes())
                 if entry_inside or referent_inside:
                     with self.assertRaises(ThreadrootError) as caught:
                         write_default_pointer(vault, {"XDG_CONFIG_HOME": str(xdg)}, base / "home")
                     self.assertEqual(caught.exception.exit_code, ExitCode.UNSAFE_PATH)
-                    self.assertEqual(before, (pointer.lstat(), referent.stat(), referent.read_bytes()))
+                    self.assertEqual(before, (_mutation_metadata(pointer.lstat()),
+                                              _mutation_metadata(referent.stat()), referent.read_bytes()))
                 else:
                     write_default_pointer(vault, {"XDG_CONFIG_HOME": str(xdg)}, base / "home")
                     self.assertFalse(pointer.is_symlink())
                     self.assertEqual(json.loads(pointer.read_text()), {"default_vault": str(vault)})
-                    self.assertEqual(before[1:], (referent.stat(), referent.read_bytes()))
+                    self.assertEqual(before[1:], (_mutation_metadata(referent.stat()), referent.read_bytes()))
                 self.assertEqual(["config.json"], [path.name for path in pointer.parent.iterdir()])
 
     def test_direct_and_parent_symlink_overlap_are_zero_write(self):

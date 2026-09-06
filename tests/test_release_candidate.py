@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import json
 import hashlib
+import errno
 import os
 from pathlib import Path
 import shutil
@@ -234,6 +235,114 @@ class CandidateManifestTests(unittest.TestCase):
         with patch("scripts.release_candidate.MAX_TOTAL_FILE_SIZE", 1):
             with self.assertRaises(CandidateIntegrityError):
                 _parse_manifest(_canonical_json({**valid, "entries": files[:1]}), self.commit)
+
+    def test_c1_controls_are_rejected_during_manifest_capture_and_parse(self):
+        self._write()
+        valid = json.loads((self.candidate / candidate_module.MANIFEST_RELATIVE).read_bytes())
+        _parse_manifest(_canonical_json(valid), self.commit)
+        for character in ("\u0080", "\u0085", "\u009f"):
+            member = self.candidate / "build" / ("control" + character)
+            member.write_bytes(b"synthetic")
+            try:
+                with self.subTest(character=ord(character), phase="capture"):
+                    with self.assertRaises(CandidateIntegrityError):
+                        _capture_candidate(self.candidate)
+            finally:
+                member.unlink()
+            entry = {**valid["entries"][0], "path": "build/control" + character}
+            with self.subTest(character=ord(character), phase="parse"):
+                with self.assertRaises(CandidateIntegrityError):
+                    _parse_manifest(_canonical_json({**valid, "entries": [entry]}), self.commit)
+
+
+class DirectoryAcquisitionTests(unittest.TestCase):
+    def test_stable_ancestor_accepts_sibling_churn_but_tree_opener_rejects_it(self):
+        for ancestor in (True, False):
+            with self.subTest(ancestor=ancestor), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                target = base / "ancestor"
+                target.mkdir()
+                with candidate_module._held_directory(target):
+                    pass
+                before = target.stat()
+                real_open = os.open
+                fired = []
+                def churn(path, *args, **kwargs):
+                    if path == "ancestor" and not fired:
+                        (target / "unrelated-sibling").mkdir()
+                        fired.append(True)
+                    return real_open(path, *args, **kwargs)
+                with patch.object(candidate_module.os, "open", side_effect=churn):
+                    if ancestor:
+                        with candidate_module._held_directory(target):
+                            pass
+                    else:
+                        parent = real_open(base, os.O_RDONLY | os.O_DIRECTORY)
+                        try:
+                            with self.assertRaises(CandidateIntegrityError):
+                                candidate_module._open_dir_at(parent, "ancestor")
+                        finally:
+                            os.close(parent)
+                self.assertEqual(fired, [True])
+                self.assertEqual(candidate_module._ancestor_identity(before),
+                                 candidate_module._ancestor_identity(target.stat()))
+                self.assertNotEqual(candidate_module._identity(before),
+                                    candidate_module._identity(target.stat()))
+
+    def test_ancestor_acquisition_rejects_permission_and_replacement_drift(self):
+        for mutation in ("mode", "replacement", "symlink"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                target = base / "ancestor"
+                target.mkdir(mode=0o755)
+                real_open = os.open
+                fired = []
+                def mutate(path, *args, **kwargs):
+                    if path == "ancestor" and not fired:
+                        fired.append(True)
+                        if mutation == "mode":
+                            target.chmod(0o700)
+                        else:
+                            target.rename(base / "moved")
+                            if mutation == "replacement":
+                                target.mkdir(mode=0o755)
+                            else:
+                                target.symlink_to(base / "moved", target_is_directory=True)
+                    return real_open(path, *args, **kwargs)
+                with patch.object(candidate_module.os, "open", side_effect=mutate):
+                    with self.assertRaises((CandidateIntegrityError, OSError)):
+                        with candidate_module._held_directory(target):
+                            pass
+                self.assertEqual(fired, [True])
+
+    def test_initial_fstat_failure_closes_child_and_preserves_parent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            (base / "child").mkdir()
+            parent = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
+            real_open, real_fstat = os.open, os.fstat
+            acquired = []
+            def capture(*args, **kwargs):
+                descriptor = real_open(*args, **kwargs)
+                acquired.append(descriptor)
+                return descriptor
+            try:
+                with patch.object(candidate_module.os, "open", side_effect=capture), \
+                     patch.object(candidate_module.os, "fstat", side_effect=OSError(errno.EIO, "synthetic")):
+                    with self.assertRaises(OSError):
+                        candidate_module._open_dir_at(parent, "child")
+                self.assertTrue(stat.S_ISDIR(real_fstat(parent).st_mode))
+                self.assertEqual(len(acquired), 1)
+                with self.assertRaises(OSError) as caught:
+                    real_fstat(acquired[0])
+                self.assertEqual(caught.exception.errno, errno.EBADF)
+            finally:
+                os.close(parent)
+                for descriptor in acquired:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
 
 
 class CandidateAuthorityTests(unittest.TestCase):
@@ -490,6 +599,63 @@ class SuccessfulAttemptTests(unittest.TestCase):
         with self.assertRaises(CandidateIntegrityError):
             self._verify_success()
 
+    def test_c1_controls_are_rejected_in_record_root_and_external_arguments(self):
+        self._record_success()
+        self.assertEqual(self._verify_success(), self.candidate)
+        data = json.loads(self.record.read_bytes())
+        for character in ("\u0080", "\u0085", "\u009f"):
+            with self.subTest(character=ord(character), phase="record-root"):
+                with self.assertRaises(CandidateIntegrityError):
+                    candidate_module._parse_record(_canonical_json({
+                        **data, "candidate_root": str(self.candidate) + character}), self.commit)
+            record = self.root / ("authority" + character)
+            receipt = self.root / ("receipt" + character)
+            record.write_bytes(self.record.read_bytes())
+            record.chmod(0o400)
+            receipt.write_bytes(self.receipt.read_bytes())
+            receipt.chmod(0o400)
+            with self._in_repository():
+                for arguments in ((self.receipt, record), (receipt, self.record)):
+                    with self.subTest(character=ord(character), phase="verify", arguments=arguments):
+                        with self.assertRaises(CandidateIntegrityError):
+                            candidate_module.verify_successful_attempt(*arguments, self.commit)
+                with self.subTest(character=ord(character), phase="publish"):
+                    destination = self.root / ("new-receipt" + character)
+                    with self.assertRaises(CandidateIntegrityError):
+                        candidate_module.record_successful_attempt(self.record, self.commit, destination)
+                    self.assertFalse(destination.exists())
+
+    def test_receipt_schema_numeric_digest_commit_and_size_boundaries(self):
+        self._record_success()
+        valid = json.loads(self.receipt.read_bytes())
+        self.assertEqual(self._verify_success(), self.candidate)
+        for size in (1, 16384):
+            self.assertEqual(candidate_module._parse_receipt(_canonical_json({
+                **valid, "authority_record_size": size}), self.commit)["authority_record_size"], size)
+        mutations = {
+            "schema": (True, False, 0, 2, 1.0, "1"),
+            "authority_record_size": (True, False, 0, -1, 16385, 1.0, "1"),
+            "authority_record_sha256": (None, True, "A" * 64, "g" * 64, "0" * 63, "0" * 65),
+            "commit": (None, True, "A" * 40, "g" * 40, "0" * 39, "0" * 41, "0" * 40),
+        }
+        for key, values in mutations.items():
+            for value in values:
+                with self.subTest(key=key, value=value):
+                    with self.assertRaises(CandidateIntegrityError):
+                        candidate_module._parse_receipt(_canonical_json({**valid, key: value}), self.commit)
+        for size in (4096, 4097):
+            # A canonical, schema-invalid document isolates the bounded read:
+            # 4096 reaches parsing; 4097 must fail before JSON decoding.
+            payload = _canonical_json({"padding": "x" * (size - 15)})
+            self.assertEqual(len(payload), size)
+            self.receipt.chmod(0o600)
+            self.receipt.write_bytes(payload)
+            self.receipt.chmod(0o400)
+            with self.subTest(size=size), patch.object(candidate_module, "_parse_receipt", wraps=candidate_module._parse_receipt) as parse:
+                with self.assertRaises(CandidateIntegrityError):
+                    self._verify_success()
+                self.assertEqual(parse.call_count, 1 if size == 4096 else 0)
+
     def test_receipt_is_canonical_single_link_regular_0400_and_bounded(self):
         self._record_success()
         self.assertEqual(self.receipt.read_bytes(), _canonical_json(json.loads(self.receipt.read_bytes())))
@@ -604,6 +770,68 @@ class ReleaseCandidateCliTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(result.stdout, "")
             self.assertEqual(result.stderr, "candidate integrity verification failed\n")
+
+    def test_raw_lexical_paths_are_rejected_by_every_applicable_cli_option(self):
+        self.test_all_three_subcommands_are_silent_on_success()
+        saved_receipt = self.receipt.read_bytes()
+        for command in ("verify", "record-success", "verify-success"):
+            options = ("--authority-record",) if command == "verify" else ("--authority-record", "--success-receipt")
+            for option in options:
+                for separator, suffix in (("/./", ""), ("//", ""), ("/", "/")):
+                    with self.subTest(command=command, option=option, separator=separator, suffix=suffix):
+                        if command == "record-success":
+                            self.receipt.unlink(missing_ok=True)
+                        elif command == "verify-success" and not self.receipt.exists():
+                            self.receipt.write_bytes(saved_receipt)
+                            self.receipt.chmod(0o400)
+                        values = {"--authority-record": str(self.record), "--expected-commit": self.commit}
+                        if command != "verify":
+                            values["--success-receipt"] = str(self.receipt)
+                        path = Path(values[option])
+                        values[option] = str(path.parent) + separator + path.name + suffix
+                        result = self._cli(command, *(token for pair in values.items() for token in pair))
+                        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                         (1, "", "candidate integrity verification failed\n"))
+                        if command == "record-success":
+                            self.assertFalse(self.receipt.exists())
+                        self.assertFalse(list(self.root.glob(".*.pending")))
+
+    def test_unknown_duplicate_options_and_sensitive_malformed_metadata_are_sanitized(self):
+        self.test_all_three_subcommands_are_silent_on_success()
+        valid_receipt = self.root / "valid-success.json"
+        self.receipt.rename(valid_receipt)
+        sensitive = self.root / "synthetic-private-marker.json"
+        sensitive.write_bytes(b'{"synthetic-private-payload":"secret-marker"}\n')
+        sensitive.chmod(0o400)
+        matching_receipt = self.root / "matching-malformed-record.json"
+        matching_receipt.write_bytes(_canonical_json({
+            "schema": 1, "commit": self.commit,
+            "authority_record_size": sensitive.stat().st_size,
+            "authority_record_sha256": hashlib.sha256(sensitive.read_bytes()).hexdigest(),
+        }))
+        matching_receipt.chmod(0o400)
+        for command in ("verify", "record-success", "verify-success"):
+            valid = ["--authority-record", str(self.record), "--expected-commit", self.commit]
+            if command != "verify":
+                valid += ["--success-receipt", str(valid_receipt if command == "verify-success" else self.receipt)]
+            variants = [["--unknown", str(sensitive), *valid[2:]],
+                        ["--authority-record", str(sensitive), "--authority-record", str(sensitive), *valid[4:]]]
+            if command == "verify-success":
+                variants.extend([
+                    ["--authority-record", str(sensitive), "--expected-commit", self.commit,
+                     "--success-receipt", str(matching_receipt)],
+                    ["--authority-record", str(self.record), "--expected-commit", self.commit,
+                     "--success-receipt", str(sensitive)],
+                ])
+            else:
+                variants.append(["--authority-record", str(sensitive), *valid[2:]])
+            for arguments in variants:
+                with self.subTest(command=command, arguments=arguments):
+                    result = self._cli(command, *arguments)
+                    self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                     (1, "", "candidate integrity verification failed\n"))
+                    self.assertFalse(self.receipt.exists())
+                    self.assertFalse(list(self.root.glob(".*.pending")))
 
 
 if __name__ == "__main__":

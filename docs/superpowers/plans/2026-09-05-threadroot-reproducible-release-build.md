@@ -2927,10 +2927,14 @@ gh release view v0.1.0 \
   --repo Will413028/threadroot \
   --json assets,body,isDraft,isPrerelease,name,tagName,url \
   > "$threadroot_state_root/draft-after.json"
-jq -S '{assets: ([.assets[] | {name, size}] | sort_by(.name)), body, isDraft, isPrerelease, name, tagName, url}' \
+jq -eS 'if all(.assets[]; (.id | if type == "string" then test("\\S") else false end))
+  then {assets: ([.assets[] | {id, name, size, digest}] | sort_by(.name)), body, isDraft, isPrerelease, name, tagName, url}
+  else error("missing or invalid release asset identity") end' \
   "$threadroot_state_root/draft-before.json" \
   > "$threadroot_state_root/draft-before-contract.json"
-jq -S '{assets: ([.assets[] | {name, size}] | sort_by(.name)), body, isDraft, isPrerelease, name, tagName, url}' \
+jq -eS 'if all(.assets[]; (.id | if type == "string" then test("\\S") else false end))
+  then {assets: ([.assets[] | {id, name, size, digest}] | sort_by(.name)), body, isDraft, isPrerelease, name, tagName, url}
+  else error("missing or invalid release asset identity") end' \
   "$threadroot_state_root/draft-after.json" \
   > "$threadroot_state_root/draft-after-contract.json"
 cmp "$threadroot_state_root/draft-before-contract.json" \
@@ -2953,6 +2957,15 @@ trap - EXIT
 Also require every API-reported size to equal its selected local file and the
 local/remote peeled tag to equal the saved commit. Leave the draft unpublished
 on any mismatch.
+
+The `gh release view --json assets` export uses a string `id` from the server's
+asset `node_id`, and a nullable `digest` (see the
+[gh 2.99.0 export implementation](https://github.com/cli/cli/blob/v2.99.0/pkg/cmd/release/shared/fetch.go)).
+The before/after and prepublish contracts require a nonempty string identity
+for every asset and compare both `id` and `digest` along with name and size.
+An unavailable digest may be null; an unavailable identity stops the workflow.
+This detects a same-name, same-size remote replacement after download and
+before the final metadata read.
 
 ---
 
@@ -3085,7 +3098,9 @@ gh release view v0.1.0 \
   --repo Will413028/threadroot \
   --json assets,body,isDraft,isPrerelease,name,tagName,url \
   > "$threadroot_state_root/draft-prepublish.json"
-jq -S '{assets: ([.assets[] | {name, size}] | sort_by(.name)), body, isDraft, isPrerelease, name, tagName, url}' \
+jq -eS 'if all(.assets[]; (.id | if type == "string" then test("\\S") else false end))
+  then {assets: ([.assets[] | {id, name, size, digest}] | sort_by(.name)), body, isDraft, isPrerelease, name, tagName, url}
+  else error("missing or invalid release asset identity") end' \
   "$threadroot_state_root/draft-prepublish.json" \
   > "$threadroot_state_root/draft-prepublish-contract.json"
 cmp "$threadroot_state_root/draft-after-contract.json" \

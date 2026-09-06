@@ -311,6 +311,7 @@ else:
     _write_executable(
         fake_bin / "gh",
         """#!/usr/bin/env python3
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -361,6 +362,21 @@ elif args[:2] == ["release", "download"]:
     destination = Path(args[args.index("--dir") + 1])
     source = Path(os.environ["FAKE_DRAFT_ASSET_ROOT"]) / pattern
     shutil.copyfile(source, destination / pattern)
+    mutation = os.environ.get("FAKE_POST_DOWNLOAD_MUTATION")
+    if mutation and pattern == "threadroot-codex-0.1.0.zip":
+        wheel = source.parent / "threadroot-0.1.0-py3-none-any.whl"
+        payload = wheel.read_bytes()
+        wheel.write_bytes(bytes([payload[0] ^ 1]) + payload[1:])
+        metadata = Path(os.environ["FAKE_RELEASE_JSON"])
+        release = json.loads(metadata.read_text())
+        asset = next(item for item in release["assets"] if item["name"] == wheel.name)
+        if mutation.startswith("replacement"):
+            asset["id"] = "RA_synthetic_replacement"
+        if mutation != "replacement-without-digest":
+            asset["digest"] = "sha256:" + hashlib.sha256(wheel.read_bytes()).hexdigest()
+        metadata.write_text(json.dumps(release))
+        with Path(os.environ["THREADROOT_TEST_CALL_LOG"]).open("a") as stream:
+            stream.write("remote mutation after final download\\n")
 elif args[:2] == ["release", "edit"]:
     print("published")
 else:
@@ -413,13 +429,16 @@ def _write_sha256sums(destination: Path, selected: Path) -> None:
     )
 
 
-def _write_release_contract(destination: Path, selected: Path) -> Path:
+def _write_release_metadata(destination: Path, selected: Path) -> Path:
     release = {
         "assets": [
-            {"name": name, "size": (selected / name).stat().st_size}
-            for name in sorted(EXPECTED_RELEASE_ASSETS)
+            {"name": name, "size": (selected / name).stat().st_size,
+             "id": f"RA_synthetic_{index}",
+             "apiUrl": f"https://api.github.com/repos/synthetic/release/releases/assets/{index}",
+             "digest": "sha256:" + hashlib.sha256((selected / name).read_bytes()).hexdigest()}
+            for index, name in enumerate(sorted(EXPECTED_RELEASE_ASSETS), 1)
         ],
-        "body": "synthetic release body",
+        "body": RELEASE_NOTES.read_text(encoding="utf-8"),
         "isDraft": True,
         "isPrerelease": False,
         "name": "Threadroot v0.1.0",
@@ -428,19 +447,6 @@ def _write_release_contract(destination: Path, selected: Path) -> Path:
     }
     release_json = destination / "release.json"
     release_json.write_text(json.dumps(release), encoding="utf-8")
-    contract = {
-        "assets": release["assets"],
-        "body": release["body"],
-        "isDraft": release["isDraft"],
-        "isPrerelease": release["isPrerelease"],
-        "name": release["name"],
-        "tagName": release["tagName"],
-        "url": release["url"],
-    }
-    (destination / "draft-after-contract.json").write_text(
-        json.dumps(contract, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
     return release_json
 
 
@@ -1238,14 +1244,108 @@ os.execv(os.environ["THREADROOT_REAL_PYTHON"],
         self.assertNotIn("gh release create ", self.calls())
         self.assertEqual(self.calls().count("release_candidate verify-success"), 2)
 
-    def prepare_draft(self):
+    def prepare_draft(self, *, digest_available=True):
         selected = self.candidate / "build/selected"
-        download = self.directory / "draft-download"
-        shutil.copytree(selected, download)
-        (self.state / "draft-download-root.txt").write_text(str(download) + "\n")
-        release_json = _write_release_contract(self.state, selected)
-        return {"FAKE_RELEASE_JSON": str(release_json),
-                "FAKE_DRAFT_ASSET_ROOT": str(download)}
+        remote = self.directory / "remote-draft"
+        shutil.copytree(selected, remote)
+        release_json = _write_release_metadata(self.state, selected)
+        if not digest_available:
+            metadata = json.loads(release_json.read_text())
+            for asset in metadata["assets"]:
+                asset["digest"] = None
+            release_json.write_text(json.dumps(metadata))
+        environment = {"FAKE_RELEASE_JSON": str(release_json),
+                       "FAKE_DRAFT_ASSET_ROOT": str(remote)}
+        result = self.run_block(11, 4, **environment)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.call_log.write_text("")
+        Path(str(self.call_log) + ".verify-count").write_text("0")
+        return environment
+
+    def test_task_12_post_download_remote_replacement_cannot_publish(self):
+        for mutation in ("replacement", "digest-only", "replacement-without-digest"):
+            with self.subTest(mutation=mutation):
+                case = ReleaseAuthorityFlowTests()
+                case.setUp()
+                try:
+                    case.bind_state()
+                    environment = case.prepare_draft(digest_available=mutation != "replacement-without-digest")
+                    result = case.run_block(12, 2, **environment, FAKE_POST_DOWNLOAD_MUTATION=mutation)
+                    calls = case.calls().splitlines()
+                    downloads = [i for i, line in enumerate(calls) if line.startswith("gh release download ")]
+                    views = [i for i, line in enumerate(calls) if line.startswith("gh release view ")]
+                    self.assertEqual(len(downloads), 4)
+                    self.assertEqual(len(views), 1)
+                    self.assertLess(downloads[-1], calls.index("remote mutation after final download"))
+                    self.assertLess(calls.index("remote mutation after final download"), views[0])
+                    selected = case.candidate / "build/selected/threadroot-0.1.0-py3-none-any.whl"
+                    remote = Path(environment["FAKE_DRAFT_ASSET_ROOT"]) / selected.name
+                    fresh_roots = list(case.directory.glob("threadroot-v010-publish-download-*"))
+                    self.assertEqual(len(fresh_roots), 1)
+                    self.assertEqual((fresh_roots[0] / selected.name).read_bytes(), selected.read_bytes())
+                    self.assertEqual(remote.stat().st_size, selected.stat().st_size)
+                    self.assertNotEqual(remote.read_bytes(), selected.read_bytes())
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertNotIn("gh release edit ", case.calls())
+                    self.assertFalse((case.state / "publish-download-root.txt").exists())
+                finally:
+                    case.doCleanups()
+
+    def test_task_11_post_download_remote_replacement_cannot_bind_draft(self):
+        self.bind_state()
+        metadata = _write_release_metadata(self.state, self.candidate / "build/selected")
+        remote = self.directory / "remote-draft"
+        shutil.copytree(self.candidate / "build/selected", remote)
+        result = self.run_block(11, 4, FAKE_RELEASE_JSON=str(metadata),
+                                FAKE_DRAFT_ASSET_ROOT=str(remote), FAKE_POST_DOWNLOAD_MUTATION="replacement")
+        calls = self.calls().splitlines()
+        self.assertEqual(sum(line.startswith("gh release download ") for line in calls), 4)
+        self.assertEqual(sum(line.startswith("gh release view ") for line in calls), 2)
+        self.assertIn("remote mutation after final download", calls)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((self.state / "draft-download-root.txt").exists())
+
+    def test_task_11_requires_nonempty_string_asset_identity(self):
+        for identity in (None, "", "   ", 42, True, "missing"):
+            with self.subTest(identity=identity):
+                case = ReleaseAuthorityFlowTests()
+                case.setUp()
+                try:
+                    case.bind_state()
+                    metadata = _write_release_metadata(case.state, case.candidate / "build/selected")
+                    release = json.loads(metadata.read_text())
+                    if identity == "missing":
+                        del release["assets"][0]["id"]
+                    else:
+                        release["assets"][0]["id"] = identity
+                    metadata.write_text(json.dumps(release))
+                    result = case.run_block(11, 4, FAKE_RELEASE_JSON=str(metadata),
+                                            FAKE_DRAFT_ASSET_ROOT=str(case.candidate / "build/selected"))
+                    self.assertIn("gh release view ", case.calls())
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertFalse((case.state / "draft-download-root.txt").exists())
+                finally:
+                    case.doCleanups()
+
+    def test_task_11_and_12_accept_asset_identity_without_optional_digest(self):
+        self.bind_state()
+        selected = self.candidate / "build/selected"
+        metadata = _write_release_metadata(self.state, selected)
+        release = json.loads(metadata.read_text())
+        for asset in release["assets"]:
+            asset["digest"] = None
+        metadata.write_text(json.dumps(release))
+        remote = self.directory / "remote-draft"
+        shutil.copytree(selected, remote)
+        environment = {"FAKE_RELEASE_JSON": str(metadata), "FAKE_DRAFT_ASSET_ROOT": str(remote)}
+        draft = self.run_block(11, 4, **environment)
+        self.assertEqual(draft.returncode, 0, draft.stdout + draft.stderr)
+        for asset in release["assets"]:
+            del asset["digest"]
+        metadata.write_text(json.dumps(release))
+        result = self.run_block(12, 2, **environment)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("gh release edit ", self.calls())
 
     def test_task_12_drift_before_publish_stops_mutator(self):
         self.bind_state()
@@ -1394,7 +1494,7 @@ os.execv(os.environ["THREADROOT_REAL_PYTHON"],
         self.assertEqual(len(publishes), 1)
         self.assertLess(downloads[-1], publishes[0])
         bound = Path((self.state / "publish-download-root.txt").read_text().strip())
-        self.assertNotEqual(bound, self.directory / "draft-download")
+        self.assertNotEqual(bound, Path((self.state / "draft-download-root.txt").read_text().strip()))
         for name in EXPECTED_RELEASE_ASSETS:
             self.assertEqual((bound / name).read_bytes(), (self.candidate / "build/selected" / name).read_bytes())
 
@@ -1485,13 +1585,14 @@ os.execv(os.environ["THREADROOT_REAL_PYTHON"],
                     case.bind_state()
                     environment = case.prepare_draft()
                     current = case.directory / "current-draft"
-                    shutil.copytree(case.directory / "draft-download", current)
+                    draft_download = Path((case.state / "draft-download-root.txt").read_text().strip())
+                    shutil.copytree(draft_download, current)
                     environment["FAKE_DRAFT_ASSET_ROOT"] = str(current)
                     binding = case.state / "publish-download-root.txt"
                     if scenario == "main-drift":
                         environment["FAKE_REMOTE_MAIN"] = "9" * 40
                     elif scenario == "selected-and-old-download-drift":
-                        for root in (case.candidate / "build/selected", case.directory / "draft-download"):
+                        for root in (case.candidate / "build/selected", draft_download):
                             (root / "threadroot-codex-0.1.0.zip").write_bytes(b"same drift")
                     elif scenario == "current-draft-same-size-drift":
                         member = current / "threadroot-codex-0.1.0.zip"
