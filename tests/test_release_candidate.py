@@ -267,6 +267,14 @@ class CandidateAuthorityTests(unittest.TestCase):
         self.assertEqual(data["manifest"]["sha256"], hashlib.sha256(
             (self.candidate / "build/evidence/candidate-integrity.json").read_bytes()).hexdigest())
 
+    def test_sticky_temporary_parent_allows_binding_and_verification(self):
+        self._prepare()
+        self.root.chmod(0o1777)
+        self.assertEqual(stat.S_IMODE(self.root.stat().st_mode), 0o1777)
+        self._bind()
+        self.assertEqual(self._verify(), self.candidate)
+        self.assertEqual(json.loads(self.record.read_bytes())["candidate"]["mode"], "0755")
+
     def test_record_is_canonical_single_link_regular_0400_and_bounded(self):
         self._prepare()
         self._bind()

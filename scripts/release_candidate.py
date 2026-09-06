@@ -451,6 +451,14 @@ def _directory_identity(metadata: os.stat_result) -> dict[str, object]:
                 gid=metadata.st_gid, mode=_mode(metadata))
 
 
+def _ancestor_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    """Filesystem ancestor modes include sticky/setgid bits, unlike wire modes."""
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise _fail()
+    return (metadata.st_dev, metadata.st_ino, metadata.st_uid, metadata.st_gid,
+            metadata.st_mode)
+
+
 @contextmanager
 def _held_directory(path: Path):
     """Hold every real ancestor and detect renames or permission drift."""
@@ -463,11 +471,11 @@ def _held_directory(path: Path):
             parent = fd
             fd, before = _open_dir_at(parent, part)
             stack.callback(os.close, fd)
-            bindings.append((parent, part, fd, _directory_identity(before)))
+            bindings.append((parent, part, fd, _ancestor_identity(before)))
         def check():
             for parent, part, child, identity in bindings:
-                if (_directory_identity(os.fstat(child)) != identity
-                        or _directory_identity(os.stat(part, dir_fd=parent, follow_symlinks=False)) != identity):
+                if (_ancestor_identity(os.fstat(child)) != identity
+                        or _ancestor_identity(os.stat(part, dir_fd=parent, follow_symlinks=False)) != identity):
                     raise _fail()
         check()
         yield fd, check
