@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -293,14 +294,15 @@ elif args and args[0] == "show-ref":
 elif args and args[0] == "ls-remote":
     if os.environ.get("FAKE_LS_REMOTE_EXIT"):
         raise SystemExit(int(os.environ["FAKE_LS_REMOTE_EXIT"]))
-    if os.environ.get("FAKE_LS_REMOTE_EMPTY") == "1":
+    if os.environ.get("FAKE_LS_REMOTE_EMPTY") == "1" and not Path(os.environ["THREADROOT_TEST_CALL_LOG"] + ".tag-pushed").exists():
         raise SystemExit(0)
     commit = os.environ.get("FAKE_TAG_COMMIT", os.environ.get("FAKE_RELEASE_COMMIT", "3" * 40))
     print(f"{commit}\\trefs/tags/v0.1.0^{{}}")
 elif args and args[0] in {"fetch", "merge-base"}:
     raise SystemExit(int(os.environ.get("FAKE_GIT_READ_EXIT", "0")))
 elif args and args[0] in {"tag", "push"}:
-    pass
+    if args[0] == "push" and any("refs/tags/" in arg for arg in args):
+        Path(os.environ["THREADROOT_TEST_CALL_LOG"] + ".tag-pushed").touch()
 else:
     print(f"unsupported fake git command: {shlex.join(args)}", file=sys.stderr)
     raise SystemExit(97)
@@ -338,6 +340,12 @@ elif args[:2] == ["pr", "checks"]:
         print(json.dumps(checks))
 elif args[:2] == ["pr", "diff"]:
     print("synthetic diff")
+elif args[:2] == ["pr", "list"]:
+    print(os.environ.get("FAKE_EXISTING_PR", ""))
+elif args[:2] == ["pr", "create"]:
+    print("https://example.invalid/pr/1")
+elif args[:2] == ["pr", "edit"]:
+    pass
 elif args[:2] == ["pr", "merge"]:
     print("merged")
 elif args[:2] == ["release", "create"]:
@@ -368,6 +376,7 @@ def _run_release_plan_block(
     directory: Path,
     fake_bin: Path,
     call_log: Path,
+    repository: Path | None = None,
     **environment: str,
 ) -> subprocess.CompletedProcess[str]:
     sandboxed = block.replace(
@@ -382,20 +391,15 @@ def _run_release_plan_block(
     run_environment.update(environment)
     run_environment["PATH"] = f"{fake_bin}{os.pathsep}{run_environment['PATH']}"
     run_environment["THREADROOT_TEST_CALL_LOG"] = str(call_log)
+    run_environment["PYTHONPATH"] = str(Path.cwd().resolve()) + os.pathsep + str(Path.cwd().resolve() / "src")
     return subprocess.run(
         ["/bin/bash", "-c", sandboxed],
-        cwd=Path.cwd(),
+        cwd=repository or Path.cwd(),
         env=run_environment,
         text=True,
         capture_output=True,
         check=False,
     )
-
-
-def _write_selected_artifacts(selected: Path, marker: bytes) -> None:
-    selected.mkdir(parents=True)
-    for name in sorted(EXPECTED_RELEASE_ASSETS):
-        (selected / name).write_bytes(marker + b":" + name.encode("utf-8"))
 
 
 def _write_sha256sums(destination: Path, selected: Path) -> None:
@@ -473,13 +477,6 @@ elif test "$*" = "plugin list --json"; then
   printf '%s\\n' '{{"plugins":["threadroot@threadroot"]}}'
 fi
 """,
-    )
-
-
-def _write_task_10_checksum(path: Path) -> None:
-    path.with_suffix(".before").write_text(
-        f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path}\n",
-        encoding="utf-8",
     )
 
 
@@ -920,867 +917,6 @@ if phase == "record-success":
                         syntax.stdout + syntax.stderr,
                     )
 
-    def test_task_10_cli_smoke_validation_runs_in_a_fresh_shell(self) -> None:
-        plan = REPRODUCIBLE_RELEASE_PLAN.read_text(encoding="utf-8")
-        block = _release_plan_bash_block(plan, 10, 3, 1)
-
-        with TemporaryDirectory() as directory_name:
-            directory = Path(directory_name)
-            fake_bin, call_log = _fake_release_commands(directory)
-            state_root = directory / "threadroot-v010-release-state-20260905"
-            final_root = directory / "final"
-            smoke_root = final_root / "cli-smoke"
-            smoke_home = smoke_root / "home"
-            smoke_xdg = smoke_root / "xdg"
-            smoke_vault = smoke_root / "vault"
-            state_root.mkdir()
-            smoke_home.mkdir(parents=True)
-            smoke_xdg.mkdir()
-            (smoke_vault / "daily").mkdir(parents=True)
-            (smoke_vault / "daily" / "2042-04-03.md").write_bytes(b"")
-            (state_root / "final-root.txt").write_text(
-                f"{final_root}\n", encoding="utf-8"
-            )
-            sentinel = smoke_root / "sentinel.txt"
-            sentinel.write_text("unrelated sentinel\n", encoding="utf-8")
-            _write_task_10_checksum(sentinel)
-
-            document_names = (
-                "init-preview.json",
-                "init-apply.json",
-                "doctor.json",
-                "claim-preview.json",
-                "claim-apply.json",
-                "claim-repeat.json",
-            )
-            commands = ("init", "init", "doctor", "claim", "claim", "claim")
-            applied = (False, True, False, False, True, False)
-            for index, (name, command, was_applied) in enumerate(
-                zip(document_names, commands, applied, strict=True)
-            ):
-                (smoke_root / name).write_text(
-                    json.dumps(
-                        {
-                            "ok": index != 5,
-                            "command": command,
-                            "applied": was_applied,
-                            "vault": str(smoke_vault),
-                            "changes": [],
-                            "issues": (
-                                [] if index != 5 else [{"code": "target.conflict"}]
-                            ),
-                        }
-                    ),
-                    encoding="utf-8",
-                )
-
-            result = _run_release_plan_block(
-                block,
-                directory,
-                fake_bin,
-                call_log,
-            )
-
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertTrue((smoke_root / "vault-pristine").is_dir())
-
-    def test_task_10_host_validation_runs_in_a_fresh_shell(self) -> None:
-        plan = REPRODUCIBLE_RELEASE_PLAN.read_text(encoding="utf-8")
-        block = _release_plan_bash_block(plan, 10, 4, 1)
-
-        with TemporaryDirectory() as directory_name:
-            directory = Path(directory_name)
-            fake_bin, call_log = _fake_release_commands(directory)
-            _write_task_10_host_fake(fake_bin, "claude")
-            _write_task_10_host_fake(fake_bin, "codex")
-            state_root = directory / "threadroot-v010-release-state-20260905"
-            final_root = directory / "final"
-            smoke_root = final_root / "cli-smoke"
-            host_root = final_root / "host-smoke"
-            state_root.mkdir()
-            smoke_root.mkdir(parents=True)
-            for name in (
-                "claude-bundle",
-                "codex-bundle",
-                "claude-home",
-                "claude-config",
-                "claude-cache",
-                "codex-home",
-                "codex-config",
-                "codex-data",
-                "codex-cache",
-                "codex-state",
-                "claude-tmp",
-                "codex-tmp",
-            ):
-                (host_root / name).mkdir(parents=True)
-            (state_root / "final-root.txt").write_text(
-                f"{final_root}\n", encoding="utf-8"
-            )
-
-            result = _run_release_plan_block(
-                block,
-                directory,
-                fake_bin,
-                call_log,
-            )
-
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(
-                (smoke_root / "claude-version.txt").read_text(encoding="utf-8"),
-                "claude 1.0.0\n",
-            )
-            self.assertEqual(
-                (smoke_root / "codex-version.txt").read_text(encoding="utf-8"),
-                "codex 1.0.0\n",
-            )
-            self.assertTrue((host_root / "claude-list-installed.json").is_file())
-            self.assertTrue((host_root / "codex-list-installed.json").is_file())
-
-    def test_task_10_uninstall_runs_in_a_fresh_shell(self) -> None:
-        plan = REPRODUCIBLE_RELEASE_PLAN.read_text(encoding="utf-8")
-        block = _release_plan_bash_block(plan, 10, 5)
-
-        with TemporaryDirectory() as directory_name:
-            directory = Path(directory_name)
-            fake_bin, call_log = _fake_release_commands(directory)
-            _write_task_10_host_fake(fake_bin, "claude")
-            _write_task_10_host_fake(fake_bin, "codex")
-            state_root = directory / "threadroot-v010-release-state-20260905"
-            final_root = directory / "final"
-            smoke_root = final_root / "cli-smoke"
-            smoke_vault = smoke_root / "vault"
-            host_root = final_root / "host-smoke"
-            state_root.mkdir()
-            (state_root / "final-root.txt").write_text(
-                f"{final_root}\n", encoding="utf-8"
-            )
-            wheel_python = final_root / "wheel-smoke-venv" / "bin" / "python"
-            wheel_python.parent.mkdir(parents=True)
-            _write_executable(
-                wheel_python,
-                """#!/bin/bash
-set -euo pipefail
-if test "$*" = "-m pip uninstall -y threadroot"; then
-  exit 0
-fi
-if test "$*" = "-c import threadroot"; then
-  exit 1
-fi
-exit 97
-""",
-            )
-            (smoke_vault / "daily").mkdir(parents=True)
-            (smoke_vault / "daily" / "2042-04-03.md").write_bytes(b"")
-            (smoke_root / "vault-pristine" / "daily").mkdir(parents=True)
-            (smoke_root / "vault-pristine" / "daily" / "2042-04-03.md").write_bytes(
-                b""
-            )
-            sentinel = smoke_root / "sentinel.txt"
-            sentinel.write_text("unrelated sentinel\n", encoding="utf-8")
-            _write_task_10_checksum(sentinel)
-            for name in ("claude-bundle", "codex-bundle"):
-                bundle = host_root / name
-                pristine = host_root / f"{name}-pristine"
-                bundle.mkdir(parents=True)
-                pristine.mkdir()
-                (bundle / "manifest.txt").write_text("same\n", encoding="utf-8")
-                (pristine / "manifest.txt").write_text(
-                    "same\n", encoding="utf-8"
-                )
-            for name in (
-                "claude-home",
-                "claude-config",
-                "claude-cache",
-                "codex-home",
-                "codex-config",
-                "codex-data",
-                "codex-cache",
-                "codex-state",
-                "claude-tmp",
-                "codex-tmp",
-            ):
-                (host_root / name).mkdir(parents=True)
-
-            result = _run_release_plan_block(
-                block,
-                directory,
-                fake_bin,
-                call_log,
-            )
-
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertTrue((host_root / "claude-list-removed.json").is_file())
-            self.assertTrue((host_root / "codex-list-removed.json").is_file())
-            self.assertTrue((smoke_root / "sentinel.after-uninstall").is_file())
-
-    def test_task_7_binding_rejects_candidate_commit_without_writing_authority(
-        self,
-    ) -> None:
-        plan = REPRODUCIBLE_RELEASE_PLAN.read_text(encoding="utf-8")
-        block = _release_plan_bash_block(plan, 7, 4)
-        reviewed_head = "1" * 40
-        with TemporaryDirectory() as directory_name:
-            directory = Path(directory_name)
-            fake_bin, call_log = _fake_release_commands(directory)
-            candidate_root = directory / "candidate"
-            evidence = candidate_root / "build" / "evidence"
-            evidence.mkdir(parents=True)
-            (evidence / "build.json").write_text(
-                json.dumps({"commit": "2" * 40}),
-                encoding="utf-8",
-            )
-            candidate_record = (
-                directory / f"threadroot-v010-candidate-{reviewed_head}.txt"
-            )
-            candidate_record.write_text(f"{candidate_root}\n", encoding="utf-8")
-
-            result = _run_release_plan_block(
-                block,
-                directory,
-                fake_bin,
-                call_log,
-                FAKE_GIT_HEAD=reviewed_head,
-            )
-
-            state_root = directory / "threadroot-v010-release-state-20260905"
-            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertNotIn("unsupported fake", result.stderr)
-            self.assertFalse(
-                state_root.exists(),
-                "a rejected candidate must not create the authority directory",
-            )
-
-    def test_task_7_binding_reloads_successful_candidate_in_new_shell(self) -> None:
-        plan = REPRODUCIBLE_RELEASE_PLAN.read_text(encoding="utf-8")
-        block = _release_plan_bash_block(plan, 7, 4)
-        reviewed_head = "1" * 40
-        with TemporaryDirectory() as directory_name:
-            directory = Path(directory_name)
-            fake_bin, call_log = _fake_release_commands(directory)
-            candidate_root = directory / "candidate"
-            selected = candidate_root / "build" / "selected"
-            _write_selected_artifacts(selected, b"approved")
-            _write_sha256sums(
-                candidate_root / "build" / "evidence" / "SHA256SUMS",
-                selected,
-            )
-            (candidate_root / "build" / "evidence" / "build.json").write_text(
-                json.dumps({"commit": reviewed_head}),
-                encoding="utf-8",
-            )
-            candidate_record = (
-                directory / f"threadroot-v010-candidate-{reviewed_head}.txt"
-            )
-            candidate_record.write_text(f"{candidate_root}\n", encoding="utf-8")
-
-            result = _run_release_plan_block(
-                block,
-                directory,
-                fake_bin,
-                call_log,
-                FAKE_GIT_HEAD=reviewed_head,
-            )
-
-            state_root = directory / "threadroot-v010-release-state-20260905"
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(
-                (state_root / "candidate-root.txt").read_text(encoding="utf-8"),
-                f"{candidate_root}\n",
-            )
-            self.assertEqual(
-                (state_root / "reviewed-head.txt").read_text(encoding="utf-8"),
-                f"{reviewed_head}\n",
-            )
-
-    def test_task_8_pr_approval_rejects_local_head_drift_without_authority_write(
-        self,
-    ) -> None:
-        plan = REPRODUCIBLE_RELEASE_PLAN.read_text(encoding="utf-8")
-        block = _release_plan_bash_block(plan, 8, 3)
-        reviewed_head = "1" * 40
-        changed_head = "2" * 40
-        with TemporaryDirectory() as directory_name:
-            directory = Path(directory_name)
-            fake_bin, call_log = _fake_release_commands(directory)
-            state_root = directory / "threadroot-v010-release-state-20260905"
-            candidate_root = directory / "candidate"
-            evidence = candidate_root / "build" / "evidence"
-            evidence.mkdir(parents=True)
-            (evidence / "build.json").write_text(
-                json.dumps({"commit": reviewed_head}),
-                encoding="utf-8",
-            )
-            state_root.mkdir()
-            (state_root / "candidate-root.txt").write_text(
-                f"{candidate_root}\n", encoding="utf-8"
-            )
-            (state_root / "reviewed-head.txt").write_text(
-                f"{reviewed_head}\n", encoding="utf-8"
-            )
-            (state_root / "pr-url.txt").write_text(
-                "https://example.invalid/pr/1\n", encoding="utf-8"
-            )
-
-            result = _run_release_plan_block(
-                block,
-                directory,
-                fake_bin,
-                call_log,
-                FAKE_GIT_HEAD=changed_head,
-                FAKE_PR_HEAD=changed_head,
-            )
-
-            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertNotIn("unsupported fake", result.stderr)
-            self.assertFalse(
-                (state_root / "approved-pr-head.txt").exists(),
-                "local HEAD drift must not become approved authority",
-            )
-
-    def test_task_9_merge_rejects_pr_authority_not_bound_to_reviewed_head(
-        self,
-    ) -> None:
-        plan = REPRODUCIBLE_RELEASE_PLAN.read_text(encoding="utf-8")
-        block = _release_plan_bash_block(plan, 9, 1)
-        reviewed_head = "1" * 40
-        unreviewed_head = "2" * 40
-        with TemporaryDirectory() as directory_name:
-            directory = Path(directory_name)
-            fake_bin, call_log = _fake_release_commands(directory)
-            state_root = directory / "threadroot-v010-release-state-20260905"
-            state_root.mkdir()
-            (state_root / "reviewed-head.txt").write_text(
-                f"{reviewed_head}\n", encoding="utf-8"
-            )
-            (state_root / "approved-pr-head.txt").write_text(
-                f"{unreviewed_head}\n", encoding="utf-8"
-            )
-            (state_root / "pr-url.txt").write_text(
-                "https://example.invalid/pr/1\n", encoding="utf-8"
-            )
-
-            result = _run_release_plan_block(
-                block,
-                directory,
-                fake_bin,
-                call_log,
-                FAKE_PR_HEAD=unreviewed_head,
-            )
-
-            calls = call_log.read_text(encoding="utf-8") if call_log.exists() else ""
-            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertNotIn("unsupported fake", result.stderr)
-            self.assertNotIn("gh pr merge", calls)
-
-    def test_task_11_draft_upload_rehashes_current_selected_assets(self) -> None:
-        plan = REPRODUCIBLE_RELEASE_PLAN.read_text(encoding="utf-8")
-        block = _release_plan_bash_block(plan, 11, 3)
-        reviewed_head = "1" * 40
-        release_commit = "3" * 40
-        with TemporaryDirectory() as directory_name:
-            directory = Path(directory_name)
-            fake_bin, call_log = _fake_release_commands(directory)
-            state_root = directory / "threadroot-v010-release-state-20260905"
-            final_root = directory / "final"
-            selected = final_root / "build" / "selected"
-            canonical = final_root / "build" / "evidence" / "SHA256SUMS"
-            _write_selected_artifacts(selected, b"approved")
-            _write_sha256sums(canonical, selected)
-            state_root.mkdir()
-            _write_sha256sums(state_root / "final-recomputed.SHA256SUMS", selected)
-            (state_root / "reviewed-head.txt").write_text(
-                f"{reviewed_head}\n", encoding="utf-8"
-            )
-            (state_root / "approved-pr-head.txt").write_text(
-                f"{reviewed_head}\n", encoding="utf-8"
-            )
-            (state_root / "release-commit.txt").write_text(
-                f"{release_commit}\n", encoding="utf-8"
-            )
-            (state_root / "final-root.txt").write_text(
-                f"{final_root}\n", encoding="utf-8"
-            )
-            (selected / "threadroot-codex-0.1.0.zip").write_bytes(b"drifted")
-
-            result = _run_release_plan_block(
-                block,
-                directory,
-                fake_bin,
-                call_log,
-                FAKE_RELEASE_COMMIT=release_commit,
-            )
-
-            calls = call_log.read_text(encoding="utf-8") if call_log.exists() else ""
-            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertNotIn("unsupported fake", result.stderr)
-            self.assertNotIn("gh release create", calls)
-            self.assertFalse((state_root / "draft-url.txt").exists())
-
-    def test_task_11_tag_probe_failures_skip_tag_and_push_mutators(self) -> None:
-        plan = REPRODUCIBLE_RELEASE_PLAN.read_text(encoding="utf-8")
-        block = _release_plan_bash_block(plan, 11, 2)
-        reviewed_head = "1" * 40
-        release_commit = "3" * 40
-        scenarios = {
-            "local probe error": {
-                "FAKE_SHOW_REF_EXIT": "2",
-                "FAKE_LS_REMOTE_EMPTY": "1",
-            },
-            "remote probe error": {"FAKE_LS_REMOTE_EXIT": "42"},
-        }
-        for scenario, failure_environment in scenarios.items():
-            with self.subTest(scenario=scenario), TemporaryDirectory() as directory_name:
-                directory = Path(directory_name)
-                fake_bin, call_log = _fake_release_commands(directory)
-                state_root = directory / "threadroot-v010-release-state-20260905"
-                state_root.mkdir()
-                for name, value in (
-                    ("reviewed-head.txt", reviewed_head),
-                    ("approved-pr-head.txt", reviewed_head),
-                    ("release-commit.txt", release_commit),
-                ):
-                    (state_root / name).write_text(
-                        f"{value}\n", encoding="utf-8"
-                    )
-
-                result = _run_release_plan_block(
-                    block,
-                    directory,
-                    fake_bin,
-                    call_log,
-                    FAKE_GIT_HEAD=reviewed_head,
-                    FAKE_RELEASE_COMMIT=release_commit,
-                    **failure_environment,
-                )
-
-                calls = (
-                    call_log.read_text(encoding="utf-8")
-                    if call_log.exists()
-                    else ""
-                )
-                self.assertNotEqual(
-                    result.returncode, 0, result.stdout + result.stderr
-                )
-                self.assertNotIn("unsupported fake", result.stderr)
-                self.assertNotIn("git tag --annotate", calls)
-                self.assertNotIn("git push", calls)
-
-    def test_task_12_publish_precondition_failure_skips_mutator(self) -> None:
-        plan = REPRODUCIBLE_RELEASE_PLAN.read_text(encoding="utf-8")
-        block = _release_plan_bash_block(plan, 12, 2)
-        reviewed_head = "1" * 40
-        release_commit = "3" * 40
-        with TemporaryDirectory() as directory_name:
-            directory = Path(directory_name)
-            fake_bin, call_log = _fake_release_commands(directory)
-            state_root = directory / "threadroot-v010-release-state-20260905"
-            final_root = directory / "final"
-            selected = final_root / "build" / "selected"
-            draft_download = directory / "draft-download"
-            _write_selected_artifacts(selected, b"approved")
-            _write_selected_artifacts(draft_download, b"approved")
-            _write_sha256sums(
-                final_root / "build" / "evidence" / "SHA256SUMS", selected
-            )
-            state_root.mkdir()
-            for name, value in (
-                ("reviewed-head.txt", reviewed_head),
-                ("approved-pr-head.txt", reviewed_head),
-                ("release-commit.txt", release_commit),
-                ("final-root.txt", str(final_root)),
-                ("draft-download-root.txt", str(draft_download)),
-            ):
-                (state_root / name).write_text(f"{value}\n", encoding="utf-8")
-            release_json = _write_release_contract(state_root, selected)
-
-            result = _run_release_plan_block(
-                block,
-                directory,
-                fake_bin,
-                call_log,
-                FAKE_RELEASE_COMMIT=release_commit,
-                FAKE_REMOTE_MAIN="9" * 40,
-                FAKE_RELEASE_JSON=str(release_json),
-            )
-
-            calls = call_log.read_text(encoding="utf-8") if call_log.exists() else ""
-            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertNotIn("unsupported fake", result.stderr)
-            self.assertNotIn("gh release edit", calls)
-            self.assertFalse((state_root / "publish-download-root.txt").exists())
-
-    def test_task_12_publish_rehashes_current_selected_assets(self) -> None:
-        plan = REPRODUCIBLE_RELEASE_PLAN.read_text(encoding="utf-8")
-        block = _release_plan_bash_block(plan, 12, 2)
-        reviewed_head = "1" * 40
-        release_commit = "3" * 40
-        with TemporaryDirectory() as directory_name:
-            directory = Path(directory_name)
-            fake_bin, call_log = _fake_release_commands(directory)
-            state_root = directory / "threadroot-v010-release-state-20260905"
-            final_root = directory / "final"
-            selected = final_root / "build" / "selected"
-            draft_download = directory / "draft-download"
-            _write_selected_artifacts(selected, b"approved")
-            _write_sha256sums(
-                final_root / "build" / "evidence" / "SHA256SUMS", selected
-            )
-            _write_selected_artifacts(draft_download, b"approved")
-            drifted_asset = "threadroot-codex-0.1.0.zip"
-            (selected / drifted_asset).write_bytes(b"matching drift")
-            (draft_download / drifted_asset).write_bytes(b"matching drift")
-            state_root.mkdir()
-            for name, value in (
-                ("reviewed-head.txt", reviewed_head),
-                ("approved-pr-head.txt", reviewed_head),
-                ("release-commit.txt", release_commit),
-                ("final-root.txt", str(final_root)),
-                ("draft-download-root.txt", str(draft_download)),
-            ):
-                (state_root / name).write_text(f"{value}\n", encoding="utf-8")
-            release_json = _write_release_contract(state_root, selected)
-
-            result = _run_release_plan_block(
-                block,
-                directory,
-                fake_bin,
-                call_log,
-                FAKE_RELEASE_COMMIT=release_commit,
-                FAKE_RELEASE_JSON=str(release_json),
-            )
-
-            calls = call_log.read_text(encoding="utf-8") if call_log.exists() else ""
-            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertNotIn("unsupported fake", result.stderr)
-            self.assertNotIn("gh release edit", calls)
-            self.assertFalse((state_root / "publish-download-root.txt").exists())
-
-    def test_task_12_publish_rejects_same_size_current_draft_byte_drift(
-        self,
-    ) -> None:
-        plan = REPRODUCIBLE_RELEASE_PLAN.read_text(encoding="utf-8")
-        block = _release_plan_bash_block(plan, 12, 2)
-        reviewed_head = "1" * 40
-        release_commit = "3" * 40
-        with TemporaryDirectory() as directory_name:
-            directory = Path(directory_name)
-            fake_bin, call_log = _fake_release_commands(directory)
-            state_root = directory / "threadroot-v010-release-state-20260905"
-            final_root = directory / "final"
-            selected = final_root / "build" / "selected"
-            prior_download = directory / "draft-download"
-            current_draft = directory / "current-draft"
-            _write_selected_artifacts(selected, b"approved")
-            _write_selected_artifacts(prior_download, b"approved")
-            _write_selected_artifacts(current_draft, b"approved")
-            _write_sha256sums(
-                final_root / "build" / "evidence" / "SHA256SUMS", selected
-            )
-            drifted_asset = current_draft / "threadroot-codex-0.1.0.zip"
-            original = drifted_asset.read_bytes()
-            drifted_asset.write_bytes(bytes([original[0] ^ 1]) + original[1:])
-            self.assertEqual(
-                drifted_asset.stat().st_size,
-                (selected / drifted_asset.name).stat().st_size,
-            )
-            state_root.mkdir()
-            for name, value in (
-                ("reviewed-head.txt", reviewed_head),
-                ("approved-pr-head.txt", reviewed_head),
-                ("release-commit.txt", release_commit),
-                ("final-root.txt", str(final_root)),
-                ("draft-download-root.txt", str(prior_download)),
-            ):
-                (state_root / name).write_text(f"{value}\n", encoding="utf-8")
-            release_json = _write_release_contract(state_root, selected)
-
-            result = _run_release_plan_block(
-                block,
-                directory,
-                fake_bin,
-                call_log,
-                FAKE_GIT_HEAD=reviewed_head,
-                FAKE_RELEASE_COMMIT=release_commit,
-                FAKE_RELEASE_JSON=str(release_json),
-                FAKE_DRAFT_ASSET_ROOT=str(current_draft),
-            )
-
-            calls = call_log.read_text(encoding="utf-8") if call_log.exists() else ""
-            downloads = [
-                call
-                for call in calls.splitlines()
-                if call.startswith("gh release download ")
-            ]
-            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertNotIn("unsupported fake", result.stderr)
-            self.assertEqual(len(downloads), 4)
-            self.assertNotIn("gh release edit", calls)
-            self.assertFalse((state_root / "publish-download-root.txt").exists())
-
-    def test_task_12_publish_redownloads_current_draft_before_mutation(self) -> None:
-        plan = REPRODUCIBLE_RELEASE_PLAN.read_text(encoding="utf-8")
-        block = _release_plan_bash_block(plan, 12, 2)
-        reviewed_head = "1" * 40
-        release_commit = "3" * 40
-        with TemporaryDirectory() as directory_name:
-            directory = Path(directory_name)
-            fake_bin, call_log = _fake_release_commands(directory)
-            state_root = directory / "threadroot-v010-release-state-20260905"
-            final_root = directory / "final"
-            selected = final_root / "build" / "selected"
-            prior_download = directory / "draft-download"
-            current_draft = directory / "current-draft"
-            _write_selected_artifacts(selected, b"approved")
-            _write_selected_artifacts(prior_download, b"approved")
-            _write_selected_artifacts(current_draft, b"approved")
-            _write_sha256sums(
-                final_root / "build" / "evidence" / "SHA256SUMS", selected
-            )
-            state_root.mkdir()
-            for name, value in (
-                ("reviewed-head.txt", reviewed_head),
-                ("approved-pr-head.txt", reviewed_head),
-                ("release-commit.txt", release_commit),
-                ("final-root.txt", str(final_root)),
-                ("draft-download-root.txt", str(prior_download)),
-            ):
-                (state_root / name).write_text(f"{value}\n", encoding="utf-8")
-            release_json = _write_release_contract(state_root, selected)
-
-            result = _run_release_plan_block(
-                block,
-                directory,
-                fake_bin,
-                call_log,
-                FAKE_GIT_HEAD=reviewed_head,
-                FAKE_RELEASE_COMMIT=release_commit,
-                FAKE_RELEASE_JSON=str(release_json),
-                FAKE_DRAFT_ASSET_ROOT=str(current_draft),
-            )
-
-            calls = call_log.read_text(encoding="utf-8").splitlines()
-            downloads = [
-                call for call in calls if call.startswith("gh release download ")
-            ]
-            edits = [call for call in calls if call.startswith("gh release edit ")]
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertNotIn("unsupported fake", result.stderr)
-            self.assertEqual(len(downloads), 4)
-            self.assertEqual(len(edits), 1)
-            self.assertLess(calls.index(downloads[-1]), calls.index(edits[0]))
-            publication_root = Path(
-                (state_root / "publish-download-root.txt")
-                .read_text(encoding="utf-8")
-                .strip()
-            )
-            self.assertTrue(publication_root.is_dir())
-            for name in EXPECTED_RELEASE_ASSETS:
-                self.assertEqual(
-                    (publication_root / name).read_bytes(),
-                    (selected / name).read_bytes(),
-                )
-
-    def test_task_12_publish_download_failure_skips_mutator_and_binding(
-        self,
-    ) -> None:
-        plan = REPRODUCIBLE_RELEASE_PLAN.read_text(encoding="utf-8")
-        block = _release_plan_bash_block(plan, 12, 2)
-        reviewed_head = "1" * 40
-        release_commit = "3" * 40
-        with TemporaryDirectory() as directory_name:
-            directory = Path(directory_name)
-            fake_bin, call_log = _fake_release_commands(directory)
-            state_root = directory / "threadroot-v010-release-state-20260905"
-            final_root = directory / "final"
-            selected = final_root / "build" / "selected"
-            prior_download = directory / "draft-download"
-            current_draft = directory / "current-draft"
-            _write_selected_artifacts(selected, b"approved")
-            _write_selected_artifacts(prior_download, b"approved")
-            _write_selected_artifacts(current_draft, b"approved")
-            _write_sha256sums(
-                final_root / "build" / "evidence" / "SHA256SUMS", selected
-            )
-            state_root.mkdir()
-            for name, value in (
-                ("reviewed-head.txt", reviewed_head),
-                ("approved-pr-head.txt", reviewed_head),
-                ("release-commit.txt", release_commit),
-                ("final-root.txt", str(final_root)),
-                ("draft-download-root.txt", str(prior_download)),
-            ):
-                (state_root / name).write_text(f"{value}\n", encoding="utf-8")
-            release_json = _write_release_contract(state_root, selected)
-
-            result = _run_release_plan_block(
-                block,
-                directory,
-                fake_bin,
-                call_log,
-                FAKE_GIT_HEAD=reviewed_head,
-                FAKE_RELEASE_COMMIT=release_commit,
-                FAKE_RELEASE_JSON=str(release_json),
-                FAKE_DRAFT_ASSET_ROOT=str(current_draft),
-                FAKE_RELEASE_DOWNLOAD_EXIT="42",
-            )
-
-            calls = call_log.read_text(encoding="utf-8") if call_log.exists() else ""
-            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("synthetic release download failure", result.stderr)
-            self.assertIn("gh release download", calls)
-            self.assertNotIn("gh release edit", calls)
-            self.assertFalse((state_root / "publish-download-root.txt").exists())
-
-    def test_task_12_publish_refuses_to_overwrite_existing_binding(self) -> None:
-        plan = REPRODUCIBLE_RELEASE_PLAN.read_text(encoding="utf-8")
-        block = _release_plan_bash_block(plan, 12, 2)
-        reviewed_head = "1" * 40
-        release_commit = "3" * 40
-        with TemporaryDirectory() as directory_name:
-            directory = Path(directory_name)
-            fake_bin, call_log = _fake_release_commands(directory)
-            state_root = directory / "threadroot-v010-release-state-20260905"
-            final_root = directory / "final"
-            selected = final_root / "build" / "selected"
-            prior_download = directory / "draft-download"
-            current_draft = directory / "current-draft"
-            _write_selected_artifacts(selected, b"approved")
-            _write_selected_artifacts(prior_download, b"approved")
-            _write_selected_artifacts(current_draft, b"approved")
-            _write_sha256sums(
-                final_root / "build" / "evidence" / "SHA256SUMS", selected
-            )
-            state_root.mkdir()
-            for name, value in (
-                ("reviewed-head.txt", reviewed_head),
-                ("approved-pr-head.txt", reviewed_head),
-                ("release-commit.txt", release_commit),
-                ("final-root.txt", str(final_root)),
-                ("draft-download-root.txt", str(prior_download)),
-            ):
-                (state_root / name).write_text(f"{value}\n", encoding="utf-8")
-            binding = state_root / "publish-download-root.txt"
-            binding.write_text("existing authority\n", encoding="utf-8")
-            release_json = _write_release_contract(state_root, selected)
-
-            result = _run_release_plan_block(
-                block,
-                directory,
-                fake_bin,
-                call_log,
-                FAKE_GIT_HEAD=reviewed_head,
-                FAKE_RELEASE_COMMIT=release_commit,
-                FAKE_RELEASE_JSON=str(release_json),
-                FAKE_DRAFT_ASSET_ROOT=str(current_draft),
-            )
-
-            calls = call_log.read_text(encoding="utf-8") if call_log.exists() else ""
-            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertNotIn("gh release download", calls)
-            self.assertNotIn("gh release edit", calls)
-            self.assertEqual(binding.read_text(encoding="utf-8"), "existing authority\n")
-
-    def test_task_12_public_binding_reloads_successful_candidate_in_new_shell(
-        self,
-    ) -> None:
-        plan = REPRODUCIBLE_RELEASE_PLAN.read_text(encoding="utf-8")
-        block = _release_plan_bash_block(plan, 12, 3, 1)
-        reviewed_head = "1" * 40
-        release_commit = "3" * 40
-        with TemporaryDirectory() as directory_name:
-            directory = Path(directory_name)
-            fake_bin, call_log = _fake_release_commands(directory)
-            state_root = directory / "threadroot-v010-release-state-20260905"
-            final_root = directory / "final"
-            selected = final_root / "build" / "selected"
-            public_download = directory / "public-download"
-            _write_selected_artifacts(selected, b"approved")
-            _write_selected_artifacts(public_download, b"approved")
-            _write_sha256sums(
-                final_root / "build" / "evidence" / "SHA256SUMS", selected
-            )
-            _write_public_release(public_download / "release.json", selected)
-            state_root.mkdir()
-            for name, value in (
-                ("reviewed-head.txt", reviewed_head),
-                ("approved-pr-head.txt", reviewed_head),
-                ("release-commit.txt", release_commit),
-                ("final-root.txt", str(final_root)),
-            ):
-                (state_root / name).write_text(f"{value}\n", encoding="utf-8")
-            candidate_record = (
-                directory
-                / f"threadroot-v010-public-candidate-{release_commit}.txt"
-            )
-            candidate_record.write_text(f"{public_download}\n", encoding="utf-8")
-
-            result = _run_release_plan_block(
-                block,
-                directory,
-                fake_bin,
-                call_log,
-                FAKE_GIT_HEAD=reviewed_head,
-                FAKE_RELEASE_COMMIT=release_commit,
-            )
-
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(
-                (state_root / "public-download-root.txt").read_text(
-                    encoding="utf-8"
-                ),
-                f"{public_download}\n",
-            )
-
-    def test_task_12_public_binding_rejects_invalid_metadata_without_authority(
-        self,
-    ) -> None:
-        plan = REPRODUCIBLE_RELEASE_PLAN.read_text(encoding="utf-8")
-        block = _release_plan_bash_block(plan, 12, 3, 1)
-        reviewed_head = "1" * 40
-        release_commit = "3" * 40
-        with TemporaryDirectory() as directory_name:
-            directory = Path(directory_name)
-            fake_bin, call_log = _fake_release_commands(directory)
-            state_root = directory / "threadroot-v010-release-state-20260905"
-            final_root = directory / "final"
-            selected = final_root / "build" / "selected"
-            public_download = directory / "public-download"
-            _write_selected_artifacts(selected, b"approved")
-            _write_selected_artifacts(public_download, b"approved")
-            _write_sha256sums(
-                final_root / "build" / "evidence" / "SHA256SUMS", selected
-            )
-            (public_download / "release.json").write_text(
-                json.dumps({"tag_name": "v0.1.0"}),
-                encoding="utf-8",
-            )
-            state_root.mkdir()
-            for name, value in (
-                ("reviewed-head.txt", reviewed_head),
-                ("approved-pr-head.txt", reviewed_head),
-                ("release-commit.txt", release_commit),
-                ("final-root.txt", str(final_root)),
-            ):
-                (state_root / name).write_text(f"{value}\n", encoding="utf-8")
-            candidate_record = (
-                directory
-                / f"threadroot-v010-public-candidate-{release_commit}.txt"
-            )
-            candidate_record.write_text(f"{public_download}\n", encoding="utf-8")
-
-            result = _run_release_plan_block(
-                block,
-                directory,
-                fake_bin,
-                call_log,
-                FAKE_GIT_HEAD=reviewed_head,
-                FAKE_RELEASE_COMMIT=release_commit,
-            )
-
-            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertNotIn("unsupported fake", result.stderr)
-            self.assertFalse((state_root / "public-download-root.txt").exists())
 
     def test_task_7_local_matrix_command_uses_src_layout(self) -> None:
         plan = REPRODUCIBLE_RELEASE_PLAN.read_text(encoding="utf-8")
@@ -1857,6 +993,600 @@ exit 97
         )
         self.assertIn("Tasks 5-12", prefix)
         self.assertIn("must not be executed", prefix)
+
+
+class ReleaseAuthorityFlowTests(unittest.TestCase):
+    """Execute published shell blocks with real Git and paired authority."""
+
+    def setUp(self):
+        from tests import test_release_candidate as fixtures
+        from scripts.release_candidate import record_successful_attempt
+
+        self.fixture = fixtures.CandidateAuthorityTests()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        selected = self.fixture.candidate / "build/selected"
+        for host in ("claude", "codex"):
+            archive = build_archive(host, selected)
+            for group in ("candidate-a", "candidate-b"):
+                shutil.copyfile(archive, self.fixture.candidate / "build" / group / archive.name)
+        evidence = self.fixture.candidate / "build/evidence"
+        (evidence / "unpacked").mkdir()
+        build_path = evidence / "build.json"
+        build = json.loads(build_path.read_bytes())
+        build["artifacts"] = [{"name": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                               "size": path.stat().st_size} for path in sorted(selected.iterdir())]
+        build_path.write_text(json.dumps(build))
+        _write_sha256sums(evidence / "SHA256SUMS", selected)
+        self.fixture._prepare()
+        self.fixture._bind()
+        self.directory = self.fixture.root
+        self.repository = self.fixture.repository
+        self.candidate = self.fixture.candidate
+        self.commit = self.fixture.commit
+        self.receipt = self.directory / "success.json"
+        with self.fixture._in_repository():
+            record_successful_attempt(self.fixture.record, self.commit, self.receipt)
+        self.fixture._git("branch", "-m", "release/v0.1.0-readiness")
+        notes = self.repository / "docs/releases/v0.1.0.md"
+        notes.parent.mkdir(parents=True)
+        notes.write_bytes(RELEASE_NOTES.read_bytes())
+        self.fake_bin, self.call_log = _fake_release_commands(self.directory)
+        fake_git = self.fake_bin / "git"
+        original = fake_git.read_text()
+        original = original.replace(
+            'if args[:2] == ["rev-parse", "HEAD"]:',
+            'if args and (args[0] in {"archive", "show", "ls-tree", "cat-file"} or args[:2] == ["rev-parse", "--show-toplevel"]):\n'
+            '    os.execv(os.environ["THREADROOT_REAL_GIT"], ["git", *args])\n'
+            'elif args[:2] == ["rev-parse", "HEAD"]:',
+        )
+        _write_executable(fake_git, original)
+        _write_executable(self.fake_bin / "python3", f"#!{sys.executable}\n" + r'''
+import os
+from pathlib import Path
+import shlex
+import shutil
+import sys
+
+args = sys.argv[1:]
+if args[:3] == ["-B", "-m", "scripts.release_candidate"]:
+    with Path(os.environ["THREADROOT_TEST_CALL_LOG"]).open("a") as stream:
+        stream.write("release_candidate " + shlex.join(args[3:]) + "\n")
+    if args[3] == "verify-success":
+        counter = Path(os.environ["THREADROOT_TEST_CALL_LOG"] + ".verify-count")
+        count = int(counter.read_text()) + 1 if counter.exists() else 1
+        counter.write_text(str(count))
+        if str(count) == os.environ.get("THREADROOT_DRIFT_AT_VERIFY"):
+            Path(os.environ["THREADROOT_DRIFT_MEMBER"]).write_bytes(b"drift\n")
+elif "scripts.build_verified_release" in args:
+    with Path(os.environ["THREADROOT_TEST_CALL_LOG"]).open("a") as stream:
+        stream.write("builder " + shlex.join(args) + "\n")
+    if os.environ.get("THREADROOT_BUILDER_FAIL") == "1":
+        raise SystemExit(19)
+    import json
+    import subprocess
+    from scripts.release_candidate import _canonical_json, bind_candidate
+    output = Path(args[args.index("--output") + 1])
+    record = Path(args[args.index("--authority-record") + 1])
+    commit = args[args.index("--commit") + 1]
+    assert not output.exists() and not record.exists()
+    shutil.copytree(os.environ["THREADROOT_FIXTURE_CANDIDATE"], output,
+                    ignore=shutil.ignore_patterns("candidate-integrity.json"))
+    build_path = output / "build/evidence/build.json"
+    build = json.loads(build_path.read_bytes())
+    build["commit"] = commit
+    build["source_date_epoch"] = int(subprocess.run(
+        ["git", "show", "-s", "--format=%ct", commit],
+        check=True, capture_output=True, text=True).stdout)
+    build_path.write_bytes(_canonical_json(build))
+    bind_candidate(output, commit, record)
+    raise SystemExit(0)
+elif args[:3] == ["-B", "-m", "venv"]:
+    root = Path(args[3])
+    root.mkdir()
+    (root / "bin").mkdir()
+    for command, template in (("python", "THREADROOT_FAKE_WHEEL_PYTHON"),
+                              ("threadroot", "THREADROOT_FAKE_WHEEL_CLI")):
+        shutil.copyfile(os.environ[template], root / "bin" / command)
+        (root / "bin" / command).chmod(0o755)
+    with Path(os.environ["THREADROOT_TEST_CALL_LOG"]).open("a") as stream:
+        stream.write("install venv " + str(root) + "\n")
+    raise SystemExit(0)
+elif args[:2] == ["-B", "scripts/check_public.py"]:
+    args[1] = str(Path(os.environ["THREADROOT_WORKTREE"]) / args[1])
+os.execv(os.environ["THREADROOT_REAL_PYTHON"], [os.environ["THREADROOT_REAL_PYTHON"], *args])
+''')
+        self.state = self.directory / "threadroot-v010-release-state-20260905"
+        self.environment = {
+            "FAKE_GIT_HEAD": self.commit,
+            "FAKE_RELEASE_COMMIT": self.commit,
+            "THREADROOT_REAL_GIT": shutil.which("git"),
+            "THREADROOT_REAL_PYTHON": sys.executable,
+            "THREADROOT_WORKTREE": str(Path.cwd()),
+            "THREADROOT_FIXTURE_CANDIDATE": str(self.candidate),
+            "THREADROOT_DRIFT_MEMBER": str(self.candidate / "source-b/README.md"),
+            "threadroot_reviewed_head": self.commit,
+            "threadroot_candidate_record": str(self.fixture.record),
+            "threadroot_candidate_receipt": str(self.receipt),
+        }
+        wheel_python = self.directory / "wheel-python"
+        _write_executable(wheel_python, f"#!{sys.executable}\n" + r'''
+import os
+from pathlib import Path
+import sys
+args = sys.argv[1:]
+with Path(os.environ["THREADROOT_TEST_CALL_LOG"]).open("a") as stream:
+    stream.write("wheel-python " + " ".join(args) + "\n")
+if args == ["-m", "pip", "uninstall", "-y", "threadroot"]:
+    Path(sys.argv[0]).with_name("threadroot").unlink()
+elif args == ["-c", "import threadroot"]:
+    raise SystemExit(1)
+elif args[:3] == ["-m", "pip", "install"]:
+    assert "--no-index" in args and "--no-deps" in args
+    if os.environ.get("THREADROOT_TOOL_DRIFT") == "1":
+        Path(os.environ["THREADROOT_DRIFT_MEMBER"]).write_bytes(b"installer drift")
+elif args != ["-m", "pip", "check"] and args[:1] != ["-c"]:
+    raise SystemExit(97)
+''')
+        wheel_cli = self.directory / "wheel-cli"
+        _write_executable(wheel_cli, f"#!{sys.executable}\n" + r'''
+import os
+from pathlib import Path
+import sys
+with Path(os.environ["THREADROOT_TEST_CALL_LOG"]).open("a") as stream:
+    stream.write("threadroot " + " ".join(sys.argv[1:]) + "\n")
+os.execv(os.environ["THREADROOT_REAL_PYTHON"],
+         [os.environ["THREADROOT_REAL_PYTHON"], "-B", "-m", "threadroot", *sys.argv[1:]])
+''')
+        self.environment.update(THREADROOT_FAKE_WHEEL_PYTHON=str(wheel_python),
+                                THREADROOT_FAKE_WHEEL_CLI=str(wheel_cli))
+        for host in ("claude", "codex"):
+            _write_task_10_host_fake(self.fake_bin, host)
+            host_file = self.fake_bin / host
+            source = host_file.read_text().replace(
+                "set -euo pipefail\n", "set -euo pipefail\n" +
+                f"printf '%s\\n' \"{host} $*\" >> {str(self.call_log)!r}\n")
+            _write_executable(host_file, source)
+        self.plan = REPRODUCIBLE_RELEASE_PLAN.read_text()
+
+    def run_block(self, task, step, block=0, **environment):
+        return _run_release_plan_block(
+            _release_plan_bash_block(self.plan, task, step, block),
+            self.directory, self.fake_bin, self.call_log, repository=self.repository,
+            **(self.environment | environment),
+        )
+
+    def calls(self):
+        return self.call_log.read_text() if self.call_log.exists() else ""
+
+    def bind_state(self):
+        result = self.run_block(7, 4)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for name, value in (("pr-url.txt", "https://example.invalid/pr/1"),
+                            ("approved-pr-head.txt", self.commit),
+                            ("release-commit.txt", self.commit),
+                            ("final-root.txt", str(self.candidate))):
+            (self.state / name).write_text(value + "\n")
+        for source, name in ((self.fixture.record, "final-authority.json"),
+                             (self.receipt, "final-success.json")):
+            destination = self.state / name
+            destination.write_bytes(source.read_bytes())
+            destination.chmod(0o400)
+        self.call_log.write_text("")
+        Path(str(self.call_log) + ".verify-count").write_text("0")
+
+    def test_task_8_pr_evidence_remains_outside_candidate(self):
+        from scripts.release_candidate import verify_successful_attempt
+        self.bind_state()
+        (self.state / "approved-pr-head.txt").unlink()
+        result = self.run_block(8, 3)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.state / "pr-checks.json").is_file())
+        self.assertTrue((self.state / "pr.diff").is_file())
+        self.assertFalse((self.candidate / "pr-checks.json").exists())
+        self.assertFalse((self.candidate / "pr.diff").exists())
+        with self.fixture._in_repository():
+            self.assertEqual(verify_successful_attempt(self.receipt, self.fixture.record, self.commit), self.candidate)
+
+    def test_task_9_source_drift_immediately_before_merge_stops_mutator(self):
+        self.bind_state()
+        result = self.run_block(9, 1, THREADROOT_DRIFT_AT_VERIFY="2")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("gh pr merge ", self.calls())
+        self.assertEqual(self.calls().count("release_candidate verify-success"), 2)
+
+    def test_task_9_final_build_records_new_state_local_pair(self):
+        self.bind_state()
+        self.fixture._git("commit", "--allow-empty", "--no-gpg-sign", "-qm", "synthetic merged commit")
+        release_commit = self.fixture._git("rev-parse", "HEAD").stdout.strip()
+        self.assertNotEqual(release_commit, self.commit)
+        (self.state / "release-commit.txt").write_text(release_commit + "\n")
+        for name in ("final-authority.json", "final-success.json", "final-root.txt"):
+            (self.state / name).unlink()
+        result = self.run_block(9, 4, FAKE_RELEASE_COMMIT=release_commit)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.state / "final-authority.json").is_file())
+        self.assertTrue((self.state / "final-success.json").is_file())
+        authority = json.loads((self.state / "final-authority.json").read_bytes())
+        self.assertEqual(authority["commit"], release_commit)
+        root = authority["candidate_root"]
+        self.assertEqual((self.state / "final-root.txt").read_text(), root + "\n")
+
+    def test_task_10_raw_record_cannot_begin_install(self):
+        self.bind_state()
+        (self.state / "final-success.json").unlink()
+        result = self.run_block(10, 2)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("release_candidate verify-success", self.calls())
+        self.assertFalse((self.candidate / "wheel-smoke-venv").exists())
+
+    def test_task_9_failed_final_builder_cannot_record_success_or_bind_root(self):
+        self.bind_state()
+        for name in ("final-authority.json", "final-success.json", "final-root.txt"):
+            (self.state / name).unlink()
+        result = self.run_block(9, 4, THREADROOT_BUILDER_FAIL="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("builder ", self.calls())
+        self.assertNotIn("release_candidate record-success", self.calls())
+        self.assertFalse((self.state / "final-success.json").exists())
+        self.assertFalse((self.state / "final-root.txt").exists())
+
+    def test_task_11_drift_before_draft_upload_stops_mutator(self):
+        self.bind_state()
+        result = self.run_block(11, 3, THREADROOT_DRIFT_AT_VERIFY="2")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("gh release create ", self.calls())
+        self.assertEqual(self.calls().count("release_candidate verify-success"), 2)
+
+    def prepare_draft(self):
+        selected = self.candidate / "build/selected"
+        download = self.directory / "draft-download"
+        shutil.copytree(selected, download)
+        (self.state / "draft-download-root.txt").write_text(str(download) + "\n")
+        release_json = _write_release_contract(self.state, selected)
+        return {"FAKE_RELEASE_JSON": str(release_json),
+                "FAKE_DRAFT_ASSET_ROOT": str(download)}
+
+    def test_task_12_drift_before_publish_stops_mutator(self):
+        self.bind_state()
+        result = self.run_block(12, 2, **self.prepare_draft(), THREADROOT_DRIFT_AT_VERIFY="2")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("gh release edit ", self.calls())
+        self.assertEqual(self.calls().count("release_candidate verify-success"), 2)
+
+    def test_task_10_complete_validation_uses_one_external_root_and_preserves_candidate(self):
+        from scripts.release_candidate import verify_successful_attempt
+        self.bind_state()
+        for step, block in ((1, 0), (2, 0), (3, 0), (3, 1), (4, 0), (4, 1), (5, 0)):
+            with self.subTest(step=step, block=block):
+                result = self.run_block(10, step, block)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        validation = Path((self.state / "validation-root.txt").read_text().strip())
+        self.assertEqual(validation.stat().st_mode & 0o777, 0o700)
+        self.assertFalse(validation.is_relative_to(self.candidate))
+        self.assertFalse(validation.is_relative_to(self.repository))
+        for relative in ("wheel-smoke-venv", "cli-smoke", "host-smoke/claude-smoke", "host-smoke/codex-smoke"):
+            self.assertTrue((validation / relative).is_dir())
+        self.assertEqual(len(list(self.directory.glob("threadroot-v010-validation-*"))), 1)
+        with self.fixture._in_repository():
+            self.assertEqual(verify_successful_attempt(self.receipt, self.fixture.record, self.commit), self.candidate)
+
+    def test_task_8_push_and_pr_create_have_separate_fresh_verification(self):
+        self.bind_state()
+        (self.state / "pr-url.txt").unlink()
+        result = self.run_block(8, 2)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self.calls().splitlines()
+        pushes = [i for i, line in enumerate(calls) if line.startswith("git push ")]
+        creates = [i for i, line in enumerate(calls) if line.startswith("gh pr create ")]
+        checks = [i for i, line in enumerate(calls) if line.startswith("release_candidate verify-success ")]
+        self.assertEqual(len(pushes), 1)
+        self.assertEqual(len(creates), 1)
+        self.assertTrue(checks[1] < pushes[0] < checks[2] < creates[0])
+
+    def test_task_8_drift_at_each_outbound_boundary_prevents_its_mutator(self):
+        for count, mutator, existing in ((2, "git push ", ""), (3, "gh pr create ", ""),
+                                         (3, "gh pr edit ", "https://example.invalid/pr/1")):
+            with self.subTest(mutator=mutator):
+                case = ReleaseAuthorityFlowTests()
+                case.setUp()
+                try:
+                    case.bind_state()
+                    (case.state / "pr-url.txt").unlink()
+                    result = case.run_block(8, 2, THREADROOT_DRIFT_AT_VERIFY=str(count), FAKE_EXISTING_PR=existing)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn(mutator, case.calls())
+                    self.assertEqual(case.calls().count("release_candidate verify-success"), count)
+                finally:
+                    case.doCleanups()
+
+    def prepare_validation(self, wheel=True):
+        validation = self.directory / "validation"
+        validation.mkdir(mode=0o700)
+        (self.state / "validation-root.txt").write_text(str(validation) + "\n")
+        (validation / "cli-smoke").mkdir()
+        for host in ("claude", "codex"):
+            for child in ("bundle", "home", "config", "cache", "data", "state", "tmp"):
+                (validation / "host-smoke" / f"{host}-smoke" / child).mkdir(parents=True)
+        if wheel:
+            binaries = validation / "wheel-smoke-venv/bin"
+            binaries.mkdir(parents=True)
+            for command, template in (("python", "THREADROOT_FAKE_WHEEL_PYTHON"),
+                                      ("threadroot", "THREADROOT_FAKE_WHEEL_CLI")):
+                shutil.copyfile(self.environment[template], binaries / command)
+                (binaries / command).chmod(0o755)
+        return validation
+
+    def test_task_10_drift_at_every_install_and_uninstall_boundary_stops_that_effect(self):
+        cases = (
+            (2, 0, 2, "install venv", ""),
+            (2, 0, 3, "wheel-python -m pip install", ""),
+            (3, 0, 3, "threadroot init", "--apply"),
+            (3, 0, 6, "threadroot claim", "--apply"),
+            (3, 0, 7, "threadroot claim", "--apply"),
+            (4, 1, 2, "claude plugin marketplace add", ""),
+            (4, 1, 3, "claude plugin install", ""),
+            (4, 1, 4, "codex plugin marketplace add", ""),
+            (4, 1, 5, "codex plugin add", ""),
+            (5, 0, 2, "wheel-python -m pip uninstall", ""),
+            (5, 0, 3, "claude plugin remove", ""),
+            (5, 0, 4, "claude plugin marketplace remove", ""),
+            (5, 0, 5, "codex plugin remove", ""),
+            (5, 0, 6, "codex plugin marketplace remove", ""),
+        )
+        for step, block, count, mutator, qualifier in cases:
+            with self.subTest(step=step, count=count, mutator=mutator):
+                case = ReleaseAuthorityFlowTests()
+                case.setUp()
+                try:
+                    case.bind_state()
+                    case.prepare_validation(wheel=step != 2)
+                    result = case.run_block(10, step, block, THREADROOT_DRIFT_AT_VERIFY=str(count))
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    effects = [line for line in case.calls().splitlines()
+                               if line.startswith(mutator) and qualifier in line]
+                    self.assertEqual(len(effects), 1 if (step, count) == (3, 7) else 0,
+                                     case.calls())
+                    self.assertEqual(case.calls().count("release_candidate verify-success"), count,
+                                     result.stdout + result.stderr)
+                finally:
+                    case.doCleanups()
+
+    def test_task_11_tag_and_push_have_separate_drift_gates(self):
+        for count, mutator in ((2, "git tag --annotate"), (3, "git push ")):
+            with self.subTest(mutator=mutator):
+                case = ReleaseAuthorityFlowTests()
+                case.setUp()
+                try:
+                    case.bind_state()
+                    result = case.run_block(11, 2, FAKE_LS_REMOTE_EMPTY="1",
+                                           THREADROOT_DRIFT_AT_VERIFY=str(count))
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn(mutator, case.calls())
+                    self.assertEqual(case.calls().count("release_candidate verify-success"), count)
+                finally:
+                    case.doCleanups()
+
+    def test_task_11_positive_tag_and_draft_keep_valid_authority(self):
+        self.bind_state()
+        for step in (2, 3):
+            result = self.run_block(11, step, FAKE_LS_REMOTE_EMPTY="1")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("git tag --annotate", self.calls())
+        self.assertIn("git push origin refs/tags/v0.1.0:refs/tags/v0.1.0", self.calls())
+        self.assertIn("gh release create ", self.calls())
+
+    def test_task_12_positive_publish_downloads_fresh_bytes_before_mutation(self):
+        self.bind_state()
+        result = self.run_block(12, 2, **self.prepare_draft())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self.calls().splitlines()
+        downloads = [i for i, line in enumerate(calls) if line.startswith("gh release download ")]
+        publishes = [i for i, line in enumerate(calls) if line.startswith("gh release edit ")]
+        self.assertEqual(len(downloads), 4)
+        self.assertEqual(len(publishes), 1)
+        self.assertLess(downloads[-1], publishes[0])
+        bound = Path((self.state / "publish-download-root.txt").read_text().strip())
+        self.assertNotEqual(bound, self.directory / "draft-download")
+        for name in EXPECTED_RELEASE_ASSETS:
+            self.assertEqual((bound / name).read_bytes(), (self.candidate / "build/selected" / name).read_bytes())
+
+    def test_task_7_reviewers_require_successful_entry_and_exit(self):
+        review = re.search(r"^```sh\n(.*?)^```", _release_plan_step(self.plan, 7, 4), re.M | re.S).group(1)
+        for reviewer in ("spec", "quality"):
+            result = _run_release_plan_block(review, self.directory, self.fake_bin, self.call_log,
+                                             repository=self.repository, **self.environment)
+            self.assertEqual(result.returncode, 0, reviewer + result.stderr)
+        self.assertEqual(self.calls().count("release_candidate verify-success"), 4)
+        result = _run_release_plan_block(review, self.directory, self.fake_bin, self.call_log,
+                                        repository=self.repository,
+                                        **(self.environment | {"THREADROOT_DRIFT_AT_VERIFY": "6"}))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.calls().count("release_candidate verify-success"), 6)
+
+    def test_task_7_raw_record_cannot_enter_review(self):
+        review = re.search(r"^```sh\n(.*?)^```", _release_plan_step(self.plan, 7, 4), re.M | re.S).group(1)
+        self.receipt.unlink()
+        result = _run_release_plan_block(review, self.directory, self.fake_bin, self.call_log,
+                                        repository=self.repository, **self.environment)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.calls().count("release_candidate verify-success"), 1)
+
+    def test_task_7_binding_rejects_head_other_than_reviewed_commit(self):
+        result = self.run_block(7, 4, FAKE_GIT_HEAD="9" * 40)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.state.exists())
+
+    def test_task_8_approval_rejects_local_head_drift(self):
+        self.bind_state()
+        (self.state / "approved-pr-head.txt").unlink()
+        result = self.run_block(8, 3, FAKE_GIT_HEAD="9" * 40)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.state / "approved-pr-head.txt").exists())
+        self.assertIn("release_candidate verify-success", self.calls())
+
+    def test_task_8_post_check_drift_prevents_approved_head_binding(self):
+        self.bind_state()
+        (self.state / "approved-pr-head.txt").unlink()
+        result = self.run_block(8, 3, THREADROOT_DRIFT_AT_VERIFY="2")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.state / "approved-pr-head.txt").exists())
+        self.assertTrue((self.state / "pr.diff").is_file())
+
+    def test_task_10_installer_candidate_write_invalidates_block_exit(self):
+        self.bind_state()
+        self.prepare_validation(wheel=False)
+        result = self.run_block(10, 2, THREADROOT_TOOL_DRIFT="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("wheel-python -m pip install", self.calls())
+        self.assertEqual(self.calls().count("release_candidate verify-success"), 4)
+
+    def test_task_9_merge_rejects_approval_not_bound_to_reviewed_head(self):
+        self.bind_state()
+        (self.state / "approved-pr-head.txt").write_text("9" * 40 + "\n")
+        result = self.run_block(9, 1)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("gh pr merge ", self.calls())
+        self.assertIn("release_candidate verify-success", self.calls())
+
+    def test_task_11_tag_probe_errors_cannot_authorize_tag_or_push(self):
+        self.bind_state()
+        for environment in ({"FAKE_SHOW_REF_EXIT": "2", "FAKE_LS_REMOTE_EMPTY": "1"},
+                            {"FAKE_LS_REMOTE_EXIT": "42"}):
+            result = self.run_block(11, 2, **environment)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("git tag --annotate", self.calls())
+            self.assertNotIn("git push ", self.calls())
+            self.assertNotIn("unsupported fake", result.stderr)
+
+    def test_task_11_selected_artifact_drift_cannot_authorize_upload(self):
+        self.bind_state()
+        (self.candidate / "build/selected/threadroot-codex-0.1.0.zip").write_bytes(b"drift")
+        result = self.run_block(11, 3)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("gh release create ", self.calls())
+        self.assertFalse((self.state / "draft-url.txt").exists())
+
+    def test_task_12_prior_guards_remain_discriminating_with_valid_authority(self):
+        scenarios = ("main-drift", "selected-and-old-download-drift", "current-draft-same-size-drift",
+                     "download-failure", "existing-binding", "metadata-drift")
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario):
+                case = ReleaseAuthorityFlowTests()
+                case.setUp()
+                try:
+                    case.bind_state()
+                    environment = case.prepare_draft()
+                    current = case.directory / "current-draft"
+                    shutil.copytree(case.directory / "draft-download", current)
+                    environment["FAKE_DRAFT_ASSET_ROOT"] = str(current)
+                    binding = case.state / "publish-download-root.txt"
+                    if scenario == "main-drift":
+                        environment["FAKE_REMOTE_MAIN"] = "9" * 40
+                    elif scenario == "selected-and-old-download-drift":
+                        for root in (case.candidate / "build/selected", case.directory / "draft-download"):
+                            (root / "threadroot-codex-0.1.0.zip").write_bytes(b"same drift")
+                    elif scenario == "current-draft-same-size-drift":
+                        member = current / "threadroot-codex-0.1.0.zip"
+                        payload = member.read_bytes()
+                        member.write_bytes(bytes([payload[0] ^ 1]) + payload[1:])
+                    elif scenario == "download-failure":
+                        environment["FAKE_RELEASE_DOWNLOAD_EXIT"] = "42"
+                    elif scenario == "existing-binding":
+                        binding.write_text("existing authority\n")
+                    else:
+                        metadata = Path(environment["FAKE_RELEASE_JSON"])
+                        data = json.loads(metadata.read_text())
+                        data["name"] = "changed draft"
+                        metadata.write_text(json.dumps(data))
+                    result = case.run_block(12, 2, **environment)
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertNotIn("gh release edit ", case.calls())
+                    self.assertNotIn("unsupported fake", result.stderr)
+                    self.assertIn("release_candidate verify-success", case.calls())
+                    if scenario == "existing-binding":
+                        self.assertEqual(binding.read_text(), "existing authority\n")
+                        self.assertNotIn("gh release download ", case.calls())
+                    else:
+                        self.assertFalse(binding.exists())
+                    if scenario in ("current-draft-same-size-drift", "metadata-drift"):
+                        self.assertEqual(case.calls().count("gh release download "), 4)
+                finally:
+                    case.doCleanups()
+
+    def test_task_12_public_binding_checks_metadata_with_valid_final_pair(self):
+        for valid in (True, False):
+            with self.subTest(valid=valid):
+                case = ReleaseAuthorityFlowTests()
+                case.setUp()
+                try:
+                    case.bind_state()
+                    selected = case.candidate / "build/selected"
+                    public = case.directory / "public-download"
+                    shutil.copytree(selected, public)
+                    _write_public_release(public / "release.json", selected)
+                    if not valid:
+                        (public / "release.json").write_text('{"tag_name":"v0.1.0"}')
+                    record = case.directory / f"threadroot-v010-public-candidate-{case.commit}.txt"
+                    record.write_text(str(public) + "\n")
+                    result = case.run_block(12, 3, 1)
+                    binding = case.state / "public-download-root.txt"
+                    if valid:
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertEqual(binding.read_text(), str(public) + "\n")
+                    else:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertFalse(binding.exists())
+                    self.assertIn("release_candidate verify-success", case.calls())
+                finally:
+                    case.doCleanups()
+
+    def test_task_7_binding_copies_the_verified_pair_and_exact_bindings(self):
+        result = self.run_block(7, 4)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for source, name in ((self.fixture.record, "candidate-authority.json"),
+                             (self.receipt, "candidate-success.json")):
+            destination = self.state / name
+            self.assertEqual(destination.read_bytes(), source.read_bytes())
+            self.assertEqual(destination.stat().st_mode & 0o777, 0o400)
+        self.assertEqual((self.state / "candidate-root.txt").read_text(), f"{self.candidate}\n")
+        self.assertEqual((self.state / "reviewed-head.txt").read_text(), f"{self.commit}\n")
+        self.assertGreaterEqual(self.calls().count("release_candidate verify-success"), 2)
+
+    def test_task_7_raw_record_and_post_review_drift_cannot_create_state(self):
+        for failure in ("missing-receipt", "source-drift"):
+            with self.subTest(failure=failure):
+                if failure == "missing-receipt":
+                    self.receipt.rename(self.directory / "held-success.json")
+                else:
+                    (self.directory / "held-success.json").rename(self.receipt)
+                    (self.candidate / "source-a/README.md").write_bytes(b"drift\n")
+                result = self.run_block(7, 4)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.state.exists())
+                self.assertIn("release_candidate verify-success", self.calls())
+
+    def test_task_7_builder_failure_never_records_success(self):
+        result = self.run_block(7, 2, THREADROOT_BUILDER_FAIL="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("builder ", self.calls())
+        self.assertNotIn("release_candidate record-success", self.calls())
+
+    def test_task_7_successful_builder_creates_pair_in_success_arm(self):
+        result = self.run_block(7, 2)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        summary = dict(line.split(": ", 1) for line in result.stdout.splitlines()
+                       if line.startswith(("Authority: ", "Receipt: ")))
+        record, receipt = Path(summary["Authority"]), Path(summary["Receipt"])
+        self.assertEqual(record.name, "authority.json")
+        self.assertEqual(receipt.name, "success.json")
+        self.assertEqual(record.parent, receipt.parent)
+        self.assertTrue(record.parent.name.startswith(f"threadroot-v010-candidate-{self.commit}-"))
+        self.assertTrue(record.is_file() and receipt.is_file())
+        calls = self.calls()
+        self.assertLess(calls.index("builder "), calls.index("release_candidate record-success"))
+        self.assertLess(calls.index("release_candidate record-success"),
+                        calls.index("release_candidate verify-success"))
 
 
 if __name__ == "__main__":

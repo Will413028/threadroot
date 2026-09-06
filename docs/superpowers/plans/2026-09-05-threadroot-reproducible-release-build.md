@@ -1380,12 +1380,28 @@ test "$(git branch --show-current)" = "release/v0.1.0-readiness"
 threadroot_worktree_status="$(git status --porcelain=v1 --untracked-files=all)"
 test -z "$threadroot_worktree_status"
 threadroot_candidate_head="$(git rev-parse HEAD)"
-threadroot_candidate_record="/private/tmp/threadroot-v010-candidate-${threadroot_candidate_head}.txt"
+threadroot_attempt_root="$(mktemp -d /private/tmp/threadroot-v010-candidate-${threadroot_candidate_head}-XXXXXX)"
+threadroot_candidate_record="$threadroot_attempt_root/authority.json"
+threadroot_candidate_receipt="$threadroot_attempt_root/success.json"
+threadroot_candidate_root="$threadroot_attempt_root/candidate"
 test ! -e "$threadroot_candidate_record"
-threadroot_candidate_root="$(mktemp -d /private/tmp/threadroot-hatchling-candidate-20260905-XXXXXX)"
-python3 -m scripts.build_verified_release \
+test ! -e "$threadroot_candidate_receipt"
+test ! -e "$threadroot_candidate_root"
+if python3 -B -m scripts.build_verified_release \
   --commit "$threadroot_candidate_head" \
-  --output "$threadroot_candidate_root"
+  --output "$threadroot_candidate_root" \
+  --authority-record "$threadroot_candidate_record"; then
+  python3 -B -m scripts.release_candidate record-success \
+    --authority-record "$threadroot_candidate_record" \
+    --expected-commit "$threadroot_candidate_head" \
+    --success-receipt "$threadroot_candidate_receipt"
+else
+  exit 1
+fi
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_candidate_record" \
+  --expected-commit "$threadroot_candidate_head" \
+  --success-receipt "$threadroot_candidate_receipt"
 find "$threadroot_candidate_root/build/selected" -maxdepth 1 -type f -print | sort
 sed -n '1,4p' "$threadroot_candidate_root/build/evidence/SHA256SUMS"
 test "$(jq -r .commit \
@@ -1399,17 +1415,16 @@ test "$(jq -r .commit \
     threadroot-claude-0.1.0.zip \
     threadroot-codex-0.1.0.zip | LC_ALL=C sort -k 2
 ) | cmp - "$threadroot_candidate_root/build/evidence/SHA256SUMS"
-python3 -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
-  "$threadroot_candidate_record" \
-  "$threadroot_candidate_root"
+printf 'Successful attempt: %s\nAuthority: %s\nReceipt: %s\n' \
+  "$threadroot_candidate_head" "$threadroot_candidate_record" "$threadroot_candidate_receipt"
 ```
 
 Expected: exactly four selected artifact paths and four sorted checksum lines;
 candidate A/B, archive checks, scans, and sdist replay all pass inside the
 offline container. Preserve and report the root path and its immutable,
-HEAD-qualified candidate record; do not delete or replace the earlier
-Setuptools candidate directories. The record is created only after the build
-commit and the current selected bytes match canonical evidence. If the build
+HEAD-and-attempt-qualified authority record and success receipt; do not delete
+or replace the earlier Setuptools candidate directories. The builder creates
+the record; only its zero-exit arm creates the paired receipt. If the build
 fails, preserve the path and use a new candidate root for the next complete
 attempt rather than editing or reusing partial output.
 
@@ -1419,7 +1434,7 @@ Run:
 
 ```bash
 set -euo pipefail
-python3 scripts/check_public.py .
+python3 -B scripts/check_public.py .
 git diff --check origin/main...HEAD
 git status --short --branch
 git log --oneline origin/main..HEAD
@@ -1447,47 +1462,101 @@ Fix every Important or higher finding with a focused test-first commit, then
 repeat Steps 1-3 and both reviews against the new head. Do not waive a finding
 to reach the release deadline.
 
+Give each reviewer the exact reviewed HEAD and the two external paths reported
+by Step 2. Each reviewer independently runs this entry/exit shell from the
+worktree, inserting their read-only inspection at the indicated point. Use
+worktree-owned scripts and `python3 -B` throughout; never execute candidate
+source as review tooling. A failed entry or exit invalidates that review.
+
+```sh
+set -euo pipefail
+: "${threadroot_reviewed_head:?set the exact reviewed HEAD}"
+: "${threadroot_candidate_record:?set the successful attempt authority path}"
+: "${threadroot_candidate_receipt:?set the successful attempt receipt path}"
+test "$(git rev-parse HEAD)" = "$threadroot_reviewed_head"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_candidate_record" \
+  --expected-commit "$threadroot_reviewed_head" \
+  --success-receipt "$threadroot_candidate_receipt"
+# Perform this reviewer's read-only inspection here, using worktree-owned code.
+test "$(git rev-parse HEAD)" = "$threadroot_reviewed_head"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_candidate_record" \
+  --expected-commit "$threadroot_reviewed_head" \
+  --success-receipt "$threadroot_candidate_receipt"
+```
+
 Only after both reviews pass the unchanged head, bind the final candidate root
 once:
 
 ```bash
 set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
-threadroot_reviewed_head="$(git rev-parse HEAD)"
-threadroot_candidate_record="/private/tmp/threadroot-v010-candidate-${threadroot_reviewed_head}.txt"
+: "${threadroot_reviewed_head:?set the unchanged HEAD approved by both reviewers}"
+: "${threadroot_candidate_record:?set the reviewed external authority path}"
+: "${threadroot_candidate_receipt:?set the reviewed external receipt path}"
+test "$(git rev-parse HEAD)" = "$threadroot_reviewed_head"
 test "$(git branch --show-current)" = "release/v0.1.0-readiness"
 threadroot_worktree_status="$(git status --porcelain=v1 --untracked-files=all)"
 test -z "$threadroot_worktree_status"
-test -f "$threadroot_candidate_record"
-threadroot_candidate_root="$(tr -d '\n' < "$threadroot_candidate_record")"
-test -n "$threadroot_candidate_root"
-test -d "$threadroot_candidate_root/build/selected"
-test "$(jq -r .commit \
-  "$threadroot_candidate_root/build/evidence/build.json")" \
-  = "$threadroot_reviewed_head"
-(
-  cd "$threadroot_candidate_root/build/selected"
-  shasum -a 256 \
-    threadroot-0.1.0-py3-none-any.whl \
-    threadroot-0.1.0.tar.gz \
-    threadroot-claude-0.1.0.zip \
-    threadroot-codex-0.1.0.zip | LC_ALL=C sort -k 2
-) | cmp - "$threadroot_candidate_root/build/evidence/SHA256SUMS"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_candidate_record" \
+  --expected-commit "$threadroot_reviewed_head" \
+  --success-receipt "$threadroot_candidate_receipt"
+threadroot_candidate_root="$(jq -r .candidate_root "$threadroot_candidate_record")"
 test ! -e "$threadroot_state_root"
-install -d -m 700 "$threadroot_state_root"
-python3 -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
-  "$threadroot_state_root/candidate-root.txt" \
-  "$threadroot_candidate_root"
-python3 -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
-  "$threadroot_state_root/reviewed-head.txt" \
-  "$threadroot_reviewed_head"
+python3 -B - "$threadroot_state_root" "$threadroot_candidate_record" \
+  "$threadroot_candidate_receipt" "$threadroot_candidate_root" \
+  "$threadroot_reviewed_head" <<'PY'
+import json
+import os
+from pathlib import Path
+import sys
+
+state, record, receipt = map(Path, sys.argv[1:4])
+root, commit = sys.argv[4:6]
+record_bytes, receipt_bytes = record.read_bytes(), receipt.read_bytes()
+authority = json.loads(record_bytes)
+assert authority["candidate_root"] == root and authority["commit"] == commit
+state.mkdir(mode=0o700)
+for name, payload in (
+    ("candidate-authority.json", record_bytes),
+    ("candidate-success.json", receipt_bytes),
+    ("candidate-root.txt", (root + "\n").encode()),
+    ("reviewed-head.txt", (commit + "\n").encode()),
+):
+    destination = state / name
+    with open(destination, "xb") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+        os.chmod(destination, 0o400)
+    parent = os.open(state, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+assert (state / "candidate-authority.json").read_bytes() == record_bytes
+assert (state / "candidate-success.json").read_bytes() == receipt_bytes
+PY
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/candidate-authority.json" \
+  --expected-commit "$threadroot_reviewed_head" \
+  --success-receipt "$threadroot_state_root/candidate-success.json"
+cmp "$threadroot_candidate_record" "$threadroot_state_root/candidate-authority.json"
+cmp "$threadroot_candidate_receipt" "$threadroot_state_root/candidate-success.json"
+test "$(jq -r .candidate_root "$threadroot_state_root/candidate-authority.json")" \
+  = "$(tr -d '\n' < "$threadroot_state_root/candidate-root.txt")"
+test "$(jq -r .commit "$threadroot_state_root/candidate-authority.json")" \
+  = "$(tr -d '\n' < "$threadroot_state_root/reviewed-head.txt")"
 ```
 
-Require `candidate-root.txt` to name the most recent successful candidate and
-`reviewed-head.txt` to equal its `build/evidence/build.json` commit. Never
+Require `candidate-root.txt` and `reviewed-head.txt` to equal the verified
+authority record's `candidate_root` and `commit`. Never
 rewrite these bindings. This block is intentionally self-contained: a new
-shell derives the HEAD-qualified successful-candidate record and validates all
-candidate authority before it creates the state directory or either binding.
+shell reads the reviewed HEAD and HEAD-and-attempt-qualified pair supplied by
+both reviewers, verifies before creating state, and verifies its exact copies
+before returning. Preserve partial failures for inspection; never overwrite.
 
 ---
 
@@ -1511,6 +1580,14 @@ Run and summarize:
 
 ```bash
 set -euo pipefail
+threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
+threadroot_reviewed_head="$(tr -d '\n' < "$threadroot_state_root/reviewed-head.txt")"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/candidate-authority.json" \
+  --expected-commit "$threadroot_reviewed_head" \
+  --success-receipt "$threadroot_state_root/candidate-success.json"
+threadroot_candidate_root="$(jq -r .candidate_root "$threadroot_state_root/candidate-authority.json")"
+test "$threadroot_candidate_root" = "$(tr -d '\n' < "$threadroot_state_root/candidate-root.txt")"
 git status --short --branch
 git log --oneline origin/main..HEAD
 git diff --stat origin/main...HEAD
@@ -1552,8 +1629,13 @@ installed until the account is restored:
 ```bash
 set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
-threadroot_candidate_root="$(tr -d '\n' < "$threadroot_state_root/candidate-root.txt")"
 threadroot_reviewed_head="$(tr -d '\n' < "$threadroot_state_root/reviewed-head.txt")"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/candidate-authority.json" \
+  --expected-commit "$threadroot_reviewed_head" \
+  --success-receipt "$threadroot_state_root/candidate-success.json"
+threadroot_candidate_root="$(jq -r .candidate_root "$threadroot_state_root/candidate-authority.json")"
+test "$threadroot_candidate_root" = "$(tr -d '\n' < "$threadroot_state_root/candidate-root.txt")"
 test -n "$threadroot_candidate_root"
 test -n "$threadroot_reviewed_head"
 test ! -e "$threadroot_state_root/pr-url.txt"
@@ -1575,6 +1657,10 @@ trap threadroot_restore_account EXIT
 
 gh auth switch --hostname github.com --user Will413028
 test "$(gh api user --jq .login)" = "Will413028"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/candidate-authority.json" \
+  --expected-commit "$threadroot_reviewed_head" \
+  --success-receipt "$threadroot_state_root/candidate-success.json"
 git push --set-upstream origin \
   HEAD:refs/heads/release/v0.1.0-readiness
 
@@ -1586,6 +1672,10 @@ threadroot_pr_url="$(gh pr list \
   --json url \
   --jq '.[0].url // empty')"
 if test -z "$threadroot_pr_url"; then
+  python3 -B -m scripts.release_candidate verify-success \
+    --authority-record "$threadroot_state_root/candidate-authority.json" \
+    --expected-commit "$threadroot_reviewed_head" \
+    --success-receipt "$threadroot_state_root/candidate-success.json"
   threadroot_pr_url="$(gh pr create \
     --repo Will413028/threadroot \
     --base main \
@@ -1593,6 +1683,10 @@ if test -z "$threadroot_pr_url"; then
     --title "Release: prepare Threadroot v0.1.0" \
     --body-file /private/tmp/threadroot-v010-pr-body-20260905.md)"
 else
+  python3 -B -m scripts.release_candidate verify-success \
+    --authority-record "$threadroot_state_root/candidate-authority.json" \
+    --expected-commit "$threadroot_reviewed_head" \
+    --success-receipt "$threadroot_state_root/candidate-success.json"
   gh pr edit "$threadroot_pr_url" \
     --repo Will413028/threadroot \
     --title "Release: prepare Threadroot v0.1.0" \
@@ -1603,7 +1697,7 @@ test "$(gh pr view "$threadroot_pr_url" \
   --repo Will413028/threadroot --json headRefOid --jq .headRefOid)" \
   = "$threadroot_reviewed_head"
 
-python3 -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
+python3 -B -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
   "$threadroot_state_root/pr-url.txt" \
   "$threadroot_pr_url"
 
@@ -1621,9 +1715,14 @@ Run:
 ```bash
 set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
-threadroot_candidate_root="$(tr -d '\n' < "$threadroot_state_root/candidate-root.txt")"
-threadroot_pr_url="$(tr -d '\n' < "$threadroot_state_root/pr-url.txt")"
 threadroot_reviewed_head="$(tr -d '\n' < "$threadroot_state_root/reviewed-head.txt")"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/candidate-authority.json" \
+  --expected-commit "$threadroot_reviewed_head" \
+  --success-receipt "$threadroot_state_root/candidate-success.json"
+threadroot_candidate_root="$(jq -r .candidate_root "$threadroot_state_root/candidate-authority.json")"
+test "$threadroot_candidate_root" = "$(tr -d '\n' < "$threadroot_state_root/candidate-root.txt")"
+threadroot_pr_url="$(tr -d '\n' < "$threadroot_state_root/pr-url.txt")"
 test -n "$threadroot_candidate_root"
 test -n "$threadroot_pr_url"
 test -n "$threadroot_reviewed_head"
@@ -1640,22 +1739,30 @@ gh pr checks "$threadroot_pr_url" \
 gh pr checks "$threadroot_pr_url" \
   --repo Will413028/threadroot \
   --json name,bucket,state,link \
-  > "$threadroot_candidate_root/pr-checks.json"
+  > "$threadroot_state_root/pr-checks.json"
 jq -e '
   all(.[]; .bucket == "pass") and
   ([.[] | select(.name == "release-artifacts")] | length == 1) and
   ([.[] | select(.name | startswith("test ("))] | length == 8)
-' "$threadroot_candidate_root/pr-checks.json"
+' "$threadroot_state_root/pr-checks.json"
 gh pr diff "$threadroot_pr_url" \
   --repo Will413028/threadroot \
-  > "$threadroot_candidate_root/pr.diff"
+  > "$threadroot_state_root/pr.diff"
 test "$(git rev-parse HEAD)" = "$threadroot_reviewed_head"
 test "$(gh pr view "$threadroot_pr_url" \
   --repo Will413028/threadroot --json headRefOid --jq .headRefOid)" \
   = "$threadroot_reviewed_head"
-python3 -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/candidate-authority.json" \
+  --expected-commit "$threadroot_reviewed_head" \
+  --success-receipt "$threadroot_state_root/candidate-success.json"
+python3 -B -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
   "$threadroot_state_root/approved-pr-head.txt" \
   "$threadroot_reviewed_head"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/candidate-authority.json" \
+  --expected-commit "$threadroot_reviewed_head" \
+  --success-receipt "$threadroot_state_root/candidate-success.json"
 ```
 
 The exact matrix name formatting must first be confirmed from the returned
@@ -1691,8 +1798,14 @@ matches before asking. After explicit authorization, run:
 ```bash
 set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
-threadroot_pr_url="$(tr -d '\n' < "$threadroot_state_root/pr-url.txt")"
 threadroot_reviewed_head="$(tr -d '\n' < "$threadroot_state_root/reviewed-head.txt")"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/candidate-authority.json" \
+  --expected-commit "$threadroot_reviewed_head" \
+  --success-receipt "$threadroot_state_root/candidate-success.json"
+threadroot_candidate_root="$(jq -r .candidate_root "$threadroot_state_root/candidate-authority.json")"
+test "$threadroot_candidate_root" = "$(tr -d '\n' < "$threadroot_state_root/candidate-root.txt")"
+threadroot_pr_url="$(tr -d '\n' < "$threadroot_state_root/pr-url.txt")"
 threadroot_approved_head="$(tr -d '\n' < "$threadroot_state_root/approved-pr-head.txt")"
 test -n "$threadroot_pr_url"
 test -n "$threadroot_reviewed_head"
@@ -1712,6 +1825,10 @@ test "$(gh api user --jq .login)" = "Will413028"
 test "$(gh pr view "$threadroot_pr_url" \
   --repo Will413028/threadroot --json headRefOid --jq .headRefOid)" \
   = "$threadroot_reviewed_head"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/candidate-authority.json" \
+  --expected-commit "$threadroot_reviewed_head" \
+  --success-receipt "$threadroot_state_root/candidate-success.json"
 gh pr merge "$threadroot_pr_url" \
   --repo Will413028/threadroot \
   --merge \
@@ -1731,8 +1848,14 @@ no-clobber write:
 ```bash
 set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
-threadroot_pr_url="$(tr -d '\n' < "$threadroot_state_root/pr-url.txt")"
 threadroot_reviewed_head="$(tr -d '\n' < "$threadroot_state_root/reviewed-head.txt")"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/candidate-authority.json" \
+  --expected-commit "$threadroot_reviewed_head" \
+  --success-receipt "$threadroot_state_root/candidate-success.json"
+threadroot_candidate_root="$(jq -r .candidate_root "$threadroot_state_root/candidate-authority.json")"
+test "$threadroot_candidate_root" = "$(tr -d '\n' < "$threadroot_state_root/candidate-root.txt")"
+threadroot_pr_url="$(tr -d '\n' < "$threadroot_state_root/pr-url.txt")"
 threadroot_approved_head="$(tr -d '\n' < "$threadroot_state_root/approved-pr-head.txt")"
 test -n "$threadroot_pr_url"
 test -n "$threadroot_reviewed_head"
@@ -1794,7 +1917,7 @@ test "$(jq -r .headRefOid <<< "$threadroot_merge_record_after")" \
   = "$threadroot_reviewed_head"
 test "$(jq -r .mergeCommit.oid <<< "$threadroot_merge_record_after")" \
   = "$threadroot_release_commit"
-python3 -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
+python3 -B -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
   "$threadroot_state_root/release-commit.txt" \
   "$threadroot_release_commit"
 ```
@@ -1813,6 +1936,12 @@ Under the personal GitHub account, run:
 set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
 threadroot_reviewed_head="$(tr -d '\n' < "$threadroot_state_root/reviewed-head.txt")"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/candidate-authority.json" \
+  --expected-commit "$threadroot_reviewed_head" \
+  --success-receipt "$threadroot_state_root/candidate-success.json"
+threadroot_candidate_root="$(jq -r .candidate_root "$threadroot_state_root/candidate-authority.json")"
+test "$threadroot_candidate_root" = "$(tr -d '\n' < "$threadroot_state_root/candidate-root.txt")"
 threadroot_approved_head="$(tr -d '\n' < "$threadroot_state_root/approved-pr-head.txt")"
 threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
 test "$threadroot_approved_head" = "$threadroot_reviewed_head"
@@ -1862,6 +1991,12 @@ authorization. After authorization, create and preserve a fresh root with:
 set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
 threadroot_reviewed_head="$(tr -d '\n' < "$threadroot_state_root/reviewed-head.txt")"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/candidate-authority.json" \
+  --expected-commit "$threadroot_reviewed_head" \
+  --success-receipt "$threadroot_state_root/candidate-success.json"
+threadroot_candidate_root="$(jq -r .candidate_root "$threadroot_state_root/candidate-authority.json")"
+test "$threadroot_candidate_root" = "$(tr -d '\n' < "$threadroot_state_root/candidate-root.txt")"
 threadroot_approved_head="$(tr -d '\n' < "$threadroot_state_root/approved-pr-head.txt")"
 threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
 test "$threadroot_approved_head" = "$threadroot_reviewed_head"
@@ -1873,10 +2008,26 @@ test "$(git rev-parse refs/remotes/origin/main)" \
 threadroot_worktree_status="$(git status --porcelain=v1 --untracked-files=all)"
 test -z "$threadroot_worktree_status"
 test ! -e "$threadroot_state_root/final-root.txt"
-threadroot_final_root="$(mktemp -d /private/tmp/threadroot-v010-final-20260905-XXXXXX)"
-python3 -m scripts.build_verified_release \
+threadroot_final_attempt="$(mktemp -d /private/tmp/threadroot-v010-final-20260905-XXXXXX)"
+threadroot_final_root="$threadroot_final_attempt/candidate"
+test ! -e "$threadroot_state_root/final-authority.json"
+test ! -e "$threadroot_state_root/final-success.json"
+if python3 -B -m scripts.build_verified_release \
   --commit "$threadroot_release_commit" \
-  --output "$threadroot_final_root"
+  --output "$threadroot_final_root" \
+  --authority-record "$threadroot_state_root/final-authority.json"; then
+  python3 -B -m scripts.release_candidate record-success \
+    --authority-record "$threadroot_state_root/final-authority.json" \
+    --expected-commit "$threadroot_release_commit" \
+    --success-receipt "$threadroot_state_root/final-success.json"
+else
+  exit 1
+fi
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
+threadroot_final_root="$(jq -r .candidate_root "$threadroot_state_root/final-authority.json")"
 find "$threadroot_final_root/build/selected" -maxdepth 1 -type f -print | sort
 test "$(find "$threadroot_final_root/build/selected" \
   -maxdepth 1 -type f | wc -l | tr -d ' ')" = "4"
@@ -1891,7 +2042,7 @@ test "$(jq -r .commit \
     threadroot-claude-0.1.0.zip \
     threadroot-codex-0.1.0.zip | LC_ALL=C sort -k 2
 ) | cmp - "$threadroot_final_root/build/evidence/SHA256SUMS"
-python3 -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
+python3 -B -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
   "$threadroot_state_root/final-root.txt" \
   "$threadroot_final_root"
 ```
@@ -1926,8 +2077,13 @@ Run:
 ```bash
 set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
-threadroot_final_root="$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
 threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
+threadroot_final_root="$(jq -r .candidate_root "$threadroot_state_root/final-authority.json")"
+test "$threadroot_final_root" = "$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
 threadroot_selected="$threadroot_final_root/build/selected"
 test -d "$threadroot_selected"
 (
@@ -1949,11 +2105,35 @@ jq -e --arg commit "$threadroot_release_commit" '
   (.builder_definition_sha256 | test("^[0-9a-f]{64}$")) and
   (.artifacts | length == 4)
 ' "$threadroot_final_root/build/evidence/build.json"
-python3 scripts/check_public.py \
+python3 -B scripts/check_public.py \
   "$threadroot_final_root/source-a" \
   "$threadroot_final_root/source-b" \
   "$threadroot_selected" \
   "$threadroot_final_root/build/evidence/unpacked"
+test ! -e "$threadroot_state_root/validation-root.txt"
+threadroot_validation_root="$(mktemp -d /private/tmp/threadroot-v010-validation-20260905-XXXXXX)"
+chmod 700 "$threadroot_validation_root"
+python3 -B - "$threadroot_validation_root" "$threadroot_final_root" \
+  "$threadroot_state_root/validation-root.txt" <<'PY'
+import os
+from pathlib import Path
+import stat
+import sys
+
+root, candidate, binding = map(Path, sys.argv[1:])
+assert root.is_absolute() and root == root.resolve()
+assert not root.is_relative_to(Path.cwd().resolve())
+assert not root.is_relative_to(candidate.resolve())
+assert stat.S_IMODE(root.stat().st_mode) == 0o700
+with binding.open("x", encoding="utf-8") as stream:
+    stream.write(str(root) + "\n")
+    stream.flush()
+    os.fsync(stream.fileno())
+PY
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
 ```
 
 If the private denylist is available, rerun the last command with
@@ -1967,15 +2147,39 @@ Create a fresh virtual environment and run:
 ```bash
 set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
-threadroot_final_root="$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
-python3 -m venv "$threadroot_final_root/wheel-smoke-venv"
-"$threadroot_final_root/wheel-smoke-venv/bin/python" -m pip install \
+threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
+threadroot_final_root="$(jq -r .candidate_root "$threadroot_state_root/final-authority.json")"
+test "$threadroot_final_root" = "$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
+threadroot_validation_root="$(tr -d '\n' < "$threadroot_state_root/validation-root.txt")"
+test -d "$threadroot_validation_root"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
+python3 -B -m venv "$threadroot_validation_root/wheel-smoke-venv"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
+"$threadroot_validation_root/wheel-smoke-venv/bin/python" -m pip install \
   --no-index --no-deps --no-cache-dir --force-reinstall \
   "$threadroot_final_root/build/selected/threadroot-0.1.0-py3-none-any.whl"
-"$threadroot_final_root/wheel-smoke-venv/bin/python" -m pip check
-"$threadroot_final_root/wheel-smoke-venv/bin/threadroot" --version
-"$threadroot_final_root/wheel-smoke-venv/bin/python" -c \
+"$threadroot_validation_root/wheel-smoke-venv/bin/python" -m pip check
+"$threadroot_validation_root/wheel-smoke-venv/bin/threadroot" --version
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
+"$threadroot_validation_root/wheel-smoke-venv/bin/python" -c \
   'from importlib.metadata import requires, version; assert version("threadroot") == "0.1.0"; assert requires("threadroot") in (None, [])'
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
 ```
 
 Expected version: exactly `threadroot 0.1.0` according to the existing CLI
@@ -1988,8 +2192,16 @@ Run every CLI call with explicit disposable `HOME` and XDG roots:
 ```bash
 set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
-threadroot_final_root="$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
-threadroot_smoke_root="$threadroot_final_root/cli-smoke"
+threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
+threadroot_final_root="$(jq -r .candidate_root "$threadroot_state_root/final-authority.json")"
+test "$threadroot_final_root" = "$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
+threadroot_validation_root="$(tr -d '\n' < "$threadroot_state_root/validation-root.txt")"
+test -d "$threadroot_validation_root"
+threadroot_smoke_root="$threadroot_validation_root/cli-smoke"
 threadroot_smoke_home="$threadroot_smoke_root/home"
 threadroot_smoke_xdg="$threadroot_smoke_root/xdg"
 threadroot_smoke_vault="$threadroot_smoke_root/vault"
@@ -1998,34 +2210,58 @@ printf 'unrelated sentinel\n' > "$threadroot_smoke_root/sentinel.txt"
 shasum -a 256 "$threadroot_smoke_root/sentinel.txt" \
   > "$threadroot_smoke_root/sentinel.before"
 
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
 HOME="$threadroot_smoke_home" XDG_CONFIG_HOME="$threadroot_smoke_xdg" \
-  "$threadroot_final_root/wheel-smoke-venv/bin/threadroot" \
+  "$threadroot_validation_root/wheel-smoke-venv/bin/threadroot" \
   init --vault "$threadroot_smoke_vault" --json \
   > "$threadroot_smoke_root/init-preview.json"
 test ! -e "$threadroot_smoke_vault"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
 HOME="$threadroot_smoke_home" XDG_CONFIG_HOME="$threadroot_smoke_xdg" \
-  "$threadroot_final_root/wheel-smoke-venv/bin/threadroot" \
+  "$threadroot_validation_root/wheel-smoke-venv/bin/threadroot" \
   init --vault "$threadroot_smoke_vault" --json --apply \
   > "$threadroot_smoke_root/init-apply.json"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
 HOME="$threadroot_smoke_home" XDG_CONFIG_HOME="$threadroot_smoke_xdg" \
-  "$threadroot_final_root/wheel-smoke-venv/bin/threadroot" \
+  "$threadroot_validation_root/wheel-smoke-venv/bin/threadroot" \
   doctor --vault "$threadroot_smoke_vault" --json \
   > "$threadroot_smoke_root/doctor.json"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
 HOME="$threadroot_smoke_home" XDG_CONFIG_HOME="$threadroot_smoke_xdg" \
-  "$threadroot_final_root/wheel-smoke-venv/bin/threadroot" \
+  "$threadroot_validation_root/wheel-smoke-venv/bin/threadroot" \
   claim --vault "$threadroot_smoke_vault" \
   --path daily/2042-04-03.md --json \
   > "$threadroot_smoke_root/claim-preview.json"
 test ! -e "$threadroot_smoke_vault/daily/2042-04-03.md"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
 HOME="$threadroot_smoke_home" XDG_CONFIG_HOME="$threadroot_smoke_xdg" \
-  "$threadroot_final_root/wheel-smoke-venv/bin/threadroot" \
+  "$threadroot_validation_root/wheel-smoke-venv/bin/threadroot" \
   claim --vault "$threadroot_smoke_vault" \
   --path daily/2042-04-03.md --json --apply \
   > "$threadroot_smoke_root/claim-apply.json"
 test -f "$threadroot_smoke_vault/daily/2042-04-03.md"
 test ! -s "$threadroot_smoke_vault/daily/2042-04-03.md"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
 if HOME="$threadroot_smoke_home" XDG_CONFIG_HOME="$threadroot_smoke_xdg" \
-  "$threadroot_final_root/wheel-smoke-venv/bin/threadroot" \
+  "$threadroot_validation_root/wheel-smoke-venv/bin/threadroot" \
   claim --vault "$threadroot_smoke_vault" \
   --path daily/2042-04-03.md --json --apply \
   > "$threadroot_smoke_root/claim-repeat.json"; then
@@ -2034,6 +2270,10 @@ else
   threadroot_repeat_code="$?"
 fi
 test "$threadroot_repeat_code" = "5"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
 ```
 
 The repeat command is the only expected nonzero command; capture it without
@@ -2042,14 +2282,22 @@ aborting the surrounding verification shell. Validate all six JSON files with:
 ```bash
 set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
-threadroot_final_root="$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
+threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
+threadroot_final_root="$(jq -r .candidate_root "$threadroot_state_root/final-authority.json")"
+test "$threadroot_final_root" = "$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
+threadroot_validation_root="$(tr -d '\n' < "$threadroot_state_root/validation-root.txt")"
+test -d "$threadroot_validation_root"
 test -n "$threadroot_final_root"
 test -d "$threadroot_final_root"
-threadroot_smoke_root="$threadroot_final_root/cli-smoke"
+threadroot_smoke_root="$threadroot_validation_root/cli-smoke"
 threadroot_smoke_home="$threadroot_smoke_root/home"
 threadroot_smoke_xdg="$threadroot_smoke_root/xdg"
 threadroot_smoke_vault="$threadroot_smoke_root/vault"
-python3 - \
+python3 -B - \
   "$threadroot_smoke_root/init-preview.json" \
   "$threadroot_smoke_root/init-apply.json" \
   "$threadroot_smoke_root/doctor.json" \
@@ -2071,7 +2319,10 @@ assert [(item["command"], item["ok"], item["applied"]) for item in documents] ==
     ("claim", True, True),
     ("claim", False, False),
 ]
-assert all(not item["issues"] for item in documents[:5])
+assert all(not documents[index]["issues"] for index in (0, 1, 3, 4))
+assert [(issue["code"], issue["level"]) for issue in documents[2]["issues"]] == [
+    ("git.not_found", "info"),
+]
 assert documents[5]["issues"][0]["code"] == "target.conflict"
 PY
 shasum -a 256 "$threadroot_smoke_root/sentinel.txt" \
@@ -2086,6 +2337,10 @@ threadroot_unexpected_xdg="$(find \
 test -z "$threadroot_unexpected_home"
 test -z "$threadroot_unexpected_xdg"
 cp -R "$threadroot_smoke_vault" "$threadroot_smoke_root/vault-pristine"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
 ```
 
 Require no normal host path in command arguments or JSON output. The copied
@@ -2100,23 +2355,31 @@ strings. Create fresh bundles with Threadroot's safe extractor, not
 ```bash
 set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
-threadroot_final_root="$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
+threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
+threadroot_final_root="$(jq -r .candidate_root "$threadroot_state_root/final-authority.json")"
+test "$threadroot_final_root" = "$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
+threadroot_validation_root="$(tr -d '\n' < "$threadroot_state_root/validation-root.txt")"
+test -d "$threadroot_validation_root"
 threadroot_selected="$threadroot_final_root/build/selected"
 command -v claude >/dev/null
 command -v codex >/dev/null
-threadroot_host_root="$threadroot_final_root/host-smoke"
-threadroot_claude_bundle="$threadroot_host_root/claude-bundle"
-threadroot_codex_bundle="$threadroot_host_root/codex-bundle"
-threadroot_claude_home="$threadroot_host_root/claude-home"
-threadroot_claude_config="$threadroot_host_root/claude-config"
-threadroot_claude_cache="$threadroot_host_root/claude-cache"
-threadroot_codex_home="$threadroot_host_root/codex-home"
-threadroot_codex_config="$threadroot_host_root/codex-config"
-threadroot_codex_data="$threadroot_host_root/codex-data"
-threadroot_codex_cache="$threadroot_host_root/codex-cache"
-threadroot_codex_state="$threadroot_host_root/codex-state"
-threadroot_claude_tmp="$threadroot_host_root/claude-tmp"
-threadroot_codex_tmp="$threadroot_host_root/codex-tmp"
+threadroot_host_root="$threadroot_validation_root/host-smoke"
+threadroot_claude_bundle="$threadroot_host_root/claude-smoke/bundle"
+threadroot_codex_bundle="$threadroot_host_root/codex-smoke/bundle"
+threadroot_claude_home="$threadroot_host_root/claude-smoke/home"
+threadroot_claude_config="$threadroot_host_root/claude-smoke/config"
+threadroot_claude_cache="$threadroot_host_root/claude-smoke/cache"
+threadroot_codex_home="$threadroot_host_root/codex-smoke/home"
+threadroot_codex_config="$threadroot_host_root/codex-smoke/config"
+threadroot_codex_data="$threadroot_host_root/codex-smoke/data"
+threadroot_codex_cache="$threadroot_host_root/codex-smoke/cache"
+threadroot_codex_state="$threadroot_host_root/codex-smoke/state"
+threadroot_claude_tmp="$threadroot_host_root/claude-smoke/tmp"
+threadroot_codex_tmp="$threadroot_host_root/codex-smoke/tmp"
 install -d -m 700 \
   "$threadroot_host_root" \
   "$threadroot_claude_home" \
@@ -2129,7 +2392,7 @@ install -d -m 700 \
   "$threadroot_codex_state" \
   "$threadroot_claude_tmp" \
   "$threadroot_codex_tmp"
-python3 - \
+python3 -B - \
   "$threadroot_selected/threadroot-claude-0.1.0.zip" \
   "$threadroot_claude_bundle" \
   "$threadroot_selected/threadroot-codex-0.1.0.zip" \
@@ -2143,9 +2406,13 @@ extract_regular_zip(Path(sys.argv[1]), Path(sys.argv[2]))
 extract_regular_zip(Path(sys.argv[3]), Path(sys.argv[4]))
 PY
 cp -R "$threadroot_claude_bundle" \
-  "$threadroot_host_root/claude-bundle-pristine"
+  "$threadroot_host_root/claude-smoke/bundle-pristine"
 cp -R "$threadroot_codex_bundle" \
-  "$threadroot_host_root/codex-bundle-pristine"
+  "$threadroot_host_root/codex-smoke/bundle-pristine"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
 ```
 
 Run `claude plugin validate --strict .` from the Claude bundle. Then run local
@@ -2160,23 +2427,31 @@ native command forms exactly:
 ```bash
 set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
-threadroot_final_root="$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
+threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
+threadroot_final_root="$(jq -r .candidate_root "$threadroot_state_root/final-authority.json")"
+test "$threadroot_final_root" = "$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
+threadroot_validation_root="$(tr -d '\n' < "$threadroot_state_root/validation-root.txt")"
+test -d "$threadroot_validation_root"
 test -n "$threadroot_final_root"
 test -d "$threadroot_final_root"
-threadroot_smoke_root="$threadroot_final_root/cli-smoke"
-threadroot_host_root="$threadroot_final_root/host-smoke"
-threadroot_claude_bundle="$threadroot_host_root/claude-bundle"
-threadroot_codex_bundle="$threadroot_host_root/codex-bundle"
-threadroot_claude_home="$threadroot_host_root/claude-home"
-threadroot_claude_config="$threadroot_host_root/claude-config"
-threadroot_claude_cache="$threadroot_host_root/claude-cache"
-threadroot_codex_home="$threadroot_host_root/codex-home"
-threadroot_codex_config="$threadroot_host_root/codex-config"
-threadroot_codex_data="$threadroot_host_root/codex-data"
-threadroot_codex_cache="$threadroot_host_root/codex-cache"
-threadroot_codex_state="$threadroot_host_root/codex-state"
-threadroot_claude_tmp="$threadroot_host_root/claude-tmp"
-threadroot_codex_tmp="$threadroot_host_root/codex-tmp"
+threadroot_smoke_root="$threadroot_validation_root/cli-smoke"
+threadroot_host_root="$threadroot_validation_root/host-smoke"
+threadroot_claude_bundle="$threadroot_host_root/claude-smoke/bundle"
+threadroot_codex_bundle="$threadroot_host_root/codex-smoke/bundle"
+threadroot_claude_home="$threadroot_host_root/claude-smoke/home"
+threadroot_claude_config="$threadroot_host_root/claude-smoke/config"
+threadroot_claude_cache="$threadroot_host_root/claude-smoke/cache"
+threadroot_codex_home="$threadroot_host_root/codex-smoke/home"
+threadroot_codex_config="$threadroot_host_root/codex-smoke/config"
+threadroot_codex_data="$threadroot_host_root/codex-smoke/data"
+threadroot_codex_cache="$threadroot_host_root/codex-smoke/cache"
+threadroot_codex_state="$threadroot_host_root/codex-smoke/state"
+threadroot_claude_tmp="$threadroot_host_root/claude-smoke/tmp"
+threadroot_codex_tmp="$threadroot_host_root/codex-smoke/tmp"
 command -v claude >/dev/null
 command -v codex >/dev/null
 threadroot_claude() {
@@ -2211,16 +2486,36 @@ threadroot_codex --version \
   cd "$threadroot_claude_bundle"
   threadroot_claude plugin validate --strict .
 )
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
 threadroot_claude plugin marketplace add \
   "$threadroot_claude_bundle" --scope user
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
 threadroot_claude plugin install threadroot@threadroot --scope user
 threadroot_claude plugin list --json \
-  > "$threadroot_host_root/claude-list-installed.json"
+  > "$threadroot_host_root/claude-smoke/list-installed.json"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
 threadroot_codex plugin marketplace add \
   "$threadroot_codex_bundle" --json
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
 threadroot_codex plugin add threadroot@threadroot --json
 threadroot_codex plugin list --json \
-  > "$threadroot_host_root/codex-list-installed.json"
+  > "$threadroot_host_root/codex-smoke/list-installed.json"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
 ```
 
 Require each list result to report the installed
@@ -2244,24 +2539,32 @@ every `threadroot_host_*` path, and redeclares the exact `threadroot_claude` and
 ```bash
 set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
-threadroot_final_root="$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
+threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
+threadroot_final_root="$(jq -r .candidate_root "$threadroot_state_root/final-authority.json")"
+test "$threadroot_final_root" = "$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
+threadroot_validation_root="$(tr -d '\n' < "$threadroot_state_root/validation-root.txt")"
+test -d "$threadroot_validation_root"
 test -n "$threadroot_final_root"
 test -d "$threadroot_final_root"
-threadroot_smoke_root="$threadroot_final_root/cli-smoke"
+threadroot_smoke_root="$threadroot_validation_root/cli-smoke"
 threadroot_smoke_vault="$threadroot_smoke_root/vault"
-threadroot_host_root="$threadroot_final_root/host-smoke"
-threadroot_claude_bundle="$threadroot_host_root/claude-bundle"
-threadroot_codex_bundle="$threadroot_host_root/codex-bundle"
-threadroot_claude_home="$threadroot_host_root/claude-home"
-threadroot_claude_config="$threadroot_host_root/claude-config"
-threadroot_claude_cache="$threadroot_host_root/claude-cache"
-threadroot_codex_home="$threadroot_host_root/codex-home"
-threadroot_codex_config="$threadroot_host_root/codex-config"
-threadroot_codex_data="$threadroot_host_root/codex-data"
-threadroot_codex_cache="$threadroot_host_root/codex-cache"
-threadroot_codex_state="$threadroot_host_root/codex-state"
-threadroot_claude_tmp="$threadroot_host_root/claude-tmp"
-threadroot_codex_tmp="$threadroot_host_root/codex-tmp"
+threadroot_host_root="$threadroot_validation_root/host-smoke"
+threadroot_claude_bundle="$threadroot_host_root/claude-smoke/bundle"
+threadroot_codex_bundle="$threadroot_host_root/codex-smoke/bundle"
+threadroot_claude_home="$threadroot_host_root/claude-smoke/home"
+threadroot_claude_config="$threadroot_host_root/claude-smoke/config"
+threadroot_claude_cache="$threadroot_host_root/claude-smoke/cache"
+threadroot_codex_home="$threadroot_host_root/codex-smoke/home"
+threadroot_codex_config="$threadroot_host_root/codex-smoke/config"
+threadroot_codex_data="$threadroot_host_root/codex-smoke/data"
+threadroot_codex_cache="$threadroot_host_root/codex-smoke/cache"
+threadroot_codex_state="$threadroot_host_root/codex-smoke/state"
+threadroot_claude_tmp="$threadroot_host_root/claude-smoke/tmp"
+threadroot_codex_tmp="$threadroot_host_root/codex-smoke/tmp"
 command -v claude >/dev/null
 command -v codex >/dev/null
 threadroot_claude() {
@@ -2288,33 +2591,61 @@ threadroot_codex() {
     LC_ALL=C.UTF-8 \
     codex "$@"
 }
-"$threadroot_final_root/wheel-smoke-venv/bin/python" \
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
+"$threadroot_validation_root/wheel-smoke-venv/bin/python" \
   -m pip uninstall -y threadroot
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
 threadroot_claude plugin remove threadroot@threadroot --scope user
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
 threadroot_claude plugin marketplace remove threadroot --scope user
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
 threadroot_codex plugin remove threadroot@threadroot --json
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
 threadroot_codex plugin marketplace remove threadroot --json
 threadroot_claude plugin list --json \
-  > "$threadroot_host_root/claude-list-removed.json"
+  > "$threadroot_host_root/claude-smoke/list-removed.json"
 threadroot_codex plugin list --json \
-  > "$threadroot_host_root/codex-list-removed.json"
-if "$threadroot_final_root/wheel-smoke-venv/bin/python" \
+  > "$threadroot_host_root/codex-smoke/list-removed.json"
+if "$threadroot_validation_root/wheel-smoke-venv/bin/python" \
   -c 'import threadroot'; then
   false
 fi
-if test -e "$threadroot_final_root/wheel-smoke-venv/bin/threadroot"; then
+if test -e "$threadroot_validation_root/wheel-smoke-venv/bin/threadroot"; then
   false
 fi
 diff -qr "$threadroot_smoke_root/vault-pristine" \
   "$threadroot_smoke_vault"
-diff -qr "$threadroot_host_root/claude-bundle-pristine" \
+diff -qr "$threadroot_host_root/claude-smoke/bundle-pristine" \
   "$threadroot_claude_bundle"
-diff -qr "$threadroot_host_root/codex-bundle-pristine" \
+diff -qr "$threadroot_host_root/codex-smoke/bundle-pristine" \
   "$threadroot_codex_bundle"
 shasum -a 256 "$threadroot_smoke_root/sentinel.txt" \
   > "$threadroot_smoke_root/sentinel.after-uninstall"
 cmp "$threadroot_smoke_root/sentinel.before" \
   "$threadroot_smoke_root/sentinel.after-uninstall"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
 ```
 
 Require the wheel import and executable to be absent and the two native list
@@ -2360,9 +2691,15 @@ After authorization, run:
 ```bash
 set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
+threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
+threadroot_final_root="$(jq -r .candidate_root "$threadroot_state_root/final-authority.json")"
+test "$threadroot_final_root" = "$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
 threadroot_reviewed_head="$(tr -d '\n' < "$threadroot_state_root/reviewed-head.txt")"
 threadroot_approved_head="$(tr -d '\n' < "$threadroot_state_root/approved-pr-head.txt")"
-threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
 test "$threadroot_approved_head" = "$threadroot_reviewed_head"
 test "$(git rev-parse HEAD)" = "$threadroot_reviewed_head"
 git merge-base --is-ancestor \
@@ -2395,10 +2732,18 @@ test "$(gh api user --jq .login)" = "Will413028"
 threadroot_remote_tag_records="$(git ls-remote --tags origin \
   'refs/tags/v0.1.0' 'refs/tags/v0.1.0^{}')"
 test -z "$threadroot_remote_tag_records"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
 git tag --annotate v0.1.0 "$threadroot_release_commit" \
   --message "Threadroot v0.1.0"
 test "$(git rev-parse 'refs/tags/v0.1.0^{}')" \
   = "$threadroot_release_commit"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
 git push origin refs/tags/v0.1.0:refs/tags/v0.1.0
 threadroot_remote_peeled="$(git ls-remote --tags origin \
   'refs/tags/v0.1.0^{}' | awk '{print $1}')"
@@ -2420,10 +2765,15 @@ authorization, run:
 ```bash
 set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
+threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
+threadroot_final_root="$(jq -r .candidate_root "$threadroot_state_root/final-authority.json")"
+test "$threadroot_final_root" = "$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
 threadroot_reviewed_head="$(tr -d '\n' < "$threadroot_state_root/reviewed-head.txt")"
 threadroot_approved_head="$(tr -d '\n' < "$threadroot_state_root/approved-pr-head.txt")"
-threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
-threadroot_final_root="$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
 threadroot_selected="$threadroot_final_root/build/selected"
 test "$threadroot_approved_head" = "$threadroot_reviewed_head"
 test "$(git rev-parse HEAD)" = "$threadroot_reviewed_head"
@@ -2461,6 +2811,10 @@ test "$(gh api user --jq .login)" = "Will413028"
     threadroot-claude-0.1.0.zip \
     threadroot-codex-0.1.0.zip | LC_ALL=C sort -k 2
 ) | cmp - "$threadroot_final_root/build/evidence/SHA256SUMS"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
 threadroot_draft_url="$(gh release create v0.1.0 \
   --repo Will413028/threadroot \
   --title "Threadroot v0.1.0" \
@@ -2471,7 +2825,7 @@ threadroot_draft_url="$(gh release create v0.1.0 \
   "$threadroot_selected/threadroot-0.1.0.tar.gz" \
   "$threadroot_selected/threadroot-claude-0.1.0.zip" \
   "$threadroot_selected/threadroot-codex-0.1.0.zip")"
-python3 -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
+python3 -B -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
   "$threadroot_state_root/draft-url.txt" \
   "$threadroot_draft_url"
 threadroot_restore_account
@@ -2491,10 +2845,15 @@ Switch to `Will413028` with the same restore trap, then run:
 ```bash
 set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
-threadroot_final_root="$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
+threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
+threadroot_final_root="$(jq -r .candidate_root "$threadroot_state_root/final-authority.json")"
+test "$threadroot_final_root" = "$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
 threadroot_reviewed_head="$(tr -d '\n' < "$threadroot_state_root/reviewed-head.txt")"
 threadroot_approved_head="$(tr -d '\n' < "$threadroot_state_root/approved-pr-head.txt")"
-threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
 threadroot_selected="$threadroot_final_root/build/selected"
 test "$threadroot_approved_head" = "$threadroot_reviewed_head"
 test "$(git rev-parse HEAD)" = "$threadroot_reviewed_head"
@@ -2526,7 +2885,7 @@ gh release view v0.1.0 \
   --repo Will413028/threadroot \
   --json assets,body,isDraft,isPrerelease,name,tagName,url \
   > "$threadroot_state_root/draft-before.json"
-python3 -c 'from pathlib import Path; import json,sys; data=json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")); Path(sys.argv[2]).write_text(data["body"], encoding="utf-8")' \
+python3 -B -c 'from pathlib import Path; import json,sys; data=json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")); Path(sys.argv[2]).write_text(data["body"], encoding="utf-8")' \
   "$threadroot_state_root/draft-before.json" \
   "$threadroot_state_root/draft-body.md"
 cmp "$threadroot_state_root/draft-body.md" docs/releases/v0.1.0.md
@@ -2542,7 +2901,7 @@ jq -e '
     "threadroot-codex-0.1.0.zip"
   ]
 ' "$threadroot_state_root/draft-before.json"
-python3 - \
+python3 -B - \
   "$threadroot_state_root/draft-before.json" \
   "$threadroot_selected" <<'PY'
 import json
@@ -2587,7 +2946,7 @@ cmp "$threadroot_state_root/draft-before-contract.json" \
     threadroot-claude-0.1.0.zip \
     threadroot-codex-0.1.0.zip | LC_ALL=C sort -k 2
 ) | cmp - "$threadroot_final_root/build/evidence/SHA256SUMS"
-python3 -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
+python3 -B -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
   "$threadroot_state_root/draft-download-root.txt" \
   "$threadroot_draft_download"
 threadroot_restore_account
@@ -2632,10 +2991,15 @@ downloaded hashes, and final source commit, then publish with one mutation:
 ```bash
 set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
+threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
+threadroot_final_root="$(jq -r .candidate_root "$threadroot_state_root/final-authority.json")"
+test "$threadroot_final_root" = "$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
 threadroot_reviewed_head="$(tr -d '\n' < "$threadroot_state_root/reviewed-head.txt")"
 threadroot_approved_head="$(tr -d '\n' < "$threadroot_state_root/approved-pr-head.txt")"
-threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
-threadroot_final_root="$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
 threadroot_draft_download="$(tr -d '\n' < "$threadroot_state_root/draft-download-root.txt")"
 threadroot_selected="$threadroot_final_root/build/selected"
 threadroot_publish_binding="$threadroot_state_root/publish-download-root.txt"
@@ -2688,7 +3052,7 @@ for threadroot_asset in \
     --pattern "$threadroot_asset" \
     --dir "$threadroot_publish_download"
 done
-python3 - "$threadroot_publish_download" <<'PY'
+python3 -B - "$threadroot_publish_download" <<'PY'
 from pathlib import Path
 import stat
 import sys
@@ -2753,9 +3117,13 @@ for threadroot_asset in \
   cmp "$threadroot_selected/$threadroot_asset" \
     "$threadroot_publish_download/$threadroot_asset"
 done
-python3 -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
+python3 -B -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
   "$threadroot_publish_binding" \
   "$threadroot_publish_download"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
 gh release edit v0.1.0 \
   --repo Will413028/threadroot \
   --draft=false \
@@ -2781,10 +3149,15 @@ Use only unauthenticated `curl` calls with user configuration disabled:
 ```bash
 set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
+threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
+threadroot_final_root="$(jq -r .candidate_root "$threadroot_state_root/final-authority.json")"
+test "$threadroot_final_root" = "$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
 threadroot_reviewed_head="$(tr -d '\n' < "$threadroot_state_root/reviewed-head.txt")"
 threadroot_approved_head="$(tr -d '\n' < "$threadroot_state_root/approved-pr-head.txt")"
-threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
-threadroot_final_root="$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
 threadroot_selected="$threadroot_final_root/build/selected"
 threadroot_public_candidate_record="/private/tmp/threadroot-v010-public-candidate-${threadroot_release_commit}.txt"
 test "$threadroot_approved_head" = "$threadroot_reviewed_head"
@@ -2827,7 +3200,7 @@ jq -e '
     "threadroot-codex-0.1.0.zip"
   ]
 ' "$threadroot_public_download/release.json"
-python3 - \
+python3 -B - \
   "$threadroot_public_download/release.json" \
   docs/releases/v0.1.0.md \
   "$threadroot_selected" <<'PY'
@@ -2861,8 +3234,8 @@ for threadroot_asset in \
   cmp "$threadroot_selected/$threadroot_asset" \
     "$threadroot_public_download/$threadroot_asset"
 done
-python3 scripts/check_public.py "$threadroot_public_download"
-python3 - \
+python3 -B scripts/check_public.py "$threadroot_public_download"
+python3 -B - \
   "$threadroot_public_download" \
   "$threadroot_final_root/source-a" \
   "$threadroot_final_root/build/evidence/build.json" <<'PY'
@@ -2903,7 +3276,7 @@ validate_host_zip(
     "codex",
 )
 PY
-python3 -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
+python3 -B -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
   "$threadroot_public_candidate_record" \
   "$threadroot_public_download"
 ```
@@ -2927,10 +3300,15 @@ new shell with:
 ```bash
 set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
+threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
+python3 -B -m scripts.release_candidate verify-success \
+  --authority-record "$threadroot_state_root/final-authority.json" \
+  --expected-commit "$threadroot_release_commit" \
+  --success-receipt "$threadroot_state_root/final-success.json"
+threadroot_final_root="$(jq -r .candidate_root "$threadroot_state_root/final-authority.json")"
+test "$threadroot_final_root" = "$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
 threadroot_reviewed_head="$(tr -d '\n' < "$threadroot_state_root/reviewed-head.txt")"
 threadroot_approved_head="$(tr -d '\n' < "$threadroot_state_root/approved-pr-head.txt")"
-threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
-threadroot_final_root="$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
 threadroot_selected="$threadroot_final_root/build/selected"
 threadroot_public_candidate_record="/private/tmp/threadroot-v010-public-candidate-${threadroot_release_commit}.txt"
 test -f "$threadroot_public_candidate_record"
@@ -2963,7 +3341,7 @@ jq -e '
     "threadroot-codex-0.1.0.zip"
   ]
 ' "$threadroot_public_download/release.json"
-python3 - \
+python3 -B - \
   "$threadroot_public_download/release.json" \
   docs/releases/v0.1.0.md \
   "$threadroot_selected" <<'PY'
@@ -2995,7 +3373,7 @@ for threadroot_asset in \
   cmp "$threadroot_selected/$threadroot_asset" \
     "$threadroot_public_download/$threadroot_asset"
 done
-python3 -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
+python3 -B -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
   "$threadroot_state_root/public-download-root.txt" \
   "$threadroot_public_download"
 ```
