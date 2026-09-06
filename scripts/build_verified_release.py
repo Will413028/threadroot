@@ -20,6 +20,7 @@ RUNNER_FILES = (
     ".dockerignore", "requirements/release.txt", "tools/release/Dockerfile",
     "pyproject.toml", "scripts/build_verified_release.py", "scripts/release_archives.py",
     "scripts/release_artifacts.py", "scripts/build_release.py", "scripts/check_public.py",
+    "scripts/release_candidate.py",
 )
 
 
@@ -226,6 +227,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--commit", required=True)
     parser.add_argument("--epoch", type=int)
     parser.add_argument("--denylist")
+    parser.add_argument("--authority-record")
     return parser
 
 
@@ -233,6 +235,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = _parser().parse_args(argv)
         if args.inside:
+            if args.authority_record is not None:
+                raise VerifiedReleaseError("candidate integrity verification failed")
             if args.epoch is None:
                 raise VerifiedReleaseError("epoch is required")
             return _inside(args)
@@ -244,6 +248,13 @@ def main(argv: list[str] | None = None) -> int:
         _safe_output(Path(args.output))
         denylist = Path(args.denylist) if args.denylist else None
         _validate_host_denylist(denylist)
+        from scripts.release_candidate import validate_authority_path, bind_candidate, verify_candidate
+        try:
+            if not args.authority_record:
+                raise ValueError
+            authority_record = validate_authority_path(Path(args.authority_record), Path(args.output))
+        except Exception:
+            raise VerifiedReleaseError("candidate integrity verification failed") from None
         if _git("status", "--porcelain=v1", "--untracked-files=all"):
             raise VerifiedReleaseError("repository must be clean")
         if _git("rev-parse", "--verify", args.commit + "^{commit}").strip() != args.commit:
@@ -271,9 +282,15 @@ def main(argv: list[str] | None = None) -> int:
                  (str(source_b), "[source-b]"), (str(output), "[output]"))
         if denylist is not None:
             paths += ((str(denylist), "[denylist]"),)
-        observed = _run_docker(_docker_build_argv(image, source_a), "builder", paths)
-        observed.update(_run_docker(run_argv, "artifact phase", paths))
-        print(_public_status("verified release completed", observed, paths))
+        _run_docker(_docker_build_argv(image, source_a), "builder", paths)
+        _run_docker(run_argv, "artifact phase", paths)
+        try:
+            bind_candidate(output, args.commit, authority_record)
+            if verify_candidate(authority_record, args.commit) != output.resolve(strict=True):
+                raise ValueError
+        except Exception:
+            raise VerifiedReleaseError("candidate integrity verification failed") from None
+        print("verified release build completed")
         return 0
     except VerifiedReleaseError as error:
         print(str(error), file=sys.stderr)

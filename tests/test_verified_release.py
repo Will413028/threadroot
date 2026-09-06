@@ -7,16 +7,21 @@ import hashlib
 import importlib
 import inspect
 import io
+import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+import tarfile
 from tempfile import TemporaryDirectory
 import types
 import unittest
 from unittest.mock import Mock, call, patch
 
 from scripts import build_verified_release as entry
+from scripts import release_candidate as authority
+from scripts.release_artifacts import BASE_IMAGE, EXPECTED_PACKAGES
 
 
 SHA = "a" * 40
@@ -33,6 +38,7 @@ EXPECTED_RUNNER_FILES = (
     ".dockerignore", "requirements/release.txt", "tools/release/Dockerfile",
     "pyproject.toml", "scripts/build_verified_release.py", "scripts/release_archives.py",
     "scripts/release_artifacts.py", "scripts/build_release.py", "scripts/check_public.py",
+    "scripts/release_candidate.py",
 )
 
 
@@ -40,9 +46,33 @@ EXPECTED_RUNNER_FILES = (
 def outer_fixture(*, git_values=None, parity=True):
     """Keep filesystem effects real; isolate Git, extraction, and Docker."""
     with TemporaryDirectory() as directory, ExitStack() as stack:
-        root = Path(directory)
+        root = Path(directory).resolve()
         repository = root / "repository"
         repository.mkdir()
+        payload = io.BytesIO()
+        with tarfile.open(fileobj=payload, mode="w", format=tarfile.PAX_FORMAT,
+                          pax_headers={"comment": SHA}) as archive_file:
+            for name, data in (("tools", None), ("tools/release", None),
+                               ("requirements", None),
+                               ("tools/release/Dockerfile", b"FROM pinned\n"),
+                               ("requirements/release.txt", b"lock\n")):
+                member = tarfile.TarInfo(name)
+                member.mode = 0o755 if data is None else 0o644
+                member.type = tarfile.DIRTYPE if data is None else tarfile.REGTYPE
+                member.size = len(data) if data else 0
+                archive_file.addfile(member, io.BytesIO(data) if data else None)
+
+        def authority_git(argv, **kwargs):
+            if argv == ["git", "archive", "--format=tar", SHA]:
+                return subprocess.CompletedProcess(argv, 0, payload.getvalue())
+            if argv == ["git", "rev-parse", "--show-toplevel"]:
+                return subprocess.CompletedProcess(argv, 0, str(repository))
+            if argv == ["git", "show", "-s", "--format=%ct", SHA]:
+                return subprocess.CompletedProcess(argv, 0, "123\n")
+            raise AssertionError(argv)
+
+        stack.enter_context(patch.object(authority, "subprocess", types.SimpleNamespace(
+            run=authority_git, SubprocessError=subprocess.SubprocessError)))
         events = []
         answers = {STATUS: "", RESOLVE: SHA + "\n", KIND: "commit\n", EPOCH: "123\n"}
         answers.update(git_values or {})
@@ -61,6 +91,26 @@ def outer_fixture(*, git_values=None, parity=True):
             (destination / "requirements").mkdir()
             (destination / "tools/release/Dockerfile").write_bytes(b"FROM pinned\n")
             (destination / "requirements/release.txt").write_bytes(b"lock\n")
+        def populate(destination):
+            if destination.name == "source-b":
+                artifacts = []
+                names = ("threadroot-0.1.0-py3-none-any.whl", "threadroot-0.1.0.tar.gz",
+                         "threadroot-claude-0.1.0.zip", "threadroot-codex-0.1.0.zip")
+                for name in names:
+                    data = (name + "\n").encode()
+                    artifacts.append(dict(name=name, size=len(data), sha256=hashlib.sha256(data).hexdigest()))
+                    for group in ("candidate-a", "candidate-b", "selected"):
+                        target = destination.parent / "build" / group
+                        target.mkdir(parents=True, exist_ok=True)
+                        (target / name).write_bytes(data)
+                evidence = destination.parent / "build/evidence"
+                evidence.mkdir()
+                evidence.joinpath("build.json").write_bytes(authority._canonical_json(dict(
+                    schema=1, commit=SHA, source_date_epoch=123, platform="linux/amd64",
+                    python="3.14.7", base_image=BASE_IMAGE, builder_definition_sha256="0" * 64,
+                    packages=EXPECTED_PACKAGES, artifacts=artifacts)))
+                evidence.joinpath("SHA256SUMS").write_text("".join(
+                    f"{item['sha256']}  {item['name']}\n" for item in sorted(artifacts, key=lambda item: item['name'])))
 
         # Reload binds today's eager import to the dependency seam. A future
         # function-local import uses exactly the same seam, without a new target.
@@ -68,11 +118,18 @@ def outer_fixture(*, git_values=None, parity=True):
         importlib.reload(entry)
         stack.enter_context(patch.object(entry, "REPOSITORY", repository))
         fixture = types.SimpleNamespace(root=root, repository=repository, output=root / "output",
-            events=events, extractor=extractor,
+            authority=root / "authority.json", events=events, extractor=extractor,
             git=stack.enter_context(patch.object(entry, "_git", side_effect=git)),
             parity=stack.enter_context(patch.object(entry, "_runner_bytes_match", return_value=parity)),
             archive=stack.enter_context(patch.object(entry, "_archive_commit", side_effect=archive)),
-            run=stack.enter_context(patch.object(entry.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", ""))))
+            run=Mock(return_value=subprocess.CompletedProcess([], 0, "", "")))
+        def docker(argv, **kwargs):
+            result = fixture.run(argv, **kwargs)
+            if argv[:2] == ["docker", "run"]:
+                populate(fixture.output / "source-b")
+            return result
+        stack.enter_context(patch.object(entry, "subprocess", types.SimpleNamespace(
+            run=docker, CalledProcessError=subprocess.CalledProcessError)))
         stack.enter_context(patch.object(entry.os, "getuid", return_value=501, create=True))
         stack.enter_context(patch.object(entry.os, "getgid", return_value=20, create=True))
         try:
@@ -90,7 +147,8 @@ def invoke(args):
 
 
 def outer_args(fixture, **changes):
-    values = {"commit": SHA, "output": str(fixture.output), **changes}
+    values = {"commit": SHA, "output": str(fixture.output),
+              "authority-record": str(fixture.authority), **changes}
     return [item for key, value in values.items() for item in ("--" + key, str(value))]
 
 
@@ -104,6 +162,86 @@ def validate(argv, context):
 
 
 class VerifiedReleaseTests(unittest.TestCase):
+    def test_outer_mode_requires_an_absolute_missing_external_authority_record(self):
+        for kind in ("missing", "relative", "existing", "repository", "candidate", "parent", "control", "symlink"):
+            with self.subTest(kind=kind), outer_fixture() as fixture:
+                value = fixture.authority
+                if kind == "relative": value = Path("authority.json")
+                elif kind == "existing": value.write_bytes(b"keep")
+                elif kind == "repository": value = fixture.repository / "authority.json"
+                elif kind == "candidate": value = fixture.output / "authority.json"
+                elif kind == "parent": value = fixture.root / "missing/authority.json"
+                elif kind == "control": value = fixture.root / "secret\nname"
+                elif kind == "symlink": value.symlink_to(fixture.root / "absent")
+                args = outer_args(fixture, **{"authority-record": value})
+                if kind == "missing": args = args[:-2]
+                self.assert_rejected(fixture, args, "candidate integrity verification failed")
+
+    def test_authority_preflight_fails_before_any_docker_command(self):
+        with outer_fixture() as fixture:
+            fixture.authority.write_bytes(b"competitor")
+            self.assert_rejected(fixture, outer_args(fixture), "candidate integrity verification failed")
+            self.assertEqual(fixture.authority.read_bytes(), b"competitor")
+
+    def test_inside_mode_rejects_authority_record(self):
+        with outer_fixture() as fixture:
+            result = invoke(outer_args(fixture, epoch=123) + ["--inside"])
+            self.assertEqual(result, (1, "", "candidate integrity verification failed\n"))
+            fixture.run.assert_not_called()
+
+    def test_builder_binds_then_verifies_before_fixed_success_message(self):
+        with outer_fixture() as fixture:
+            self.assertEqual(invoke(outer_args(fixture)), (0, "verified release build completed\n", ""))
+            self.assertEqual(authority.verify_candidate(fixture.authority, SHA), fixture.output)
+            self.assertEqual({p.name for p in fixture.root.iterdir()}, {"repository", "output", "authority.json"})
+
+    def test_builder_failure_never_creates_a_success_receipt(self):
+        with outer_fixture() as fixture:
+            original = authority.verify_candidate
+            def fail_after_bind(record, commit):
+                original(record, commit)
+                raise authority.CandidateIntegrityError("SYNTHETIC_PRIVATE_PAYLOAD")
+            with patch.object(authority, "verify_candidate", side_effect=fail_after_bind):
+                self.assertEqual(invoke(outer_args(fixture)), (1, "", "candidate integrity verification failed\n"))
+            self.assertTrue(fixture.authority.exists())
+            self.assertEqual({p.name for p in fixture.root.iterdir()}, {"repository", "output", "authority.json"})
+
+    def test_outer_builder_with_real_git_exports_and_authority(self):
+        from tests import test_release_candidate as fixtures
+        fixture = fixtures.CandidateAuthorityTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        fixture._prepare()
+        for name, data in (("tools/release/Dockerfile", b"FROM pinned\n"),
+                           ("requirements/release.txt", b"lock\n")):
+            target = fixture.repository / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        fixture._git("add", "tools/release/Dockerfile", "requirements/release.txt")
+        fixture._git("commit", "--no-gpg-sign", "-qm", "synthetic builder inputs")
+        commit = fixture._git("rev-parse", "HEAD").stdout.strip()
+        output = fixture.root / "actual-output"
+        def artifact_phase(argv, phase, paths):
+            if phase == "artifact phase":
+                shutil.copytree(fixture.candidate / "build", output / "build", dirs_exist_ok=True)
+                evidence = output / "build/evidence/build.json"
+                data = json.loads(evidence.read_bytes())
+                data.update(commit=commit, source_date_epoch=int(fixture._git(
+                    "show", "-s", "--format=%ct", commit).stdout))
+                evidence.write_bytes(authority._canonical_json(data))
+            return set()
+        with fixture._in_repository(), patch.object(entry, "REPOSITORY", fixture.repository), \
+             patch.object(entry, "_host_identity", return_value=(501, 20)), \
+             patch.object(entry, "_runner_bytes_match", return_value=True), \
+             patch.object(entry, "_run_docker", side_effect=artifact_phase):
+            self.assertEqual(invoke(["--commit", commit, "--output", str(output),
+                                    "--authority-record", str(fixture.record)]),
+                             (0, "verified release build completed\n", ""))
+            self.assertEqual(authority.verify_candidate(fixture.record, commit), output)
+            receipt = fixture.root / "success.json"
+            authority.record_successful_attempt(fixture.record, commit, receipt)
+            self.assertEqual(authority.verify_successful_attempt(receipt, fixture.record, commit), output)
+
     def assert_rejected(self, fixture, args, message, *, no_git=False):
         result = invoke(args)
         with self.subTest(check="public error"):
@@ -354,7 +492,7 @@ class VerifiedReleaseTests(unittest.TestCase):
         self.assertFalse(any(name == module or name.startswith(module + ".")
             for name in modules for module in ("scripts.release_archives", "scripts.release_artifacts")), modules)
 
-    def test_runner_parity_reads_exact_nine_files_and_compares_each_git_blob(self):
+    def test_runner_files_bind_release_candidate_module_bytes(self):
         self.assertEqual(entry.RUNNER_FILES, EXPECTED_RUNNER_FILES)
         repository = Path("/synthetic/repository")
         payloads = {name: f"synthetic runner {index}\n".encode() for index, name in enumerate(EXPECTED_RUNNER_FILES)}
@@ -473,7 +611,7 @@ class VerifiedReleaseTests(unittest.TestCase):
             self.assertEqual(denylist.stat().st_nlink, 1)
             result = invoke(outer_args(fixture, denylist=denylist))
             with self.subTest(check="status"):
-                self.assertEqual(result, (0, "verified release completed\n", ""))
+                self.assertEqual(result, (0, "verified release build completed\n", ""))
             argv = fixture.run.call_args_list[-1].args[0]
             mounts = [argv[i + 1] for i, value in enumerate(argv) if value == "--mount"]
             self.assertEqual(len(mounts), 4)
@@ -499,7 +637,7 @@ class VerifiedReleaseTests(unittest.TestCase):
                     fixture.run.side_effect = child
                     result = invoke(outer_args(fixture, **({"denylist": denylist} if denylisted else {})))
                     if phase == "success":
-                        self.assertEqual(result, (0, "verified release completed " + labels + "\n", ""))
+                        self.assertEqual(result, (0, "verified release build completed\n", ""))
                     else:
                         self.assertEqual(result, (1, "", "verified release " + phase + " failed " + labels + "\n"))
 
@@ -510,8 +648,7 @@ class VerifiedReleaseTests(unittest.TestCase):
                 if observed == "source-a":
                     raw += " " + str(fixture.output / "source-a")
                 fixture.run.return_value = subprocess.CompletedProcess([], 0, raw, raw)
-                suffix = " [source-a]" if observed == "source-a" else ""
-                self.assertEqual(invoke(outer_args(fixture)), (0, "verified release completed" + suffix + "\n", ""))
+                self.assertEqual(invoke(outer_args(fixture)), (0, "verified release build completed\n", ""))
 
     def test_inside_mode_requires_container_sentinel_and_calls_build_and_verify(self):
         args = ["--inside", "--source-a", "/source-a", "--source-b", "/source-b", "--output",

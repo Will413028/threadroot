@@ -61,16 +61,25 @@ Hatchling is the PEP 517 build backend. Keep `python -m build` as the ordinary c
 For a canonical maintainer build, run this exact sequence from a clean checkout:
 
 ```bash
-threadroot_release_output="$(mktemp -d)"
-python3 -m scripts.build_verified_release \
-  --commit "$(git rev-parse HEAD)" \
-  --output "$threadroot_release_output"
-find "$threadroot_release_output/build/selected" -maxdepth 1 -type f -print | sort
+set -euo pipefail
+attempt_root="$(mktemp -d)"
+attempt_root="$(cd "$attempt_root" && pwd -P)"
+candidate_root="$attempt_root/candidate"
+authority_record="$attempt_root/authority.json"
+success_receipt="$attempt_root/success.json"
+release_commit="$(git rev-parse HEAD)"
+python3 -B -m scripts.build_verified_release --commit "$release_commit" --output "$candidate_root" --authority-record "$authority_record"
+python3 -B -m scripts.release_candidate record-success --authority-record "$authority_record" --expected-commit "$release_commit" --success-receipt "$success_receipt"
+python3 -B -m scripts.release_candidate verify-success --authority-record "$authority_record" --expected-commit "$release_commit" --success-receipt "$success_receipt"
 ```
 
 The canonical builder's provisioning phase is network-enabled and may pull the digest-pinned image and hash-approved wheels. The artifact container then runs with exact `--network none`.
 
 The output root must be outside the repository and must be missing or empty. Failures retain the candidate/evidence directories for inspection. Use a new output root for a complete retry so the preserved evidence remains inspectable.
+
+The sequence resolves the temporary parent to its real absolute path, including on macOS. Candidate, authority record, and success receipt start as separate missing paths. The authority record and receipt remain outside the candidate and repository. The builder derives the epoch from the selected Git commit. To apply a local denylist, add `--denylist "$denylist"` to the builder command with an absolute regular-file path.
+
+The shell stops on every nonzero exit. Only a zero builder exit permits `record-success`; `verify-success` then freshly verifies the paired receipt, authority record, and candidate. The builder never creates a success receipt itself. A failed attempt's surviving authority record is diagnostic-only: do not create a receipt for it later. Start a fresh attempt instead. The selected artifacts are under `$candidate_root/build/selected`.
 
 Docker is not an end-user or runtime requirement. It is required only for maintainers running the canonical release build.
 

@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
+import textwrap
 from tempfile import TemporaryDirectory
 import tomllib
 import unittest
@@ -58,10 +60,17 @@ EXPECTED_CI_COMMANDS = [
     "python scripts/check_public.py .",
     "python scripts/check_public.py dist",
 ]
-EXPECTED_RELEASE_COMMAND = (
-    'python3 -m scripts.build_verified_release --commit "$GITHUB_SHA" '
-    '--output "$RUNNER_TEMP/threadroot-release"'
-)
+EXPECTED_RELEASE_COMMAND = '''set -euo pipefail
+attempt_root="$(mktemp -d)"
+attempt_root="$(cd "$attempt_root" && pwd -P)"
+candidate_root="$attempt_root/candidate"
+authority_record="$attempt_root/authority.json"
+success_receipt="$attempt_root/success.json"
+release_commit="$(git rev-parse HEAD)"
+python3 -B -m scripts.build_verified_release --commit "$release_commit" --output "$candidate_root" --authority-record "$authority_record"
+python3 -B -m scripts.release_candidate record-success --authority-record "$authority_record" --expected-commit "$release_commit" --success-receipt "$success_receipt"
+python3 -B -m scripts.release_candidate verify-success --authority-record "$authority_record" --expected-commit "$release_commit" --success-receipt "$success_receipt"
+'''
 EXPECTED_CI_WORKFLOW = """name: ci
 
 on:
@@ -100,8 +109,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: python3 -m scripts.build_verified_release --commit "$GITHUB_SHA" --output "$RUNNER_TEMP/threadroot-release"
-"""
+      - run: |
+""" + "".join("          " + line + "\n" for line in EXPECTED_RELEASE_COMMAND.splitlines())
 
 
 def _section(markdown: str, heading: str) -> str:
@@ -475,6 +484,84 @@ def _write_task_10_checksum(path: Path) -> None:
 
 
 class DocumentationTests(unittest.TestCase):
+    def _assert_canonical_success_arm(self, command: str) -> None:
+        for failure, expected in (("build", ["build"]),
+                                  ("record-success", ["build", "record-success"]),
+                                  ("verify-success", ["build", "record-success", "verify-success"]),
+                                  ("", ["build", "record-success", "verify-success"])):
+            with self.subTest(failure=failure), TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                fake_bin, call_log = _fake_release_commands(root)
+                (root / "alias").symlink_to(root, target_is_directory=True)
+                _write_executable(fake_bin / "mktemp", f"#!{sys.executable}\n" + '''
+import os
+from pathlib import Path
+import sys
+assert sys.argv[1:] == ["-d"]
+root = Path(os.environ["THREADROOT_TEST_TEMP_ROOT"])
+(root / "attempt").mkdir()
+print(root / "alias/attempt")
+''')
+                # Absolute interpreter avoids recursive PATH lookup by the fake git.
+                _write_executable(fake_bin / "git", f"#!{sys.executable}\nprint('{'1' * 40}')\n")
+                _write_executable(fake_bin / "python3", f"#!{sys.executable}\n" + '''
+import json
+import os
+from pathlib import Path
+import sys
+args = sys.argv[1:]
+assert args[:2] == ["-B", "-m"], args
+assert args[2] in {"scripts.build_verified_release", "scripts.release_candidate"}
+phase = "build" if args[2] == "scripts.build_verified_release" else args[3]
+options = args[3:] if phase == "build" else args[4:]
+values = dict(zip(options[::2], options[1::2]))
+expected = {"--commit", "--output", "--authority-record"} if phase == "build" else {
+    "--authority-record", "--expected-commit", "--success-receipt"}
+assert set(values) == expected and len(options) == len(expected) * 2, args
+assert values.get("--commit", values.get("--expected-commit")) == "1" * 40
+record = Path(values["--authority-record"])
+assert record.is_absolute() and record.parent == record.parent.resolve(strict=True)
+candidate = record.parent / "candidate"
+receipt = record.parent / "success.json"
+if phase == "build":
+    assert Path(values["--output"]) == candidate
+    assert not any(path.exists() for path in (candidate, record, receipt))
+    candidate.mkdir()
+    record.write_text("synthetic diagnostic authority")
+else:
+    assert Path(values["--success-receipt"]) == receipt
+    assert candidate.is_dir() and record.is_file()
+    if phase == "record-success":
+        assert not receipt.exists()
+    else:
+        assert receipt.is_file()
+with Path(os.environ["THREADROOT_TEST_CALL_LOG"]).open("a") as stream:
+    stream.write(phase + "\\n")
+if os.environ["FAIL_PHASE"] == phase:
+    raise SystemExit(23)
+if phase == "record-success":
+    receipt.write_text("synthetic receipt")
+''')
+                result = _run_release_plan_block(command, root, fake_bin, call_log,
+                    FAIL_PHASE=failure, THREADROOT_TEST_TEMP_ROOT=str(root))
+                self.assertEqual(result.returncode, 23 if failure else 0, result.stderr)
+                self.assertEqual(call_log.read_text().splitlines(), expected)
+                self.assertEqual((root / "attempt/success.json").exists(),
+                                 failure in ("", "verify-success"))
+
+    def test_ci_canonical_build_records_and_verifies_success(self):
+        workflow = Path(".github/workflows/ci.yml").read_text()
+        release = _yaml_mapping_body(_yaml_mapping_body(workflow, "jobs", 0), "release-artifacts", 2)
+        command = textwrap.dedent(release.split("      - run: |\n", 1)[1])
+        self.assertEqual(command, EXPECTED_RELEASE_COMMAND)
+        self._assert_canonical_success_arm(command)
+
+    def test_testing_guide_canonical_build_records_and_verifies_success(self):
+        section = _section(Path("docs/testing.md").read_text(), "Canonical release build")
+        command = re.findall(r"^```bash\s*$\n(.*?)^```\s*$", section, re.MULTILINE | re.DOTALL)[0]
+        self.assertEqual(command, EXPECTED_RELEASE_COMMAND)
+        self._assert_canonical_success_arm(command)
+
     def test_non_overwrite_contract_distinguishes_vault_from_default_pointer(self) -> None:
         sections = {
             "README Safety": _section(
@@ -714,7 +801,7 @@ class DocumentationTests(unittest.TestCase):
         self.assertRegex(release_actions[0], r"@[0-9a-f]{40}$")
         self.assertEqual(
             re.findall(r"^\s+- run:\s*(.+)$", release_job, re.MULTILINE),
-            [EXPECTED_RELEASE_COMMAND],
+            ["|"],
         )
         self.assertEqual(
             re.findall(
@@ -749,7 +836,8 @@ class DocumentationTests(unittest.TestCase):
     def test_ci_contract_rejects_hidden_yaml_mutations(self) -> None:
         workflow_path = Path(".github/workflows/ci.yml")
         workflow = workflow_path.read_text(encoding="utf-8")
-        canonical_release_step = f"      - run: {EXPECTED_RELEASE_COMMAND}\n"
+        canonical_release_step = "      - run: |\n" + "".join(
+            "          " + line + "\n" for line in EXPECTED_RELEASE_COMMAND.splitlines())
         canonical_permissions = "permissions:\n  contents: read\n\njobs:\n"
         mutations = {
             "quoted release permissions": workflow.replace(
@@ -1730,16 +1818,7 @@ exit 97
     def test_canonical_release_build_is_documented(self) -> None:
         testing = Path("docs/testing.md").read_text(encoding="utf-8")
         section = _section(testing, "Canonical release build")
-        expected_commands = "\n".join(
-            (
-                'threadroot_release_output="$(mktemp -d)"',
-                "python3 -m scripts.build_verified_release \\",
-                '  --commit "$(git rev-parse HEAD)" \\',
-                '  --output "$threadroot_release_output"',
-                'find "$threadroot_release_output/build/selected" '
-                "-maxdepth 1 -type f -print | sort",
-            )
-        )
+        expected_commands = EXPECTED_RELEASE_COMMAND.rstrip("\n")
 
         self.assertEqual(
             re.findall(
