@@ -55,6 +55,12 @@ class ReleaseSourceSnapshot:
     entries: tuple[ReleaseSourceEntry, ...]
 
 
+@dataclass(frozen=True)
+class ValidatedZipMember:
+    filename: str
+    raw_filename: bytes
+
+
 def _fail(code: str, message: str) -> ReleaseArchiveError:
     return ReleaseArchiveError(code, message)
 
@@ -152,7 +158,11 @@ def _decode_zip_name(raw: bytes, flags: int) -> str:
     if b"\0" in raw:
         raise _fail("unsafe_path", "unsafe archive path")
     try:
-        return raw.decode("utf-8" if flags & 0x800 else "cp437")
+        encoding = "utf-8" if flags & 0x800 else "cp437"
+        decoded = raw.decode(encoding)
+        if decoded.encode(encoding) != raw:
+            raise _fail("invalid_archive", "invalid ZIP filename encoding")
+        return decoded
     except UnicodeDecodeError:
         raise _fail("invalid_archive", "invalid ZIP filename encoding") from None
 
@@ -162,13 +172,16 @@ def _validate_zip_member_stream(
     method: int,
     expected_size: int,
     expected_crc: int,
+    max_member_size: int | None,
 ) -> None:
+    if max_member_size is not None and expected_size > max_member_size:
+        raise _fail("invalid_archive", "ZIP member exceeds size limit")
     try:
         if method == zipfile.ZIP_STORED:
             data = compressed
         elif method == zipfile.ZIP_DEFLATED:
             decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
-            data = decompressor.decompress(compressed) + decompressor.flush()
+            data = decompressor.decompress(compressed, expected_size + 1)
             if (
                 not decompressor.eof
                 or decompressor.unused_data
@@ -179,6 +192,8 @@ def _validate_zip_member_stream(
             raise _fail("invalid_archive", "unsupported ZIP compression")
     except zlib.error:
         raise _fail("invalid_archive", "invalid ZIP compressed payload") from None
+    if max_member_size is not None and len(data) > max_member_size:
+        raise _fail("invalid_archive", "ZIP member exceeds size limit")
     if (
         len(data) != expected_size
         or (binascii.crc32(data) & 0xFFFFFFFF) != expected_crc
@@ -186,7 +201,14 @@ def _validate_zip_member_stream(
         raise _fail("invalid_archive", "invalid ZIP size or CRC")
 
 
-def _validate_zip_structure(payload: bytes, infos: list[zipfile.ZipInfo]) -> None:
+def _validate_zip_structure(
+    payload: bytes,
+    infos: list[zipfile.ZipInfo],
+    *,
+    max_member_size: int | None = None,
+) -> tuple[ValidatedZipMember, ...]:
+    if max_member_size is not None and max_member_size < 0:
+        raise _fail("invalid_archive", "invalid ZIP member size limit")
     marker = payload.rfind(b"PK\x05\x06")
     if marker < 0 or marker + 22 > len(payload):
         raise _fail("invalid_archive", "missing ZIP end record")
@@ -203,6 +225,7 @@ def _validate_zip_structure(payload: bytes, infos: list[zipfile.ZipInfo]) -> Non
         raise _fail("invalid_archive", "invalid ZIP end record")
     central_cursor = central_offset
     local_cursor = 0
+    validated_members: list[ValidatedZipMember] = []
     for info in infos:
         if central_cursor + 46 > marker or payload[central_cursor : central_cursor + 4] != b"PK\x01\x02":
             raise _fail("invalid_archive", "invalid ZIP central record")
@@ -256,20 +279,41 @@ def _validate_zip_structure(payload: bytes, infos: list[zipfile.ZipInfo]) -> Non
             or cexternal != info.external_attr
         ):
             raise _fail("invalid_archive", "ZIP local and central records differ")
+        if max_member_size is not None and cusize > max_member_size:
+            raise _fail("invalid_archive", "ZIP member exceeds size limit")
+        if cmethod == zipfile.ZIP_STORED and (
+            ccsize != cusize
+            or (
+                max_member_size is not None
+                and ccsize > max_member_size
+            )
+        ):
+            raise _fail("invalid_archive", "invalid stored ZIP size")
+        validated_members.append(ValidatedZipMember(decoded, craw_name))
         _validate_zip_member_stream(
             payload[compressed_start:local_cursor],
             cmethod,
             cusize,
             ccrc,
+            max_member_size,
         )
     if local_cursor != central_offset or central_cursor != marker:
         raise _fail("invalid_archive", "ZIP contains unowned or interstitial bytes")
+    return tuple(validated_members)
 
 
-def validate_zip_framing(payload: bytes) -> None:
+def validate_zip_framing(
+    payload: bytes,
+    *,
+    max_member_size: int | None = None,
+) -> tuple[ValidatedZipMember, ...]:
     try:
         with zipfile.ZipFile(io.BytesIO(payload)) as archive:
-            _validate_zip_structure(payload, archive.infolist())
+            return _validate_zip_structure(
+                payload,
+                archive.infolist(),
+                max_member_size=max_member_size,
+            )
     except ReleaseArchiveError:
         raise
     except (OSError, ValueError, zipfile.BadZipFile, zlib.error):
@@ -1045,6 +1089,14 @@ def validate_wheel_payload(artifact: bytes, source: ReleaseSourceSnapshot, versi
                 )
                 if stat.S_IMODE(info.external_attr >> 16) != expected_mode:
                     raise _fail("unsupported_mode", "wheel mode mismatch")
+                expected_external_attr = (
+                    (expected_type | expected_mode) << 16
+                )
+                if info.external_attr != expected_external_attr:
+                    raise _fail(
+                        "metadata_mismatch",
+                        "wheel external attributes mismatch",
+                    )
                 local_flags = int.from_bytes(raw[info.header_offset + 6 : info.header_offset + 8], "little")
                 if (
                     info.date_time != expected_timestamp
@@ -1205,7 +1257,7 @@ def validate_host_zip_payload(artifact: bytes, source: ReleaseSourceSnapshot, ho
                     or info.create_system != 3
                     or info.flag_bits != 0x800
                     or local_flags != 0x800
-                    or info.external_attr >> 16 != stat.S_IFREG | 0o644
+                    or info.external_attr != (stat.S_IFREG | 0o644) << 16
                     or info.compress_type != zipfile.ZIP_DEFLATED
                     or info.extra
                     or info.comment

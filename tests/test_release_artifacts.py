@@ -781,6 +781,73 @@ class PromotionIdentityTests(unittest.TestCase):
 
 
 class BuildAndVerifyTests(unittest.TestCase):
+    def test_byte_identical_wheel_with_external_attr_low_bits_fails_before_evidence(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_a = _make_source(root / "a")
+            source_b = _make_source(root / "b")
+            output = root / "output"
+            wheel = root / "valid.whl"
+            order, payloads = _wheel_payloads(source_a)
+            _write_wheel(wheel, order, payloads)
+            malformed = _mutate_zip_fixed_header(
+                wheel.read_bytes(),
+                "external-low-bits",
+            )
+
+            def build(
+                source: Path,
+                candidate: Path,
+                work: Path,
+                epoch: int,
+                **kwargs: object,
+            ) -> None:
+                candidate.mkdir(parents=True, exist_ok=True)
+                for name in expected_asset_names("0.1.0"):
+                    payload = malformed if name.endswith(".whl") else name.encode()
+                    (candidate / name).write_bytes(payload)
+
+            with (
+                _canonical_environment(WHEEL_EPOCH),
+                patch.object(
+                    release_artifacts,
+                    "_build_one_source",
+                    side_effect=build,
+                ),
+                patch.object(release_artifacts, "validate_sdist_payload"),
+                patch.object(release_artifacts, "validate_host_zip_payload"),
+                patch.object(release_artifacts, "_replay_sdist"),
+                patch.object(release_artifacts, "_scan"),
+                patch.object(
+                    release_artifacts,
+                    "extract_regular_zip_payload",
+                    side_effect=_fake_extract,
+                ),
+                patch.object(
+                    release_artifacts,
+                    "extract_regular_tar_payload",
+                    side_effect=_fake_extract,
+                ),
+                self.assertRaises(ReleaseArtifactError),
+            ):
+                release_artifacts.build_and_verify(
+                    source_a,
+                    source_b,
+                    output,
+                    "a" * 40,
+                    WHEEL_EPOCH,
+                )
+
+            wheel_name = expected_asset_names("0.1.0")[0]
+            self.assertEqual(
+                (output / "candidate-a" / wheel_name).read_bytes(),
+                (output / "candidate-b" / wheel_name).read_bytes(),
+            )
+            self.assertFalse((output / "selected").exists())
+            self.assertFalse((output / "selected.pending").exists())
+            self.assertFalse((output / "evidence/build.json").exists())
+            self.assertFalse((output / "evidence/SHA256SUMS").exists())
+
     def test_byte_identical_wheel_with_covert_fixed_header_fails_before_evidence(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

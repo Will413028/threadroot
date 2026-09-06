@@ -17,6 +17,7 @@ import unittest
 from unittest.mock import patch
 import warnings
 import zipfile
+import zlib
 
 from scripts import build_release
 from scripts import release_archives
@@ -375,6 +376,7 @@ def _mutate_first_tar_header(
     reserved_tail: bytes | None = None,
     padding_marker: bytes | None = None,
     name_tail: bytes | None = None,
+    name: bytes | None = None,
     size_field: bytes | None = None,
 ) -> bytes:
     changed = bytearray(payload)
@@ -398,13 +400,17 @@ def _mutate_first_tar_header(
         if name_end < 0 or name_end + 1 + len(name_tail) > 100:
             raise AssertionError("first tar name has insufficient NUL padding")
         header[name_end + 1 : name_end + 1 + len(name_tail)] = name_tail
+    if name is not None:
+        if not name or len(name) > 100:
+            raise AssertionError("first tar name must be 1-100 bytes")
+        header[:100] = name.ljust(100, b"\0")
     if size_field is not None:
         if len(size_field) != 12:
             raise AssertionError("tar size field must be exactly 12 bytes")
         header[124:136] = size_field
     if any(
         value is not None
-        for value in (typeflag, linkname, reserved_tail, name_tail, size_field)
+        for value in (typeflag, linkname, reserved_tail, name_tail, name, size_field)
     ):
         _tar_checksum(header)
         changed[:512] = header
@@ -542,6 +548,19 @@ def _mutate_zip_fixed_header(payload: bytes, mutation: str) -> bytes:
         "made-system": ((central + 5, b"\x04"),),
         "disk-start": ((central + 34, b"\x01\x00"),),
         "internal-attrs": ((central + 36, b"\x01\x00"),),
+        "clear-utf8-flags": (
+            (local + 6, b"\x00\x00"),
+            (central + 8, b"\x00\x00"),
+        ),
+        "external-low-bits": (
+            (
+                central + 38,
+                (
+                    int.from_bytes(changed[central + 38 : central + 42], "little")
+                    | 1
+                ).to_bytes(4, "little"),
+            ),
+        ),
     }
     try:
         edits = mutations[mutation]
@@ -555,6 +574,25 @@ def _mutate_zip_fixed_header(payload: bytes, mutation: str) -> bytes:
     with zipfile.ZipFile(io.BytesIO(result)) as archive:
         info = archive.infolist()[0]
         archive.read(info)
+    return result
+
+
+def _mutate_first_zip_declared_size(payload: bytes, size: int) -> bytes:
+    changed = bytearray(payload)
+    eocd = _eocd_offset(changed)
+    central = int.from_bytes(changed[eocd + 16 : eocd + 20], "little")
+    if changed[central : central + 4] != b"PK\x01\x02":
+        raise AssertionError("fixture has no first central header")
+    local = int.from_bytes(changed[central + 42 : central + 46], "little")
+    if changed[local : local + 4] != b"PK\x03\x04":
+        raise AssertionError("fixture has no matching local header")
+    encoded = size.to_bytes(4, "little")
+    changed[local + 22 : local + 26] = encoded
+    changed[central + 24 : central + 28] = encoded
+    result = bytes(changed)
+    with zipfile.ZipFile(io.BytesIO(result)) as archive:
+        if archive.infolist()[0].file_size != size:
+            raise AssertionError("declared ZIP size mutation was not observed")
     return result
 
 
@@ -1050,6 +1088,130 @@ class CommonArchiveTests(unittest.TestCase):
                     release_archives.validate_zip_framing(payload)
                 self.assertEqual(raised.exception.code, "invalid_archive")
 
+    def test_zip_member_limit_rejects_declared_oversize_before_decode_or_crc(self) -> None:
+        cap = 32
+        for method in (zipfile.ZIP_DEFLATED, zipfile.ZIP_STORED):
+            output = io.BytesIO()
+            with zipfile.ZipFile(output, "w", compression=method) as archive:
+                archive.writestr("safe.txt", b"safe\n")
+            payload = _mutate_first_zip_declared_size(output.getvalue(), cap + 1)
+            with self.subTest(method=method), patch.object(
+                release_archives.zlib,
+                "decompressobj",
+                side_effect=AssertionError("decoder must not be called"),
+            ) as decoder, patch.object(
+                release_archives.binascii,
+                "crc32",
+                side_effect=AssertionError("CRC must not be called"),
+            ) as crc:
+                try:
+                    release_archives.validate_zip_framing(
+                        payload,
+                        max_member_size=cap,
+                    )
+                except TypeError:
+                    self.fail("ZIP framing validator has no member-size contract")
+                except ReleaseArchiveError as error:
+                    self.assertEqual(error.code, "invalid_archive")
+                else:
+                    self.fail("declared oversize ZIP member was accepted")
+                decoder.assert_not_called()
+                crc.assert_not_called()
+
+    def test_zip_member_limit_bounds_a_deflate_stream_that_lies_about_size(self) -> None:
+        cap = 32
+        original = _zip_bytes(
+            [("safe.txt", b"x" * (cap + 1), stat.S_IFREG | 0o644)]
+        )
+        payload = _mutate_first_zip_declared_size(original, cap)
+        real_decompressobj = zlib.decompressobj
+        calls: list[int] = []
+        flush_calls: list[bool] = []
+
+        class TrackingDecoder:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                self._decoder = real_decompressobj(*args, **kwargs)
+
+            def decompress(self, value: bytes, max_length: int = 0) -> bytes:
+                calls.append(max_length)
+                if max_length == 0:
+                    raise ReleaseArchiveError(
+                        "invalid_archive",
+                        "synthetic unbounded decoder call",
+                    )
+                return self._decoder.decompress(value, max_length)
+
+            def flush(self) -> bytes:
+                flush_calls.append(True)
+                raise AssertionError("unbounded DEFLATE flush must not be called")
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self._decoder, name)
+
+        with patch.object(
+            release_archives.zlib,
+            "decompressobj",
+            side_effect=TrackingDecoder,
+        ):
+            try:
+                release_archives.validate_zip_framing(
+                    payload,
+                    max_member_size=cap,
+                )
+            except TypeError:
+                self.fail("ZIP framing validator has no member-size contract")
+            except ReleaseArchiveError as error:
+                self.assertEqual(error.code, "invalid_archive")
+            else:
+                self.fail("lying ZIP size was accepted")
+
+        self.assertEqual(calls, [cap + 1])
+        self.assertEqual(flush_calls, [])
+
+    def test_stored_zip_size_lie_is_rejected_before_member_slice_path(self) -> None:
+        cap = 32
+        output = io.BytesIO()
+        with zipfile.ZipFile(
+            output,
+            "w",
+            compression=zipfile.ZIP_STORED,
+        ) as archive:
+            archive.writestr("safe.txt", b"x" * (cap + 1))
+        payload = _mutate_first_zip_declared_size(output.getvalue(), cap)
+        sentinel = ReleaseArchiveError(
+            "invalid_archive",
+            "synthetic member-stream call",
+        )
+        with patch.object(
+            release_archives,
+            "_validate_zip_member_stream",
+            side_effect=sentinel,
+        ) as member_stream, patch.object(
+            release_archives.binascii,
+            "crc32",
+            side_effect=AssertionError("CRC must not be called"),
+        ) as crc:
+            with self.assertRaises(ReleaseArchiveError) as raised:
+                release_archives.validate_zip_framing(
+                    payload,
+                    max_member_size=cap,
+                )
+            self.assertEqual(raised.exception.code, "invalid_archive")
+            member_stream.assert_not_called()
+            crc.assert_not_called()
+
+    def test_generic_zip_extractor_preserves_approved_external_attr_behavior(self) -> None:
+        payload = _mutate_zip_fixed_header(
+            _zip_bytes(
+                [("safe.txt", b"safe\n", stat.S_IFREG | 0o644)]
+            ),
+            "external-low-bits",
+        )
+        with TemporaryDirectory() as directory:
+            destination = Path(directory) / "out"
+            extract_regular_zip_payload(payload, destination)
+            self.assertEqual((destination / "safe.txt").read_bytes(), b"safe\n")
+
     def test_zip_extractors_reject_bytes_after_member_deflate_eof(self) -> None:
         original = _zip_bytes([("safe/file.txt", b"safe\n", stat.S_IFREG | 0o644)])
         payload = _add_trailing_bytes_to_last_deflate_stream(original)
@@ -1379,6 +1541,46 @@ class CommonArchiveTests(unittest.TestCase):
 
 
 class WheelContractTests(unittest.TestCase):
+    def test_wheel_path_and_payload_require_exact_external_attributes(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _make_wheel_source(root)
+            snapshot = release_archives._capture_path_source(
+                source,
+                ["src/threadroot", "README.md", "LICENSE"],
+            )
+            order, payloads = _wheel_payloads(source)
+            valid = root / "valid.whl"
+            _write_wheel(valid, order, payloads)
+            payload = _mutate_zip_fixed_header(
+                valid.read_bytes(),
+                "external-low-bits",
+            )
+            artifact = root / "external-attrs.whl"
+            artifact.write_bytes(payload)
+
+            for api in ("path", "payload"):
+                with self.subTest(api=api):
+                    try:
+                        if api == "path":
+                            validate_wheel(
+                                artifact,
+                                source,
+                                "0.1.0",
+                                WHEEL_EPOCH,
+                            )
+                        else:
+                            validate_wheel_payload(
+                                payload,
+                                snapshot,
+                                "0.1.0",
+                                WHEEL_EPOCH,
+                            )
+                    except ReleaseArchiveError as error:
+                        self.assertEqual(error.code, "metadata_mismatch")
+                    else:
+                        self.fail("wheel accepted noncanonical external attributes")
+
     def test_wheel_path_and_payload_validators_reject_fixed_header_covert_bytes(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1858,6 +2060,46 @@ class SdistContractTests(unittest.TestCase):
 
 
 class HostZipContractTests(unittest.TestCase):
+    def test_both_host_zip_apis_require_exact_external_attributes(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _make_host_source(root)
+            snapshot = release_archives._capture_path_source(
+                source,
+                [
+                    *(item.as_posix() for item in release_archives.COMMON_ROOTS),
+                    release_archives.MARKETPLACE.as_posix(),
+                    *(item.as_posix() for item in release_archives.HOST_MANIFESTS.values()),
+                ],
+            )
+            output = root / "artifacts"
+            with patch.object(build_release, "REPOSITORY_ROOT", source):
+                valid = {
+                    host: build_archive(host, output)
+                    for host in ("claude", "codex")
+                }
+
+            for host, original in valid.items():
+                payload = _mutate_zip_fixed_header(
+                    original.read_bytes(),
+                    "external-low-bits",
+                )
+                artifact = root / f"{host}-external-attrs.zip"
+                artifact.write_bytes(payload)
+                for api in ("path", "payload"):
+                    with self.subTest(host=host, api=api):
+                        try:
+                            if api == "path":
+                                validate_host_zip(artifact, source, host)
+                            else:
+                                validate_host_zip_payload(payload, snapshot, host)
+                        except ReleaseArchiveError as error:
+                            self.assertEqual(error.code, "metadata_mismatch")
+                        else:
+                            self.fail(
+                                "host ZIP accepted noncanonical external attributes"
+                            )
+
     def test_host_zip_path_and_payload_validators_reject_fixed_header_covert_bytes(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

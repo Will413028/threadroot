@@ -16,9 +16,17 @@ import zipfile
 import zlib
 
 if __package__:
-    from scripts.release_archives import validate_tar_framing, validate_zip_framing
+    from scripts.release_archives import (
+        ValidatedZipMember,
+        validate_tar_framing,
+        validate_zip_framing,
+    )
 else:
-    from release_archives import validate_tar_framing, validate_zip_framing
+    from release_archives import (
+        ValidatedZipMember,
+        validate_tar_framing,
+        validate_zip_framing,
+    )
 
 
 SKIPPED_DIRECTORIES = frozenset({".git", ".venv", "__pycache__"})
@@ -47,6 +55,7 @@ COMPRESSION_SIGNATURES = (
     ("xz", b"\xfd7zXZ\x00"),
 )
 MAX_DECOMPRESSED_BYTES = 64 * 1024 * 1024
+MAX_XZ_DECODER_MEMORY = 64 * 1024 * 1024
 READ_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
 DIRECTORY_FLAGS = READ_FLAGS | os.O_DIRECTORY
 
@@ -173,22 +182,42 @@ def _scan_text(
     return findings
 
 
+def _metadata_contains_denied(
+    value: str | bytes,
+    denied_terms: tuple[str, ...],
+) -> bool:
+    try:
+        if isinstance(value, str):
+            value.encode("utf-8")
+            return any(term in value for term in denied_terms)
+        return any(term.encode("utf-8") in value for term in denied_terms)
+    except UnicodeError:
+        raise PublicScanError() from None
+
+
+def _scan_denied_metadata_values(
+    values: tuple[str | bytes, ...],
+    display_path: str,
+    denied_terms: tuple[str, ...],
+) -> list[Finding]:
+    if not any(
+        _metadata_contains_denied(value, denied_terms)
+        for value in values
+    ):
+        return []
+    return [_finding("denied_term", display_path, None, denied_terms)]
+
+
 def _scan_denied_metadata(
     value: str | bytes,
     display_path: str,
     denied_terms: tuple[str, ...],
 ) -> list[Finding]:
-    try:
-        detected = (
-            any(term in value for term in denied_terms)
-            if isinstance(value, str)
-            else any(term.encode("utf-8") in value for term in denied_terms)
-        )
-    except UnicodeError:
-        raise PublicScanError() from None
-    if not detected:
-        return []
-    return [_finding("denied_term", display_path, None, denied_terms)]
+    return _scan_denied_metadata_values(
+        (value,),
+        display_path,
+        denied_terms,
+    )
 
 
 def _read_bounded(stream: BinaryIO, expected_size: int) -> bytes:
@@ -250,10 +279,21 @@ def _scan_zip(
     payload: bytes,
     display_path: str,
     denied_terms: tuple[str, ...],
+    validated_members: tuple[ValidatedZipMember, ...],
 ) -> list[Finding]:
     findings: list[Finding] = []
     try:
         with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            infos = archive.infolist()
+            if len(infos) != len(validated_members) or any(
+                info.filename != validated.filename
+                for info, validated in zip(
+                    infos,
+                    validated_members,
+                    strict=True,
+                )
+            ):
+                raise PublicScanError()
             findings.extend(
                 _scan_denied_metadata(
                     archive.comment,
@@ -261,18 +301,28 @@ def _scan_zip(
                     denied_terms,
                 )
             )
-            for info in sorted(archive.infolist(), key=lambda item: item.filename):
+            pairs = zip(infos, validated_members, strict=True)
+            for info, validated in sorted(
+                pairs,
+                key=lambda item: item[0].filename,
+            ):
                 member_display = _archive_display(display_path, info.filename)
                 findings.extend(
-                    _scan_denied_metadata(
-                        info.filename,
+                    _scan_denied_metadata_values(
+                        (info.filename, validated.raw_filename),
                         member_display,
                         denied_terms,
                     )
                 )
+                try:
+                    comment_text = info.comment.decode(
+                        "utf-8" if info.flag_bits & 0x800 else "cp437"
+                    )
+                except UnicodeDecodeError:
+                    raise PublicScanError() from None
                 findings.extend(
-                    _scan_denied_metadata(
-                        info.comment,
+                    _scan_denied_metadata_values(
+                        (info.comment, comment_text),
                         _archive_display(member_display, "<comment>"),
                         denied_terms,
                     )
@@ -490,7 +540,10 @@ def _decompress_archive_envelope(
             complete = bzip2.eof and not bzip2.unused_data
         else:
             metadata = ()
-            xz = lzma.LZMADecompressor()
+            xz = lzma.LZMADecompressor(
+                format=lzma.FORMAT_AUTO,
+                memlimit=MAX_XZ_DECODER_MEMORY,
+            )
             expanded = xz.decompress(
                 payload,
                 max_length=MAX_DECOMPRESSED_BYTES + 1,
@@ -510,10 +563,18 @@ def _scan_regular_payload(
 ) -> list[Finding]:
     if zipfile.is_zipfile(io.BytesIO(payload)):
         try:
-            validate_zip_framing(payload)
+            validated_members = validate_zip_framing(
+                payload,
+                max_member_size=MAX_DECOMPRESSED_BYTES,
+            )
         except Exception:
             raise PublicScanError() from None
-        return _scan_zip(payload, display_path, denied_terms)
+        return _scan_zip(
+            payload,
+            display_path,
+            denied_terms,
+            validated_members,
+        )
     if payload.startswith(ZIP_STRUCTURAL_SIGNATURES):
         raise PublicScanError()
     envelope = _decompress_archive_envelope(payload)
@@ -521,9 +582,14 @@ def _scan_regular_payload(
     envelope_findings: list[Finding] = []
     if envelope is not None:
         for label, value in envelope[1]:
+            values: tuple[str | bytes, ...] = (
+                (value, value.decode("latin-1"))
+                if label in {"gzip-filename", "gzip-comment"}
+                else (value,)
+            )
             envelope_findings.extend(
-                _scan_denied_metadata(
-                    value,
+                _scan_denied_metadata_values(
+                    values,
                     _archive_display(display_path, f"<{label}>"),
                     denied_terms,
                 )

@@ -25,6 +25,7 @@ from tests.test_release_archives import (
     _gzip_tar_payload,
     _hide_metadata_behind_directory_size,
     _mutate_first_tar_header,
+    _mutate_first_zip_declared_size,
     _mutate_zip_fixed_header,
     _prepend_gnu_longname_header,
     _prepend_tar_metadata_header,
@@ -376,6 +377,82 @@ class PublicSafetyTests(unittest.TestCase):
         )
         self.assertNotIn(denied, repr(findings))
 
+    def test_denylist_scans_exact_raw_zip_name_when_utf8_flag_is_cleared(self) -> None:
+        denied = "Synthetic Caf" + "\N{LATIN SMALL LETTER E WITH ACUTE}"
+        output = io.BytesIO()
+        with zipfile.ZipFile(
+            output,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as archive:
+            archive.writestr(f"notes/{denied}.txt", b"safe\n")
+        payload = _mutate_zip_fixed_header(
+            output.getvalue(),
+            "clear-utf8-flags",
+        )
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            self.assertNotIn(denied, archive.infolist()[0].filename)
+
+        with TemporaryDirectory() as directory:
+            artifact = Path(directory) / "bundle.data"
+            artifact.write_bytes(payload)
+            findings = scan_path(artifact, denied_terms=(denied,))
+
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].code, "denied_term")
+        self.assertNotIn(denied, repr(findings))
+
+    def test_denylist_decodes_zip_member_comment_with_flag_encoding(self) -> None:
+        denied = "Synthetic Caf" + "\N{LATIN SMALL LETTER E WITH ACUTE}"
+        output = io.BytesIO()
+        with zipfile.ZipFile(
+            output,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as archive:
+            info = zipfile.ZipInfo("safe.txt")
+            info.comment = denied.encode("cp437")
+            info.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(info, b"safe\n")
+
+        with TemporaryDirectory() as directory:
+            artifact = Path(directory) / "bundle.data"
+            artifact.write_bytes(output.getvalue())
+            findings = scan_path(artifact, denied_terms=(denied,))
+
+        self.assertEqual(
+            [(finding.code, finding.path, finding.line) for finding in findings],
+            [("denied_term", "bundle.data!safe.txt!<comment>", None)],
+        )
+        self.assertNotIn(denied, repr(findings))
+
+    def test_zip_scanner_enforces_member_cap_before_shared_decoder(self) -> None:
+        output = io.BytesIO()
+        with zipfile.ZipFile(
+            output,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as archive:
+            archive.writestr("safe.txt", b"x" * 33)
+        payload = _mutate_first_zip_declared_size(output.getvalue(), 33)
+
+        with TemporaryDirectory() as directory:
+            artifact = Path(directory) / "oversize.data"
+            artifact.write_bytes(payload)
+            with patch.object(
+                check_public,
+                "MAX_DECOMPRESSED_BYTES",
+                32,
+            ), patch(
+                "scripts.release_archives.zlib.decompressobj",
+                side_effect=AssertionError("decoder must not be called"),
+            ) as decoder, self.assertRaisesRegex(
+                RuntimeError,
+                "public scan failed",
+            ):
+                scan_path(artifact)
+            decoder.assert_not_called()
+
     def test_zip_fixed_header_covert_bytes_fail_closed(self) -> None:
         output = io.BytesIO()
         with zipfile.ZipFile(
@@ -628,6 +705,35 @@ class PublicSafetyTests(unittest.TestCase):
         )
         self.assertNotIn(denied, repr(findings))
 
+    def test_denylist_scans_latin1_gzip_filename_and_comment_semantics(self) -> None:
+        denied = "Synthetic Caf" + "\N{LATIN SMALL LETTER E WITH ACUTE}"
+        filename_output = io.BytesIO()
+        with gzip.GzipFile(
+            fileobj=filename_output,
+            mode="wb",
+            filename=denied,
+            mtime=0,
+        ) as stream:
+            stream.write(b"safe\n")
+        fixtures = {
+            "filename": filename_output.getvalue(),
+            "comment": gzip_with_metadata(
+                b"safe\n",
+                comment=denied.encode("latin-1"),
+            ),
+        }
+
+        with TemporaryDirectory() as directory:
+            artifact = Path(directory) / "compressed.data"
+            for label, payload in fixtures.items():
+                with self.subTest(label=label):
+                    artifact.write_bytes(payload)
+                    findings = scan_path(artifact, denied_terms=(denied,))
+                    self.assertEqual(len(findings), 1)
+                    self.assertEqual(findings[0].code, "denied_term")
+                    self.assertIn(f"<gzip-{label}>", findings[0].path)
+                    self.assertNotIn(denied, repr(findings))
+
     def test_standalone_compression_expansion_is_bounded(self) -> None:
         compressors = {
             "gzip": lambda payload: gzip.compress(payload, mtime=0),
@@ -646,6 +752,66 @@ class PublicSafetyTests(unittest.TestCase):
                         create=True,
                     ), self.assertRaisesRegex(RuntimeError, "public scan failed"):
                         scan_path(artifact)
+
+    def test_xz_decoder_has_an_explicit_memory_limit(self) -> None:
+        high_dictionary = lzma.compress(
+            b"safe\n",
+            format=lzma.FORMAT_XZ,
+            filters=[
+                {
+                    "id": lzma.FILTER_LZMA2,
+                    "dict_size": 16 * 1024 * 1024,
+                }
+            ],
+        )
+        ordinary = lzma.compress(b"safe\n", format=lzma.FORMAT_XZ)
+        with TemporaryDirectory() as directory:
+            artifact = Path(directory) / "compressed.data"
+            artifact.write_bytes(high_dictionary)
+            with patch.object(
+                check_public,
+                "MAX_XZ_DECODER_MEMORY",
+                1024 * 1024,
+                create=True,
+            ), self.assertRaisesRegex(RuntimeError, "public scan failed"):
+                scan_path(artifact)
+
+            artifact.write_bytes(ordinary)
+            self.assertEqual(scan_path(artifact), [])
+
+    def test_unrepresentable_filesystem_and_tar_names_fail_closed(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            safe = root / "safe.txt"
+            safe.write_bytes(b"safe\n")
+            with self.subTest(kind="filesystem"), patch.object(
+                check_public.os,
+                "listdir",
+                return_value=["safe-\udcff.txt"],
+            ), patch.object(
+                check_public,
+                "_lstat_at",
+                return_value=safe.lstat(),
+            ), patch.object(
+                check_public,
+                "_read_at",
+                return_value=b"safe\n",
+            ), self.assertRaisesRegex(RuntimeError, "public scan failed"):
+                scan_path(root)
+
+            tar_payload = _mutate_first_tar_header(
+                _tar_bytes(
+                    [("safe.txt", b"safe\n", 0o644, tarfile.REGTYPE)]
+                ),
+                name=b"safe-\xff.txt",
+            )
+            artifact = root / "opaque.data"
+            artifact.write_bytes(tar_payload)
+            with self.subTest(kind="tar"), self.assertRaisesRegex(
+                RuntimeError,
+                "public scan failed",
+            ):
+                scan_path(artifact)
 
     def test_valid_compressed_and_empty_archives_are_clean(self) -> None:
         with TemporaryDirectory() as directory:
