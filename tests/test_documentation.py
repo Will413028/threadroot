@@ -5,6 +5,7 @@ import re
 from tempfile import TemporaryDirectory
 import tomllib
 import unittest
+from unittest.mock import patch
 from urllib.parse import urlsplit
 
 from scripts.build_release import build_archive
@@ -54,6 +55,46 @@ EXPECTED_RELEASE_COMMAND = (
     'python3 -m scripts.build_verified_release --commit "$GITHUB_SHA" '
     '--output "$RUNNER_TEMP/threadroot-release"'
 )
+EXPECTED_CI_WORKFLOW = """name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install --upgrade pip build
+      - run: python -m unittest discover -s tests -v
+        env:
+          PYTHONPATH: src:.
+      - run: python -m build
+      - run: python -m pip install --force-reinstall dist/threadroot-0.1.0-py3-none-any.whl
+      - run: threadroot --version
+      - run: python scripts/build_release.py --output dist
+      - run: python scripts/check_public.py .
+      - run: python scripts/check_public.py dist
+
+  release-artifacts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: python3 -m scripts.build_verified_release --commit "$GITHUB_SHA" --output "$RUNNER_TEMP/threadroot-release"
+"""
 
 
 def _section(markdown: str, heading: str) -> str:
@@ -334,6 +375,7 @@ class DocumentationTests(unittest.TestCase):
         workflow_path = Path(".github/workflows/ci.yml")
         self.assertTrue(workflow_path.is_file(), "missing CI workflow")
         workflow = workflow_path.read_text(encoding="utf-8")
+        self.assertEqual(workflow, EXPECTED_CI_WORKFLOW)
         jobs = _yaml_mapping_body(workflow, "jobs", 0)
         self.assertEqual(
             re.findall(r"^  ([A-Za-z0-9_-]+):\s*$", jobs, re.MULTILINE),
@@ -411,6 +453,57 @@ class DocumentationTests(unittest.TestCase):
             ),
             [("contents", "read")],
         )
+
+    def test_ci_contract_rejects_hidden_yaml_mutations(self) -> None:
+        workflow_path = Path(".github/workflows/ci.yml")
+        workflow = workflow_path.read_text(encoding="utf-8")
+        canonical_release_step = f"      - run: {EXPECTED_RELEASE_COMMAND}\n"
+        canonical_permissions = "permissions:\n  contents: read\n\njobs:\n"
+        mutations = {
+            "quoted release permissions": workflow.replace(
+                "    timeout-minutes: 30\n",
+                '    timeout-minutes: 30\n    "permissions": write-all\n',
+                1,
+            ),
+            "quoted upload step": workflow.replace(
+                canonical_release_step,
+                canonical_release_step
+                + '      - "uses": actions/upload-artifact@v4\n',
+                1,
+            ),
+            "quoted multiline run step": workflow.replace(
+                canonical_release_step,
+                canonical_release_step
+                + '      - "run": |\n          echo hidden command\n',
+                1,
+            ),
+            "fully quoted publish job": workflow
+            + '  "publish":\n'
+            + '    "runs-on": "ubuntu-24.04"\n'
+            + '    "steps":\n'
+            + '      - "run": "echo publish"\n',
+            "duplicate quoted top-level permissions": workflow.replace(
+                canonical_permissions,
+                canonical_permissions.replace(
+                    "\njobs:\n", '\n"permissions": write-all\n\njobs:\n'
+                ),
+                1,
+            ),
+        }
+        original_read_text = Path.read_text
+
+        for name, mutated_workflow in mutations.items():
+            with self.subTest(mutation=name):
+                self.assertNotEqual(mutated_workflow, workflow)
+
+                def controlled_read_text(path: Path, *args: object, **kwargs: object) -> str:
+                    if path == workflow_path:
+                        return mutated_workflow
+                    return original_read_text(path, *args, **kwargs)
+
+                with patch.object(Path, "read_text", new=controlled_read_text):
+                    with self.assertRaises(AssertionError):
+                        self.test_ci_has_exact_matrix_pins_and_validation_commands()
 
     def test_canonical_release_build_is_documented(self) -> None:
         testing = Path("docs/testing.md").read_text(encoding="utf-8")
