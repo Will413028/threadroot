@@ -105,6 +105,18 @@ class CandidateManifestTests(unittest.TestCase):
         self.assertEqual(document["entries"], [entry.as_manifest() for entry in before.entries])
         self.assertEqual(document["entries"], sorted(document["entries"], key=lambda item: item["path"]))
 
+    def test_prefix_siblings_are_sorted_by_full_posix_path(self) -> None:
+        directory = self.candidate / "build/a"
+        directory.mkdir()
+        (directory / "child").write_bytes(b"child\n")
+        (self.candidate / "build/a.txt").write_bytes(b"sibling\n")
+
+        snapshot = _capture_candidate(self.candidate)
+
+        paths = [entry.path for entry in snapshot.entries]
+        self.assertEqual(paths, sorted(paths))
+        self.assertLess(paths.index("build/a.txt"), paths.index("build/a/child"))
+
     def test_manifest_is_canonical_bounded_and_mode_0444(self) -> None:
         self._write()
         manifest = self.candidate / "build/evidence/candidate-integrity.json"

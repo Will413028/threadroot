@@ -160,10 +160,10 @@ def _walk(parent_fd: int, prefix: PurePosixPath, entries: list[CandidateEntry], 
                 raise _fail()
             if stat.S_ISDIR(metadata.st_mode):
                 child, opened = _open_dir_at(parent_fd, name)
-                entry = CandidateEntry(path, "directory", _mode(opened), opened.st_dev,
-                                       opened.st_ino, opened.st_uid, opened.st_gid)
-                entries.append(entry)
                 try:
+                    entry = CandidateEntry(path, "directory", _mode(opened), opened.st_dev,
+                                           opened.st_ino, opened.st_uid, opened.st_gid)
+                    entries.append(entry)
                     _walk(child, relative, entries, totals)
                     if _identity(os.fstat(child)) != _identity(opened):
                         raise _fail()
@@ -206,11 +206,9 @@ def _capture_candidate(candidate_root: Path) -> CandidateSnapshot:
             raise _fail()
         entries: list[CandidateEntry] = []
         _walk(root_fd, PurePosixPath(), entries, [0])
-        if entries != sorted(entries, key=lambda entry: entry.path):
-            raise _fail()
         if _identity(os.fstat(root_fd)) != _identity(before) or _identity(os.lstat(root)) != _identity(before):
             raise _fail()
-        return CandidateSnapshot(tuple(entries))
+        return CandidateSnapshot(tuple(sorted(entries, key=lambda entry: entry.path)))
     except CandidateIntegrityError:
         raise
     except OSError as error:
