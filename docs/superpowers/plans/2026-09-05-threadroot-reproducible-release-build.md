@@ -1334,6 +1334,11 @@ git commit -m "ci: enforce reproducible release builds"
 
 ---
 
+For Tasks 7-12, run every fenced command block with Bash and keep its first
+`set -euo pipefail` line. Expected nonzero probes are contained in explicit
+`if` statements so strict mode remains active; any other nonzero result stops
+the block before later writes or mutators.
+
 ### Task 7: Prove the complete implementation before outbound review
 
 **Files:**
@@ -1353,6 +1358,7 @@ git commit -m "ci: enforce reproducible release builds"
 Run from the repository root:
 
 ```bash
+set -euo pipefail
 for threadroot_python in python3.11 python3.12 python3.13 python3.14; do
   PYTHONPATH=src:. "$threadroot_python" -m unittest discover -s tests -v
   "$threadroot_python" -m compileall -q src scripts tests
@@ -1369,28 +1375,50 @@ network authorization. The nested artifact phase remains offline.
 Run:
 
 ```bash
+set -euo pipefail
 test "$(git branch --show-current)" = "release/v0.1.0-readiness"
-test -z "$(git status --porcelain=v1 --untracked-files=all)"
+threadroot_worktree_status="$(git status --porcelain=v1 --untracked-files=all)"
+test -z "$threadroot_worktree_status"
+threadroot_candidate_head="$(git rev-parse HEAD)"
+threadroot_candidate_record="/private/tmp/threadroot-v010-candidate-${threadroot_candidate_head}.txt"
+test ! -e "$threadroot_candidate_record"
 threadroot_candidate_root="$(mktemp -d /private/tmp/threadroot-hatchling-candidate-20260905-XXXXXX)"
 python3 -m scripts.build_verified_release \
-  --commit "$(git rev-parse HEAD)" \
+  --commit "$threadroot_candidate_head" \
   --output "$threadroot_candidate_root"
 find "$threadroot_candidate_root/build/selected" -maxdepth 1 -type f -print | sort
 sed -n '1,4p' "$threadroot_candidate_root/build/evidence/SHA256SUMS"
+test "$(jq -r .commit \
+  "$threadroot_candidate_root/build/evidence/build.json")" \
+  = "$threadroot_candidate_head"
+(
+  cd "$threadroot_candidate_root/build/selected"
+  shasum -a 256 \
+    threadroot-0.1.0-py3-none-any.whl \
+    threadroot-0.1.0.tar.gz \
+    threadroot-claude-0.1.0.zip \
+    threadroot-codex-0.1.0.zip | LC_ALL=C sort -k 2
+) | cmp - "$threadroot_candidate_root/build/evidence/SHA256SUMS"
+python3 -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
+  "$threadroot_candidate_record" \
+  "$threadroot_candidate_root"
 ```
 
 Expected: exactly four selected artifact paths and four sorted checksum lines;
 candidate A/B, archive checks, scans, and sdist replay all pass inside the
-offline container. Preserve and report the root path; do not delete or replace
-the earlier Setuptools candidate directories. If the build fails, preserve the
-path and use a new candidate root for the next complete attempt rather than
-editing or reusing partial output.
+offline container. Preserve and report the root path and its immutable,
+HEAD-qualified candidate record; do not delete or replace the earlier
+Setuptools candidate directories. The record is created only after the build
+commit and the current selected bytes match canonical evidence. If the build
+fails, preserve the path and use a new candidate root for the next complete
+attempt rather than editing or reusing partial output.
 
 - [ ] **Step 3: Run repository-wide safety checks**
 
 Run:
 
 ```bash
+set -euo pipefail
 python3 scripts/check_public.py .
 git diff --check origin/main...HEAD
 git status --short --branch
@@ -1423,23 +1451,43 @@ Only after both reviews pass the unchanged head, bind the final candidate root
 once:
 
 ```bash
+set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
-test ! -e "$threadroot_state_root"
-install -d -m 700 "$threadroot_state_root"
+threadroot_reviewed_head="$(git rev-parse HEAD)"
+threadroot_candidate_record="/private/tmp/threadroot-v010-candidate-${threadroot_reviewed_head}.txt"
+test "$(git branch --show-current)" = "release/v0.1.0-readiness"
+threadroot_worktree_status="$(git status --porcelain=v1 --untracked-files=all)"
+test -z "$threadroot_worktree_status"
+test -f "$threadroot_candidate_record"
+threadroot_candidate_root="$(tr -d '\n' < "$threadroot_candidate_record")"
+test -n "$threadroot_candidate_root"
+test -d "$threadroot_candidate_root/build/selected"
 test "$(jq -r .commit \
   "$threadroot_candidate_root/build/evidence/build.json")" \
-  = "$(git rev-parse HEAD)"
+  = "$threadroot_reviewed_head"
+(
+  cd "$threadroot_candidate_root/build/selected"
+  shasum -a 256 \
+    threadroot-0.1.0-py3-none-any.whl \
+    threadroot-0.1.0.tar.gz \
+    threadroot-claude-0.1.0.zip \
+    threadroot-codex-0.1.0.zip | LC_ALL=C sort -k 2
+) | cmp - "$threadroot_candidate_root/build/evidence/SHA256SUMS"
+test ! -e "$threadroot_state_root"
+install -d -m 700 "$threadroot_state_root"
 python3 -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
   "$threadroot_state_root/candidate-root.txt" \
   "$threadroot_candidate_root"
 python3 -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
   "$threadroot_state_root/reviewed-head.txt" \
-  "$(git rev-parse HEAD)"
+  "$threadroot_reviewed_head"
 ```
 
 Require `candidate-root.txt` to name the most recent successful candidate and
 `reviewed-head.txt` to equal its `build/evidence/build.json` commit. Never
-rewrite these bindings.
+rewrite these bindings. This block is intentionally self-contained: a new
+shell derives the HEAD-qualified successful-candidate record and validates all
+candidate authority before it creates the state directory or either binding.
 
 ---
 
@@ -1462,6 +1510,7 @@ rewrite these bindings.
 Run and summarize:
 
 ```bash
+set -euo pipefail
 git status --short --branch
 git log --oneline origin/main..HEAD
 git diff --stat origin/main...HEAD
@@ -1501,11 +1550,23 @@ Then run the exact account and push boundary below. The EXIT trap must remain
 installed until the account is restored:
 
 ```bash
+set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
 threadroot_candidate_root="$(tr -d '\n' < "$threadroot_state_root/candidate-root.txt")"
 threadroot_reviewed_head="$(tr -d '\n' < "$threadroot_state_root/reviewed-head.txt")"
+test -n "$threadroot_candidate_root"
+test -n "$threadroot_reviewed_head"
+test ! -e "$threadroot_state_root/pr-url.txt"
 test -d "$threadroot_candidate_root/build/selected"
 test "$(git rev-parse HEAD)" = "$threadroot_reviewed_head"
+test "$(jq -r .commit \
+  "$threadroot_candidate_root/build/evidence/build.json")" \
+  = "$threadroot_reviewed_head"
+test "$(git remote get-url origin)" \
+  = "https://github.com/Will413028/threadroot.git"
+test "$(git branch --show-current)" = "release/v0.1.0-readiness"
+threadroot_worktree_status="$(git status --porcelain=v1 --untracked-files=all)"
+test -z "$threadroot_worktree_status"
 threadroot_previous_account="$(gh api user --jq .login)"
 threadroot_restore_account() {
   gh auth switch --hostname github.com --user "$threadroot_previous_account"
@@ -1514,10 +1575,6 @@ trap threadroot_restore_account EXIT
 
 gh auth switch --hostname github.com --user Will413028
 test "$(gh api user --jq .login)" = "Will413028"
-test "$(git remote get-url origin)" \
-  = "https://github.com/Will413028/threadroot.git"
-test "$(git branch --show-current)" = "release/v0.1.0-readiness"
-test -z "$(git status --porcelain=v1 --untracked-files=all)"
 git push --set-upstream origin \
   HEAD:refs/heads/release/v0.1.0-readiness
 
@@ -1541,6 +1598,10 @@ else
     --title "Release: prepare Threadroot v0.1.0" \
     --body-file /private/tmp/threadroot-v010-pr-body-20260905.md
 fi
+test -n "$threadroot_pr_url"
+test "$(gh pr view "$threadroot_pr_url" \
+  --repo Will413028/threadroot --json headRefOid --jq .headRefOid)" \
+  = "$threadroot_reviewed_head"
 
 python3 -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
   "$threadroot_state_root/pr-url.txt" \
@@ -1558,13 +1619,22 @@ force-update the branch.
 Run:
 
 ```bash
+set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
 threadroot_candidate_root="$(tr -d '\n' < "$threadroot_state_root/candidate-root.txt")"
 threadroot_pr_url="$(tr -d '\n' < "$threadroot_state_root/pr-url.txt")"
-threadroot_approved_head="$(git rev-parse HEAD)"
+threadroot_reviewed_head="$(tr -d '\n' < "$threadroot_state_root/reviewed-head.txt")"
+test -n "$threadroot_candidate_root"
+test -n "$threadroot_pr_url"
+test -n "$threadroot_reviewed_head"
+test ! -e "$threadroot_state_root/approved-pr-head.txt"
+test "$(git rev-parse HEAD)" = "$threadroot_reviewed_head"
+test "$(jq -r .commit \
+  "$threadroot_candidate_root/build/evidence/build.json")" \
+  = "$threadroot_reviewed_head"
 test "$(gh pr view "$threadroot_pr_url" \
   --repo Will413028/threadroot --json headRefOid --jq .headRefOid)" \
-  = "$threadroot_approved_head"
+  = "$threadroot_reviewed_head"
 gh pr checks "$threadroot_pr_url" \
   --repo Will413028/threadroot --watch --fail-fast
 gh pr checks "$threadroot_pr_url" \
@@ -1579,19 +1649,22 @@ jq -e '
 gh pr diff "$threadroot_pr_url" \
   --repo Will413028/threadroot \
   > "$threadroot_candidate_root/pr.diff"
+test "$(git rev-parse HEAD)" = "$threadroot_reviewed_head"
 test "$(gh pr view "$threadroot_pr_url" \
   --repo Will413028/threadroot --json headRefOid --jq .headRefOid)" \
-  = "$threadroot_approved_head"
+  = "$threadroot_reviewed_head"
 python3 -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
   "$threadroot_state_root/approved-pr-head.txt" \
-  "$threadroot_approved_head"
+  "$threadroot_reviewed_head"
 ```
 
 The exact matrix name formatting must first be confirmed from the returned
 JSON; if GitHub adds a repository-level check, require the nine expected
 workflow jobs and all additional required checks to pass instead of deleting a
 valid external check to satisfy the count. Any new commit invalidates the
-approval and returns to Task 7.
+approval and returns to Task 7. `reviewed-head.txt`, never a new local HEAD
+lookup, is the authority written to `approved-pr-head.txt`; local and remote PR
+heads are only checked against that immutable value.
 
 ---
 
@@ -1616,12 +1689,18 @@ method. Re-read the values from the preserved state and require the head still
 matches before asking. After explicit authorization, run:
 
 ```bash
+set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
 threadroot_pr_url="$(tr -d '\n' < "$threadroot_state_root/pr-url.txt")"
+threadroot_reviewed_head="$(tr -d '\n' < "$threadroot_state_root/reviewed-head.txt")"
 threadroot_approved_head="$(tr -d '\n' < "$threadroot_state_root/approved-pr-head.txt")"
+test -n "$threadroot_pr_url"
+test -n "$threadroot_reviewed_head"
+test "$threadroot_approved_head" = "$threadroot_reviewed_head"
+test "$(git rev-parse HEAD)" = "$threadroot_reviewed_head"
 test "$(gh pr view "$threadroot_pr_url" \
   --repo Will413028/threadroot --json headRefOid --jq .headRefOid)" \
-  = "$threadroot_approved_head"
+  = "$threadroot_reviewed_head"
 
 threadroot_previous_account="$(gh api user --jq .login)"
 threadroot_restore_account() {
@@ -1632,11 +1711,11 @@ gh auth switch --hostname github.com --user Will413028
 test "$(gh api user --jq .login)" = "Will413028"
 test "$(gh pr view "$threadroot_pr_url" \
   --repo Will413028/threadroot --json headRefOid --jq .headRefOid)" \
-  = "$threadroot_approved_head"
+  = "$threadroot_reviewed_head"
 gh pr merge "$threadroot_pr_url" \
   --repo Will413028/threadroot \
   --merge \
-  --match-head-commit "$threadroot_approved_head"
+  --match-head-commit "$threadroot_reviewed_head"
 threadroot_restore_account
 trap - EXIT
 ```
@@ -1650,19 +1729,31 @@ Fetch `origin/main` without tags, bind the merge commit, and save it with a
 no-clobber write:
 
 ```bash
+set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
 threadroot_pr_url="$(tr -d '\n' < "$threadroot_state_root/pr-url.txt")"
+threadroot_reviewed_head="$(tr -d '\n' < "$threadroot_state_root/reviewed-head.txt")"
 threadroot_approved_head="$(tr -d '\n' < "$threadroot_state_root/approved-pr-head.txt")"
+test -n "$threadroot_pr_url"
+test -n "$threadroot_reviewed_head"
+test "$threadroot_approved_head" = "$threadroot_reviewed_head"
+test "$(git rev-parse HEAD)" = "$threadroot_reviewed_head"
+test ! -e "$threadroot_state_root/release-commit.txt"
 git fetch --no-tags origin \
   refs/heads/main:refs/remotes/origin/main
-threadroot_release_commit="$(gh pr view "$threadroot_pr_url" \
+threadroot_merge_record="$(gh pr view "$threadroot_pr_url" \
   --repo Will413028/threadroot \
-  --json mergeCommit,state \
-  --jq 'select(.state == "MERGED") | .mergeCommit.oid')"
+  --json headRefOid,mergeCommit,state)"
+test "$(jq -r .state <<< "$threadroot_merge_record")" = "MERGED"
+test "$(jq -r .headRefOid <<< "$threadroot_merge_record")" \
+  = "$threadroot_reviewed_head"
+threadroot_release_commit="$(jq -r .mergeCommit.oid \
+  <<< "$threadroot_merge_record")"
+test -n "$threadroot_release_commit"
 test "$(git rev-parse refs/remotes/origin/main)" \
   = "$threadroot_release_commit"
 git merge-base --is-ancestor \
-  "$threadroot_approved_head" "$threadroot_release_commit"
+  "$threadroot_reviewed_head" "$threadroot_release_commit"
 gh run list \
   --repo Will413028/threadroot \
   --workflow ci.yml \
@@ -1695,6 +1786,14 @@ git fetch --no-tags origin \
   refs/heads/main:refs/remotes/origin/main
 test "$(git rev-parse refs/remotes/origin/main)" \
   = "$threadroot_release_commit"
+threadroot_merge_record_after="$(gh pr view "$threadroot_pr_url" \
+  --repo Will413028/threadroot \
+  --json headRefOid,mergeCommit,state)"
+test "$(jq -r .state <<< "$threadroot_merge_record_after")" = "MERGED"
+test "$(jq -r .headRefOid <<< "$threadroot_merge_record_after")" \
+  = "$threadroot_reviewed_head"
+test "$(jq -r .mergeCommit.oid <<< "$threadroot_merge_record_after")" \
+  = "$threadroot_release_commit"
 python3 -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
   "$threadroot_state_root/release-commit.txt" \
   "$threadroot_release_commit"
@@ -1711,7 +1810,17 @@ push work until Task 12 completes or the release is abandoned.
 Under the personal GitHub account, run:
 
 ```bash
+set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
+threadroot_reviewed_head="$(tr -d '\n' < "$threadroot_state_root/reviewed-head.txt")"
+threadroot_approved_head="$(tr -d '\n' < "$threadroot_state_root/approved-pr-head.txt")"
+threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
+test "$threadroot_approved_head" = "$threadroot_reviewed_head"
+test "$(git rev-parse HEAD)" = "$threadroot_reviewed_head"
+git merge-base --is-ancestor \
+  "$threadroot_reviewed_head" "$threadroot_release_commit"
+test "$(git rev-parse refs/remotes/origin/main)" \
+  = "$threadroot_release_commit"
 threadroot_previous_account="$(gh api user --jq .login)"
 threadroot_restore_account() {
   gh auth switch --hostname github.com --user "$threadroot_previous_account"
@@ -1721,9 +1830,13 @@ gh auth switch --hostname github.com --user Will413028
 test "$(gh api user --jq .login)" = "Will413028"
 if git show-ref --verify --quiet refs/tags/v0.1.0; then
   false
+else
+  threadroot_local_tag_probe_code="$?"
+  test "$threadroot_local_tag_probe_code" = "1"
 fi
-test -z "$(git ls-remote --tags origin \
+threadroot_remote_tag_records="$(git ls-remote --tags origin \
   'refs/tags/v0.1.0' 'refs/tags/v0.1.0^{}')"
+test -z "$threadroot_remote_tag_records"
 if gh api --include \
   repos/Will413028/threadroot/releases/tags/v0.1.0 \
   > "$threadroot_state_root/release-namespace-probe.txt" 2>&1; then
@@ -1746,11 +1859,20 @@ This step provisions the immutable image and requires current explicit network
 authorization. After authorization, create and preserve a fresh root with:
 
 ```bash
+set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
+threadroot_reviewed_head="$(tr -d '\n' < "$threadroot_state_root/reviewed-head.txt")"
+threadroot_approved_head="$(tr -d '\n' < "$threadroot_state_root/approved-pr-head.txt")"
 threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
+test "$threadroot_approved_head" = "$threadroot_reviewed_head"
+test "$(git rev-parse HEAD)" = "$threadroot_reviewed_head"
+git merge-base --is-ancestor \
+  "$threadroot_reviewed_head" "$threadroot_release_commit"
 test "$(git rev-parse refs/remotes/origin/main)" \
   = "$threadroot_release_commit"
-test -z "$(git status --porcelain=v1 --untracked-files=all)"
+threadroot_worktree_status="$(git status --porcelain=v1 --untracked-files=all)"
+test -z "$threadroot_worktree_status"
+test ! -e "$threadroot_state_root/final-root.txt"
 threadroot_final_root="$(mktemp -d /private/tmp/threadroot-v010-final-20260905-XXXXXX)"
 python3 -m scripts.build_verified_release \
   --commit "$threadroot_release_commit" \
@@ -1758,6 +1880,17 @@ python3 -m scripts.build_verified_release \
 find "$threadroot_final_root/build/selected" -maxdepth 1 -type f -print | sort
 test "$(find "$threadroot_final_root/build/selected" \
   -maxdepth 1 -type f | wc -l | tr -d ' ')" = "4"
+test "$(jq -r .commit \
+  "$threadroot_final_root/build/evidence/build.json")" \
+  = "$threadroot_release_commit"
+(
+  cd "$threadroot_final_root/build/selected"
+  shasum -a 256 \
+    threadroot-0.1.0-py3-none-any.whl \
+    threadroot-0.1.0.tar.gz \
+    threadroot-claude-0.1.0.zip \
+    threadroot-codex-0.1.0.zip | LC_ALL=C sort -k 2
+) | cmp - "$threadroot_final_root/build/evidence/SHA256SUMS"
 python3 -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
   "$threadroot_state_root/final-root.txt" \
   "$threadroot_final_root"
@@ -1766,7 +1899,10 @@ python3 -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open(
 The runner-file parity check binds the locally executed wrapper to the same
 bytes at the merge commit. Require exact four-file selected membership and save
 the final root, release commit, `build.json`, and `SHA256SUMS` paths outside Git
-without overwriting previous evidence.
+without overwriting previous evidence. `release-commit.txt` is derived only
+from a merged PR response whose head equals `reviewed-head.txt`; every later
+release and tag target treats that no-clobber file as the immutable derived
+authority.
 
 ---
 
@@ -1788,6 +1924,7 @@ without overwriting previous evidence.
 Run:
 
 ```bash
+set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
 threadroot_final_root="$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
 threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
@@ -1799,7 +1936,7 @@ test -d "$threadroot_selected"
     threadroot-0.1.0-py3-none-any.whl \
     threadroot-0.1.0.tar.gz \
     threadroot-claude-0.1.0.zip \
-    threadroot-codex-0.1.0.zip | LC_ALL=C sort
+    threadroot-codex-0.1.0.zip | LC_ALL=C sort -k 2
 ) > "$threadroot_state_root/final-recomputed.SHA256SUMS"
 cmp "$threadroot_state_root/final-recomputed.SHA256SUMS" \
   "$threadroot_final_root/build/evidence/SHA256SUMS"
@@ -1828,6 +1965,7 @@ Require zero findings.
 Create a fresh virtual environment and run:
 
 ```bash
+set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
 threadroot_final_root="$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
 python3 -m venv "$threadroot_final_root/wheel-smoke-venv"
@@ -1848,6 +1986,7 @@ contract.
 Run every CLI call with explicit disposable `HOME` and XDG roots:
 
 ```bash
+set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
 threadroot_final_root="$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
 threadroot_smoke_root="$threadroot_final_root/cli-smoke"
@@ -1901,6 +2040,7 @@ The repeat command is the only expected nonzero command; capture it without
 aborting the surrounding verification shell. Validate all six JSON files with:
 
 ```bash
+set -euo pipefail
 python3 - \
   "$threadroot_smoke_root/init-preview.json" \
   "$threadroot_smoke_root/init-apply.json" \
@@ -1931,8 +2071,12 @@ shasum -a 256 "$threadroot_smoke_root/sentinel.txt" \
 cmp "$threadroot_smoke_root/sentinel.before" \
   "$threadroot_smoke_root/sentinel.after"
 test ! -e "$threadroot_smoke_home/.config/threadroot/default-vault"
-test -z "$(find "$threadroot_smoke_home" -mindepth 1 -print -quit)"
-test -z "$(find "$threadroot_smoke_xdg" -mindepth 1 -print -quit)"
+threadroot_unexpected_home="$(find \
+  "$threadroot_smoke_home" -mindepth 1 -print -quit)"
+threadroot_unexpected_xdg="$(find \
+  "$threadroot_smoke_xdg" -mindepth 1 -print -quit)"
+test -z "$threadroot_unexpected_home"
+test -z "$threadroot_unexpected_xdg"
 cp -R "$threadroot_smoke_vault" "$threadroot_smoke_root/vault-pristine"
 ```
 
@@ -1946,6 +2090,7 @@ strings. Create fresh bundles with Threadroot's safe extractor, not
 `zipfile -e` or a host runtime extractor:
 
 ```bash
+set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
 threadroot_final_root="$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
 threadroot_selected="$threadroot_final_root/build/selected"
@@ -2006,6 +2151,7 @@ marketplace add/install/list under `env -i`, passing only `PATH`, `HOME`,
 native command forms exactly:
 
 ```bash
+set -euo pipefail
 threadroot_claude() {
   env -i \
     PATH="$PATH" \
@@ -2070,6 +2216,7 @@ redeclare the exact `threadroot_claude` and `threadroot_codex` functions before
 running:
 
 ```bash
+set -euo pipefail
 "$threadroot_final_root/wheel-smoke-venv/bin/python" \
   -m pip uninstall -y threadroot
 threadroot_claude plugin remove threadroot@threadroot --scope user
@@ -2140,23 +2287,32 @@ that the Task 9 `main` release freeze is still in force.
 After authorization, run:
 
 ```bash
+set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
+threadroot_reviewed_head="$(tr -d '\n' < "$threadroot_state_root/reviewed-head.txt")"
+threadroot_approved_head="$(tr -d '\n' < "$threadroot_state_root/approved-pr-head.txt")"
 threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
+test "$threadroot_approved_head" = "$threadroot_reviewed_head"
+test "$(git rev-parse HEAD)" = "$threadroot_reviewed_head"
+git merge-base --is-ancestor \
+  "$threadroot_reviewed_head" "$threadroot_release_commit"
 git fetch --no-tags origin \
   refs/heads/main:refs/remotes/origin/main
 test "$(git config --local --get user.name)" = "Will"
 test "$(git config --local --get user.email)" = "will413028@gmail.com"
+test "$(git remote get-url origin)" \
+  = "https://github.com/Will413028/threadroot.git"
+test "$(git branch --show-current)" = "release/v0.1.0-readiness"
+threadroot_worktree_status="$(git status --porcelain=v1 --untracked-files=all)"
+test -z "$threadroot_worktree_status"
 test "$(git rev-parse refs/remotes/origin/main)" \
   = "$threadroot_release_commit"
 if git show-ref --verify --quiet refs/tags/v0.1.0; then
   false
+else
+  threadroot_local_tag_probe_code="$?"
+  test "$threadroot_local_tag_probe_code" = "1"
 fi
-test -z "$(git ls-remote --tags origin \
-  'refs/tags/v0.1.0' 'refs/tags/v0.1.0^{}')"
-git tag --annotate v0.1.0 "$threadroot_release_commit" \
-  --message "Threadroot v0.1.0"
-test "$(git rev-parse 'refs/tags/v0.1.0^{}')" \
-  = "$threadroot_release_commit"
 
 threadroot_previous_account="$(gh api user --jq .login)"
 threadroot_restore_account() {
@@ -2165,8 +2321,13 @@ threadroot_restore_account() {
 trap threadroot_restore_account EXIT
 gh auth switch --hostname github.com --user Will413028
 test "$(gh api user --jq .login)" = "Will413028"
-test "$(git remote get-url origin)" \
-  = "https://github.com/Will413028/threadroot.git"
+threadroot_remote_tag_records="$(git ls-remote --tags origin \
+  'refs/tags/v0.1.0' 'refs/tags/v0.1.0^{}')"
+test -z "$threadroot_remote_tag_records"
+git tag --annotate v0.1.0 "$threadroot_release_commit" \
+  --message "Threadroot v0.1.0"
+test "$(git rev-parse 'refs/tags/v0.1.0^{}')" \
+  = "$threadroot_release_commit"
 git push origin refs/tags/v0.1.0:refs/tags/v0.1.0
 threadroot_remote_peeled="$(git ls-remote --tags origin \
   'refs/tags/v0.1.0^{}' | awk '{print $1}')"
@@ -2186,20 +2347,33 @@ ask only for authorization to create the unpublished draft. After
 authorization, run:
 
 ```bash
+set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
+threadroot_reviewed_head="$(tr -d '\n' < "$threadroot_state_root/reviewed-head.txt")"
+threadroot_approved_head="$(tr -d '\n' < "$threadroot_state_root/approved-pr-head.txt")"
 threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
 threadroot_final_root="$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
 threadroot_selected="$threadroot_final_root/build/selected"
+test "$threadroot_approved_head" = "$threadroot_reviewed_head"
+test "$(git rev-parse HEAD)" = "$threadroot_reviewed_head"
+git merge-base --is-ancestor \
+  "$threadroot_reviewed_head" "$threadroot_release_commit"
+test ! -e "$threadroot_state_root/draft-url.txt"
 git fetch --no-tags origin \
   refs/heads/main:refs/remotes/origin/main
 test "$(git rev-parse refs/remotes/origin/main)" \
   = "$threadroot_release_commit"
 test "$(git rev-parse 'refs/tags/v0.1.0^{}')" \
   = "$threadroot_release_commit"
-test "$(git hash-object docs/releases/v0.1.0.md)" \
-  = "$(git rev-parse "$threadroot_release_commit:docs/releases/v0.1.0.md")"
-cmp "$threadroot_state_root/final-recomputed.SHA256SUMS" \
-  "$threadroot_final_root/build/evidence/SHA256SUMS"
+test "$(git ls-remote --tags origin \
+  'refs/tags/v0.1.0^{}' | awk '{print $1}')" \
+  = "$threadroot_release_commit"
+threadroot_release_notes_worktree_blob="$(git hash-object \
+  docs/releases/v0.1.0.md)"
+threadroot_release_notes_commit_blob="$(git rev-parse \
+  "$threadroot_release_commit:docs/releases/v0.1.0.md")"
+test "$threadroot_release_notes_worktree_blob" \
+  = "$threadroot_release_notes_commit_blob"
 
 threadroot_previous_account="$(gh api user --jq .login)"
 threadroot_restore_account() {
@@ -2208,6 +2382,14 @@ threadroot_restore_account() {
 trap threadroot_restore_account EXIT
 gh auth switch --hostname github.com --user Will413028
 test "$(gh api user --jq .login)" = "Will413028"
+(
+  cd "$threadroot_selected"
+  shasum -a 256 \
+    threadroot-0.1.0-py3-none-any.whl \
+    threadroot-0.1.0.tar.gz \
+    threadroot-claude-0.1.0.zip \
+    threadroot-codex-0.1.0.zip | LC_ALL=C sort -k 2
+) | cmp - "$threadroot_final_root/build/evidence/SHA256SUMS"
 threadroot_draft_url="$(gh release create v0.1.0 \
   --repo Will413028/threadroot \
   --title "Threadroot v0.1.0" \
@@ -2226,17 +2408,36 @@ trap - EXIT
 ```
 
 Do not use `--latest`, `--prerelease`, generated notes, wildcards, or
-`--clobber`. Draft authorization is not publication authorization.
+`--clobber`. The checksum pipeline reads the four selected files immediately
+before upload and compares those current bytes with canonical build evidence;
+an earlier checksum file is not upload authority. Draft authorization is not
+publication authorization.
 
 - [ ] **Step 4: Download and verify the unpublished draft**
 
 Switch to `Will413028` with the same restore trap, then run:
 
 ```bash
+set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
 threadroot_final_root="$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
+threadroot_reviewed_head="$(tr -d '\n' < "$threadroot_state_root/reviewed-head.txt")"
+threadroot_approved_head="$(tr -d '\n' < "$threadroot_state_root/approved-pr-head.txt")"
 threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
 threadroot_selected="$threadroot_final_root/build/selected"
+test "$threadroot_approved_head" = "$threadroot_reviewed_head"
+test "$(git rev-parse HEAD)" = "$threadroot_reviewed_head"
+git merge-base --is-ancestor \
+  "$threadroot_reviewed_head" "$threadroot_release_commit"
+test ! -e "$threadroot_state_root/draft-download-root.txt"
+(
+  cd "$threadroot_selected"
+  shasum -a 256 \
+    threadroot-0.1.0-py3-none-any.whl \
+    threadroot-0.1.0.tar.gz \
+    threadroot-claude-0.1.0.zip \
+    threadroot-codex-0.1.0.zip | LC_ALL=C sort -k 2
+) | cmp - "$threadroot_final_root/build/evidence/SHA256SUMS"
 threadroot_previous_account="$(gh api user --jq .login)"
 threadroot_restore_account() {
   gh auth switch --hostname github.com --user "$threadroot_previous_account"
@@ -2307,6 +2508,14 @@ jq -S '{assets: ([.assets[] | {name, size}] | sort_by(.name)), body, isDraft, is
   > "$threadroot_state_root/draft-after-contract.json"
 cmp "$threadroot_state_root/draft-before-contract.json" \
   "$threadroot_state_root/draft-after-contract.json"
+(
+  cd "$threadroot_selected"
+  shasum -a 256 \
+    threadroot-0.1.0-py3-none-any.whl \
+    threadroot-0.1.0.tar.gz \
+    threadroot-claude-0.1.0.zip \
+    threadroot-codex-0.1.0.zip | LC_ALL=C sort -k 2
+) | cmp - "$threadroot_final_root/build/evidence/SHA256SUMS"
 python3 -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
   "$threadroot_state_root/draft-download-root.txt" \
   "$threadroot_draft_download"
@@ -2350,11 +2559,18 @@ After authorization, revalidate remote main, the peeled tag, draft metadata,
 downloaded hashes, and final source commit, then publish with one mutation:
 
 ```bash
+set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
+threadroot_reviewed_head="$(tr -d '\n' < "$threadroot_state_root/reviewed-head.txt")"
+threadroot_approved_head="$(tr -d '\n' < "$threadroot_state_root/approved-pr-head.txt")"
 threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
 threadroot_final_root="$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
 threadroot_draft_download="$(tr -d '\n' < "$threadroot_state_root/draft-download-root.txt")"
 threadroot_selected="$threadroot_final_root/build/selected"
+test "$threadroot_approved_head" = "$threadroot_reviewed_head"
+test "$(git rev-parse HEAD)" = "$threadroot_reviewed_head"
+git merge-base --is-ancestor \
+  "$threadroot_reviewed_head" "$threadroot_release_commit"
 git fetch --no-tags origin \
   refs/heads/main:refs/remotes/origin/main
 test "$(git rev-parse refs/remotes/origin/main)" \
@@ -2389,6 +2605,14 @@ jq -S '{assets: ([.assets[] | {name, size}] | sort_by(.name)), body, isDraft, is
   > "$threadroot_state_root/draft-prepublish-contract.json"
 cmp "$threadroot_state_root/draft-after-contract.json" \
   "$threadroot_state_root/draft-prepublish-contract.json"
+(
+  cd "$threadroot_selected"
+  shasum -a 256 \
+    threadroot-0.1.0-py3-none-any.whl \
+    threadroot-0.1.0.tar.gz \
+    threadroot-claude-0.1.0.zip \
+    threadroot-codex-0.1.0.zip | LC_ALL=C sort -k 2
+) | cmp - "$threadroot_final_root/build/evidence/SHA256SUMS"
 gh release edit v0.1.0 \
   --repo Will413028/threadroot \
   --draft=false \
@@ -2397,17 +2621,47 @@ threadroot_restore_account
 trap - EXIT
 ```
 
-Do not upload, rebuild, replace, or retarget during this step.
+Do not upload, rebuild, replace, or retarget during this step. The final
+checksum pipeline re-reads all four selected files after draft metadata
+validation and immediately before the sole publish mutation; matching a stale
+checksum copy or a jointly drifted selected/download pair cannot authorize
+publication.
 
 - [ ] **Step 3: Verify unauthenticated public downloads**
 
 Use only unauthenticated `curl` calls with user configuration disabled:
 
 ```bash
+set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
+threadroot_reviewed_head="$(tr -d '\n' < "$threadroot_state_root/reviewed-head.txt")"
+threadroot_approved_head="$(tr -d '\n' < "$threadroot_state_root/approved-pr-head.txt")"
 threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
 threadroot_final_root="$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
 threadroot_selected="$threadroot_final_root/build/selected"
+threadroot_public_candidate_record="/private/tmp/threadroot-v010-public-candidate-${threadroot_release_commit}.txt"
+test "$threadroot_approved_head" = "$threadroot_reviewed_head"
+test "$(git rev-parse HEAD)" = "$threadroot_reviewed_head"
+git merge-base --is-ancestor \
+  "$threadroot_reviewed_head" "$threadroot_release_commit"
+git fetch --no-tags origin \
+  refs/heads/main:refs/remotes/origin/main
+test "$(git rev-parse refs/remotes/origin/main)" \
+  = "$threadroot_release_commit"
+test "$(git rev-parse 'refs/tags/v0.1.0^{}')" \
+  = "$threadroot_release_commit"
+test "$(git ls-remote --tags origin \
+  'refs/tags/v0.1.0^{}' | awk '{print $1}')" \
+  = "$threadroot_release_commit"
+(
+  cd "$threadroot_selected"
+  shasum -a 256 \
+    threadroot-0.1.0-py3-none-any.whl \
+    threadroot-0.1.0.tar.gz \
+    threadroot-claude-0.1.0.zip \
+    threadroot-codex-0.1.0.zip | LC_ALL=C sort -k 2
+) | cmp - "$threadroot_final_root/build/evidence/SHA256SUMS"
+test ! -e "$threadroot_public_candidate_record"
 threadroot_public_download="$(mktemp -d /private/tmp/threadroot-v010-public-download-20260905-XXXXXX)"
 curl --disable --fail --silent --show-error --location \
   --header 'Accept: application/vnd.github+json' \
@@ -2502,6 +2756,9 @@ validate_host_zip(
     "codex",
 )
 PY
+python3 -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
+  "$threadroot_public_candidate_record" \
+  "$threadroot_public_download"
 ```
 
 Install the public wheel with
@@ -2515,10 +2772,82 @@ rebuild or mutate a release asset after publication.
 Finally fetch the public JSON again without authentication and require the same
 tag, title, body, four names/sizes, `draft == false`, and
 `prerelease == false`. Require the local and remote peeled tag to remain the
-saved release commit. Only after every post-publication gate passes, bind the
-successful public evidence root with:
+saved release commit. The first block records only the successfully validated
+download candidate; it is not final public evidence. Only after every
+post-publication gate passes, bind the successful public evidence root in a
+new shell with:
 
 ```bash
+set -euo pipefail
+threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
+threadroot_reviewed_head="$(tr -d '\n' < "$threadroot_state_root/reviewed-head.txt")"
+threadroot_approved_head="$(tr -d '\n' < "$threadroot_state_root/approved-pr-head.txt")"
+threadroot_release_commit="$(tr -d '\n' < "$threadroot_state_root/release-commit.txt")"
+threadroot_final_root="$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
+threadroot_selected="$threadroot_final_root/build/selected"
+threadroot_public_candidate_record="/private/tmp/threadroot-v010-public-candidate-${threadroot_release_commit}.txt"
+test -f "$threadroot_public_candidate_record"
+threadroot_public_download="$(tr -d '\n' < "$threadroot_public_candidate_record")"
+test "$threadroot_approved_head" = "$threadroot_reviewed_head"
+test "$(git rev-parse HEAD)" = "$threadroot_reviewed_head"
+git merge-base --is-ancestor \
+  "$threadroot_reviewed_head" "$threadroot_release_commit"
+git fetch --no-tags origin \
+  refs/heads/main:refs/remotes/origin/main
+test "$(git rev-parse refs/remotes/origin/main)" \
+  = "$threadroot_release_commit"
+test "$(git rev-parse 'refs/tags/v0.1.0^{}')" \
+  = "$threadroot_release_commit"
+test "$(git ls-remote --tags origin \
+  'refs/tags/v0.1.0^{}' | awk '{print $1}')" \
+  = "$threadroot_release_commit"
+test -d "$threadroot_public_download"
+test -f "$threadroot_public_download/release.json"
+test ! -e "$threadroot_state_root/public-download-root.txt"
+jq -e '
+  .tag_name == "v0.1.0" and
+  .name == "Threadroot v0.1.0" and
+  .draft == false and
+  .prerelease == false and
+  ([.assets[].name] | sort) == [
+    "threadroot-0.1.0-py3-none-any.whl",
+    "threadroot-0.1.0.tar.gz",
+    "threadroot-claude-0.1.0.zip",
+    "threadroot-codex-0.1.0.zip"
+  ]
+' "$threadroot_public_download/release.json"
+python3 - \
+  "$threadroot_public_download/release.json" \
+  docs/releases/v0.1.0.md \
+  "$threadroot_selected" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+release = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+notes = Path(sys.argv[2]).read_text(encoding="utf-8")
+selected = Path(sys.argv[3])
+assert release["body"] == notes
+actual = {item["name"]: item["size"] for item in release["assets"]}
+expected = {path.name: path.stat().st_size for path in selected.iterdir()}
+assert actual == expected
+PY
+(
+  cd "$threadroot_selected"
+  shasum -a 256 \
+    threadroot-0.1.0-py3-none-any.whl \
+    threadroot-0.1.0.tar.gz \
+    threadroot-claude-0.1.0.zip \
+    threadroot-codex-0.1.0.zip | LC_ALL=C sort -k 2
+) | cmp - "$threadroot_final_root/build/evidence/SHA256SUMS"
+for threadroot_asset in \
+  threadroot-0.1.0-py3-none-any.whl \
+  threadroot-0.1.0.tar.gz \
+  threadroot-claude-0.1.0.zip \
+  threadroot-codex-0.1.0.zip; do
+  cmp "$threadroot_selected/$threadroot_asset" \
+    "$threadroot_public_download/$threadroot_asset"
+done
 python3 -c 'from pathlib import Path; import sys; stream=Path(sys.argv[1]).open("x", encoding="utf-8"); stream.write(sys.argv[2] + "\n"); stream.close()' \
   "$threadroot_state_root/public-download-root.txt" \
   "$threadroot_public_download"
