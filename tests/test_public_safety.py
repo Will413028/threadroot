@@ -19,6 +19,15 @@ import zipfile
 from unittest.mock import patch
 
 from scripts.check_public import Finding, scan_path
+from tests.test_release_archives import (
+    _add_trailing_bytes_to_last_deflate_stream,
+    _gzip_tar_payload,
+    _hide_metadata_behind_directory_size,
+    _mutate_first_tar_header,
+    _prepend_gnu_longname_header,
+    _prepend_tar_metadata_header,
+    _tar_bytes,
+)
 
 
 def private_key_header() -> str:
@@ -439,6 +448,107 @@ class PublicSafetyTests(unittest.TestCase):
                 pass
             self.assertEqual(scan_path(empty_zip), [])
             self.assertEqual(scan_path(empty_tar), [])
+
+    def test_malformed_zip_and_tar_framing_fails_closed(self) -> None:
+        zip_output = io.BytesIO()
+        with zipfile.ZipFile(
+            zip_output,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as archive:
+            archive.writestr("safe.txt", b"safe\n")
+        tar_payload = _tar_bytes(
+            [("safe.txt", b"safe\n", 0o644, tarfile.REGTYPE)]
+        )
+        cases = {
+            "deflate-trailing": _add_trailing_bytes_to_last_deflate_stream(
+                zip_output.getvalue()
+            ),
+            "tar-padding": _gzip_tar_payload(
+                _mutate_first_tar_header(
+                    tar_payload,
+                    padding_marker=b"SYNTHETIC-PADDING-MARKER",
+                )
+            ),
+            "tar-linkname": _gzip_tar_payload(
+                _mutate_first_tar_header(
+                    tar_payload,
+                    linkname=b"SYNTHETIC-LINKNAME-MARKER",
+                )
+            ),
+            "tar-reserved-tail": _gzip_tar_payload(
+                _mutate_first_tar_header(
+                    tar_payload,
+                    reserved_tail=b"SYNTHETIC",
+                )
+            ),
+            "tar-gnu-longname": _gzip_tar_payload(
+                _prepend_gnu_longname_header(tar_payload, "safe.txt")
+            ),
+            "tar-pax-global": _gzip_tar_payload(
+                _prepend_tar_metadata_header(tar_payload, tarfile.XGLTYPE)
+            ),
+            "tar-pax-member": _gzip_tar_payload(
+                _prepend_tar_metadata_header(tar_payload, tarfile.XHDTYPE)
+            ),
+            "tar-pax-solaris": _gzip_tar_payload(
+                _prepend_tar_metadata_header(
+                    tar_payload,
+                    tarfile.SOLARIS_XHDTYPE,
+                )
+            ),
+            "tar-name-nul-tail": _gzip_tar_payload(
+                _mutate_first_tar_header(
+                    tar_payload,
+                    name_tail=b"SYNTHETIC-HIDDEN",
+                )
+            ),
+            "tar-directory-size-skip": _gzip_tar_payload(
+                _hide_metadata_behind_directory_size(
+                    _tar_bytes(
+                        [
+                            ("safe/", b"", 0o755, tarfile.DIRTYPE),
+                            ("safe/file.txt", b"safe\n", 0o644, tarfile.REGTYPE),
+                        ]
+                    )
+                )
+            ),
+        }
+        with TemporaryDirectory() as directory:
+            artifact = Path(directory) / "malformed.data"
+            for mutation, payload in cases.items():
+                with self.subTest(mutation=mutation):
+                    artifact.write_bytes(payload)
+                    with self.assertRaisesRegex(RuntimeError, "public scan failed"):
+                        scan_path(artifact)
+
+    def test_cli_deflate_trailing_bytes_fail_with_generic_message_and_exit_two(self) -> None:
+        output = io.BytesIO()
+        with zipfile.ZipFile(
+            output,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as archive:
+            archive.writestr("safe.txt", b"safe\n")
+        with TemporaryDirectory() as directory:
+            artifact = Path(directory) / "malformed.data"
+            artifact.write_bytes(
+                _add_trailing_bytes_to_last_deflate_stream(output.getvalue())
+            )
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).parents[1] / "scripts/check_public.py"),
+                    str(artifact),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stdout, "")
+        self.assertEqual(completed.stderr, "public scan failed\n")
 
     def test_zip_reports_unsafe_names_and_escaping_symlink_without_following(self) -> None:
         with TemporaryDirectory() as directory:

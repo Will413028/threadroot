@@ -14,6 +14,11 @@ import sys
 import tarfile
 import zipfile
 
+if __package__:
+    from scripts.release_archives import validate_tar_framing, validate_zip_framing
+else:
+    from release_archives import validate_tar_framing, validate_zip_framing
+
 
 SKIPPED_DIRECTORIES = frozenset({".git", ".venv", "__pycache__"})
 HOME_PATH_PATTERN = re.compile("/" + r"(?:Users|home)/[^/\s]+/")
@@ -305,6 +310,10 @@ def _scan_regular_payload(
     denied_terms: tuple[str, ...],
 ) -> list[Finding]:
     if zipfile.is_zipfile(io.BytesIO(payload)):
+        try:
+            validate_zip_framing(payload)
+        except Exception:
+            raise PublicScanError() from None
         return _scan_zip(payload, display_path, denied_terms)
     if payload.startswith(ZIP_STRUCTURAL_SIGNATURES):
         raise PublicScanError()
@@ -320,6 +329,11 @@ def _scan_regular_payload(
     except Exception:
         raise PublicScanError() from None
     with archive:
+        try:
+            expanded = _decompress_archive_envelope(payload)
+            validate_tar_framing(payload if expanded is None else expanded)
+        except Exception:
+            raise PublicScanError() from None
         return _scan_open_tar(archive, display_path, denied_terms)
 
 

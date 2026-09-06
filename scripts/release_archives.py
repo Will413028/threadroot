@@ -19,7 +19,22 @@ import tomllib
 import zipfile
 import zlib
 
-from scripts.build_release import COMMON_ROOTS, HOST_MANIFESTS, MARKETPLACE, ZIP_TIMESTAMP
+try:
+    from scripts.build_release import (
+        COMMON_ROOTS,
+        HOST_MANIFESTS,
+        MARKETPLACE,
+        ZIP_TIMESTAMP,
+    )
+except ModuleNotFoundError as error:
+    if error.name != "scripts":
+        raise
+    from build_release import (
+        COMMON_ROOTS,
+        HOST_MANIFESTS,
+        MARKETPLACE,
+        ZIP_TIMESTAMP,
+    )
 
 
 class ReleaseArchiveError(RuntimeError):
@@ -142,6 +157,35 @@ def _decode_zip_name(raw: bytes, flags: int) -> str:
         raise _fail("invalid_archive", "invalid ZIP filename encoding") from None
 
 
+def _validate_zip_member_stream(
+    compressed: bytes,
+    method: int,
+    expected_size: int,
+    expected_crc: int,
+) -> None:
+    try:
+        if method == zipfile.ZIP_STORED:
+            data = compressed
+        elif method == zipfile.ZIP_DEFLATED:
+            decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+            data = decompressor.decompress(compressed) + decompressor.flush()
+            if (
+                not decompressor.eof
+                or decompressor.unused_data
+                or decompressor.unconsumed_tail
+            ):
+                raise _fail("invalid_archive", "invalid ZIP compressed boundary")
+        else:
+            raise _fail("invalid_archive", "unsupported ZIP compression")
+    except zlib.error:
+        raise _fail("invalid_archive", "invalid ZIP compressed payload") from None
+    if (
+        len(data) != expected_size
+        or (binascii.crc32(data) & 0xFFFFFFFF) != expected_crc
+    ):
+        raise _fail("invalid_archive", "invalid ZIP size or CRC")
+
+
 def _validate_zip_structure(payload: bytes, infos: list[zipfile.ZipInfo]) -> None:
     marker = payload.rfind(b"PK\x05\x06")
     if marker < 0 or marker + 22 > len(payload):
@@ -181,7 +225,10 @@ def _validate_zip_structure(payload: bytes, infos: list[zipfile.ZipInfo]) -> Non
         lstart = local_cursor + 30
         lraw_name = payload[lstart : lstart + lnlen]
         lextra = payload[lstart + lnlen : lstart + lnlen + lxlen]
-        local_cursor = lstart + lnlen + lxlen + lcsize
+        compressed_start = lstart + lnlen + lxlen
+        local_cursor = compressed_start + lcsize
+        if local_cursor > central_offset:
+            raise _fail("invalid_archive", "invalid ZIP compressed boundary")
         decoded = _decode_zip_name(craw_name, cflags)
         if (
             decoded != info.filename
@@ -199,8 +246,24 @@ def _validate_zip_structure(payload: bytes, infos: list[zipfile.ZipInfo]) -> Non
             or cexternal != info.external_attr
         ):
             raise _fail("invalid_archive", "ZIP local and central records differ")
+        _validate_zip_member_stream(
+            payload[compressed_start:local_cursor],
+            cmethod,
+            cusize,
+            ccrc,
+        )
     if local_cursor != central_offset or central_cursor != marker:
         raise _fail("invalid_archive", "ZIP contains unowned or interstitial bytes")
+
+
+def validate_zip_framing(payload: bytes) -> None:
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            _validate_zip_structure(payload, archive.infolist())
+    except ReleaseArchiveError:
+        raise
+    except (OSError, ValueError, zipfile.BadZipFile, zlib.error):
+        raise _fail("invalid_archive", "invalid ZIP archive") from None
 
 
 def _load_zip_members(artifact: Path) -> list[tuple[PurePosixPath, bool, int, bytes]]:
@@ -249,9 +312,109 @@ def _gzip_payload(raw: bytes) -> bytes:
     return payload
 
 
-def _validate_tar_boundary(raw: bytes) -> None:
+def _tar_text_field(header: bytes, start: int, end: int) -> bytes:
+    field = header[start:end]
+    terminator = field.find(b"\0")
+    if terminator < 0:
+        return field
+    if any(field[terminator + 1 :]):
+        raise _fail("invalid_archive", "invalid tar header padding")
+    return field[:terminator]
+
+
+def _tar_octal_field(field: bytes) -> int:
+    if not any(field):
+        return 0
+    if field[-1:] != b"\0" or not field[:-1] or any(
+        byte < ord("0") or byte > ord("7") for byte in field[:-1]
+    ):
+        raise _fail("invalid_archive", "invalid tar header")
+    return int(field[:-1], 8)
+
+
+def _tar_pax_record(key: str, value: str) -> bytes:
+    body = b" " + key.encode("utf-8") + b"=" + value.encode("utf-8") + b"\n"
+    length = len(body) + 1
+    while True:
+        record = str(length).encode("ascii") + body
+        if len(record) == length:
+            return record
+        length = len(record)
+
+
+def _validate_tar_header(header: bytes) -> tuple[bytes, int]:
+    member_type = header[156:157]
+    if member_type in {
+        tarfile.GNUTYPE_LONGNAME,
+        tarfile.GNUTYPE_LONGLINK,
+        tarfile.GNUTYPE_SPARSE,
+        tarfile.CONTTYPE,
+        tarfile.XHDTYPE,
+        tarfile.SOLARIS_XHDTYPE,
+    }:
+        raise _fail("unsupported_member", "unsupported tar metadata member")
+    if header[257:265] != b"ustar\0" + b"00":
+        raise _fail("invalid_archive", "invalid tar header")
+    for start, end in (
+        (0, 100),
+        (157, 257),
+        (265, 297),
+        (297, 329),
+        (345, 500),
+    ):
+        _tar_text_field(header, start, end)
+    if any(header[500:512]):
+        raise _fail("invalid_archive", "invalid tar header padding")
+
+    checksum = header[148:156]
+    if checksum[6:] == b"\0 ":
+        checksum_digits = checksum[:6]
+    elif checksum[7:] == b"\0":
+        checksum_digits = checksum[:7]
+    else:
+        raise _fail("invalid_archive", "invalid tar header")
+    if (
+        any(byte < ord("0") or byte > ord("7") for byte in checksum_digits)
+        or int(checksum_digits, 8)
+        != sum(header[:148]) + (8 * ord(" ")) + sum(header[156:])
+    ):
+        raise _fail("invalid_archive", "invalid tar header")
+
+    for start, end in ((100, 108), (108, 116), (116, 124), (136, 148)):
+        _tar_octal_field(header[start:end])
+    size = _tar_octal_field(header[124:136])
+    devmajor = _tar_octal_field(header[329:337])
+    devminor = _tar_octal_field(header[337:345])
+
+    allowed_types = {
+        tarfile.REGTYPE,
+        tarfile.AREGTYPE,
+        tarfile.LNKTYPE,
+        tarfile.SYMTYPE,
+        tarfile.CHRTYPE,
+        tarfile.BLKTYPE,
+        tarfile.DIRTYPE,
+        tarfile.FIFOTYPE,
+        tarfile.XGLTYPE,
+    }
+    if member_type not in allowed_types:
+        raise _fail("unsupported_member", "unsupported tar metadata member")
+    if member_type not in {tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.XGLTYPE} and size != 0:
+        raise _fail("invalid_archive", "non-data tar member has payload")
+    linkname = _tar_text_field(header, 157, 257)
+    if member_type not in {tarfile.LNKTYPE, tarfile.SYMTYPE} and linkname:
+        raise _fail("invalid_archive", "invalid tar link field")
+    if member_type not in {tarfile.CHRTYPE, tarfile.BLKTYPE} and (devmajor or devminor):
+        raise _fail("invalid_archive", "invalid tar device field")
+    return member_type, size
+
+
+def _validate_tar_boundary(
+    raw: bytes,
+    expected_global_comment: str | None = None,
+) -> None:
     offset = 0
-    zero_blocks = 0
+    saw_global_comment = False
     while offset + 512 <= len(raw):
         block = raw[offset : offset + 512]
         if block == bytes(512):
@@ -259,15 +422,33 @@ def _validate_tar_boundary(raw: bytes) -> None:
                 raise _fail("invalid_archive", "tar member after terminator")
             if len(raw) - offset < 1024:
                 raise _fail("invalid_archive", "incomplete tar terminator")
+            if expected_global_comment is not None and not saw_global_comment:
+                raise _fail("invalid_archive", "missing global PAX metadata")
             return
-        zero_blocks = 0
-        try:
-            size_field = block[124:136].rstrip(b"\0 ") or b"0"
-            size = int(size_field, 8)
-        except ValueError:
-            raise _fail("invalid_archive", "invalid tar header") from None
-        offset += 512 + ((size + 511) // 512) * 512
+        member_type, size = _validate_tar_header(block)
+        data_start = offset + 512
+        data_end = data_start + size
+        next_header = data_start + ((size + 511) // 512) * 512
+        if data_end > len(raw) or next_header > len(raw):
+            raise _fail("invalid_archive", "invalid tar boundary")
+        if any(raw[data_end:next_header]):
+            raise _fail("invalid_archive", "nonzero tar member padding")
+        if member_type == tarfile.XGLTYPE:
+            if (
+                expected_global_comment is None
+                or saw_global_comment
+                or offset != 0
+                or raw[data_start:data_end]
+                != _tar_pax_record("comment", expected_global_comment)
+            ):
+                raise _fail("invalid_archive", "invalid global PAX metadata")
+            saw_global_comment = True
+        offset = next_header
     raise _fail("invalid_archive", "invalid tar boundary")
+
+
+def validate_tar_framing(payload: bytes) -> None:
+    _validate_tar_boundary(payload)
 
 
 def _load_tar_members(
@@ -283,7 +464,7 @@ def _load_tar_members_payload(
 ) -> list[tuple[PurePosixPath, bool, int, bytes]]:
     try:
         raw_tar = _gzip_payload(raw) if raw.startswith(b"\x1f\x8b") else raw
-        _validate_tar_boundary(raw_tar)
+        _validate_tar_boundary(raw_tar, expected_global_comment)
         with tarfile.open(fileobj=io.BytesIO(raw_tar), mode="r:") as archive:
             expected_pax = {} if expected_global_comment is None else {"comment": expected_global_comment}
             if archive.pax_headers != expected_pax:
@@ -292,11 +473,18 @@ def _load_tar_members_payload(
             for info in archive.getmembers():
                 if info.pax_headers != expected_pax:
                     raise _fail("invalid_archive", "unexpected member PAX data")
-                if not (info.isfile() or info.isdir()):
+                if info.type not in {
+                    tarfile.REGTYPE,
+                    tarfile.AREGTYPE,
+                    tarfile.DIRTYPE,
+                }:
                     raise _fail("unsupported_member", "unsupported tar member")
-                path = _member_path(info.name, info.isdir())
+                is_directory = info.type == tarfile.DIRTYPE
+                if is_directory and info.size != 0:
+                    raise _fail("invalid_archive", "directory tar member has payload")
+                path = _member_path(info.name, is_directory)
                 mode = _normalized_mode(info.mode)
-                if info.isdir():
+                if is_directory:
                     data = b""
                 else:
                     stream = archive.extractfile(info)
@@ -928,7 +1116,7 @@ def validate_sdist_payload(artifact: bytes, source: ReleaseSourceSnapshot, versi
             names: list[str] = []
             contents: dict[str, bytes] = {}
             for info in infos:
-                if not info.isfile():
+                if info.type != tarfile.REGTYPE:
                     raise _fail("unsupported_member", "sdist member is not a regular file")
                 if info.pax_headers:
                     raise _fail("metadata_mismatch", "unexpected member PAX metadata")

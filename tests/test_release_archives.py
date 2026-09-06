@@ -9,6 +9,8 @@ import hashlib
 import os
 from pathlib import Path
 import stat
+import subprocess
+import sys
 import tarfile
 from tempfile import TemporaryDirectory
 import unittest
@@ -306,6 +308,177 @@ def _eocd_offset(payload: bytes) -> int:
     return offset
 
 
+def _add_trailing_bytes_to_last_deflate_stream(
+    payload: bytes,
+    marker: bytes = b"SYNTHETIC-FRAMING-MARKER",
+) -> bytes:
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        info = archive.infolist()[-1]
+    if info.compress_type != zipfile.ZIP_DEFLATED:
+        raise AssertionError("last ZIP member is not DEFLATE compressed")
+
+    local_offset = info.header_offset
+    name_size = int.from_bytes(payload[local_offset + 26 : local_offset + 28], "little")
+    extra_size = int.from_bytes(payload[local_offset + 28 : local_offset + 30], "little")
+    data_end = local_offset + 30 + name_size + extra_size + info.compress_size
+    eocd = _eocd_offset(payload)
+    central_offset = int.from_bytes(payload[eocd + 16 : eocd + 20], "little")
+    if data_end != central_offset:
+        raise AssertionError("last ZIP member is not adjacent to the central directory")
+
+    central_cursor = central_offset
+    target_central: int | None = None
+    while central_cursor < eocd:
+        if payload[central_cursor : central_cursor + 4] != b"PK\x01\x02":
+            raise AssertionError("fixture has an invalid central directory")
+        current_local = int.from_bytes(payload[central_cursor + 42 : central_cursor + 46], "little")
+        if current_local == local_offset:
+            target_central = central_cursor
+        central_cursor += (
+            46
+            + int.from_bytes(payload[central_cursor + 28 : central_cursor + 30], "little")
+            + int.from_bytes(payload[central_cursor + 30 : central_cursor + 32], "little")
+            + int.from_bytes(payload[central_cursor + 32 : central_cursor + 34], "little")
+        )
+    if target_central is None:
+        raise AssertionError("last ZIP member has no central record")
+
+    changed = bytearray(payload)
+    changed[local_offset + 18 : local_offset + 22] = (
+        info.compress_size + len(marker)
+    ).to_bytes(4, "little")
+    changed[target_central + 20 : target_central + 24] = (
+        info.compress_size + len(marker)
+    ).to_bytes(4, "little")
+    changed[data_end:data_end] = marker
+    changed[eocd + len(marker) + 16 : eocd + len(marker) + 20] = (
+        central_offset + len(marker)
+    ).to_bytes(4, "little")
+    return bytes(changed)
+
+
+def _tar_checksum(header: bytearray) -> None:
+    header[148:156] = b"        "
+    header[148:156] = f"{sum(header):06o}\0 ".encode("ascii")
+
+
+def _git_tar_checksum(header: bytearray) -> None:
+    header[148:156] = b"        "
+    header[148:156] = f"{sum(header):07o}\0".encode("ascii")
+
+
+def _mutate_first_tar_header(
+    payload: bytes,
+    *,
+    typeflag: bytes | None = None,
+    linkname: bytes | None = None,
+    reserved_tail: bytes | None = None,
+    padding_marker: bytes | None = None,
+    name_tail: bytes | None = None,
+    size_field: bytes | None = None,
+) -> bytes:
+    changed = bytearray(payload)
+    if changed[257:262] != b"ustar":
+        raise AssertionError("fixture has no first ustar header")
+    header = changed[:512]
+    if typeflag is not None:
+        if len(typeflag) != 1:
+            raise AssertionError("tar typeflag must be exactly one byte")
+        header[156:157] = typeflag
+    if linkname is not None:
+        if len(linkname) > 100:
+            raise AssertionError("tar linkname marker is too long")
+        header[157:257] = linkname.ljust(100, b"\0")
+    if reserved_tail is not None:
+        if len(reserved_tail) > 12:
+            raise AssertionError("tar reserved-tail marker is too long")
+        header[500:512] = reserved_tail.ljust(12, b"\0")
+    if name_tail is not None:
+        name_end = header[:100].find(b"\0")
+        if name_end < 0 or name_end + 1 + len(name_tail) > 100:
+            raise AssertionError("first tar name has insufficient NUL padding")
+        header[name_end + 1 : name_end + 1 + len(name_tail)] = name_tail
+    if size_field is not None:
+        if len(size_field) != 12:
+            raise AssertionError("tar size field must be exactly 12 bytes")
+        header[124:136] = size_field
+    if any(
+        value is not None
+        for value in (typeflag, linkname, reserved_tail, name_tail, size_field)
+    ):
+        _tar_checksum(header)
+        changed[:512] = header
+    if padding_marker is not None:
+        size_field = bytes(header[124:136]).rstrip(b"\0 ") or b"0"
+        size = int(size_field, 8)
+        padding_start = 512 + size
+        padding_end = 512 + ((size + 511) // 512) * 512
+        if not padding_marker or padding_start + len(padding_marker) > padding_end:
+            raise AssertionError("first tar member has insufficient alignment padding")
+        changed[padding_start : padding_start + len(padding_marker)] = padding_marker
+    return bytes(changed)
+
+
+def _tar_metadata_member(typeflag: bytes, payload: bytes) -> bytes:
+    info = tarfile.TarInfo("././@SyntheticMeta")
+    info.type = typeflag
+    info.mode = 0o644
+    info.uid = info.gid = 0
+    info.uname = info.gname = ""
+    info.size = len(payload)
+    header = info.tobuf(format=tarfile.PAX_FORMAT)
+    return header + payload.ljust(((len(payload) + 511) // 512) * 512, b"\0")
+
+
+def _prepend_tar_metadata_header(
+    payload: bytes,
+    typeflag: bytes,
+    metadata: bytes = b"\0SYNTHETIC-HIDDEN",
+) -> bytes:
+    return _tar_metadata_member(typeflag, metadata) + payload
+
+
+def _hide_metadata_behind_directory_size(payload: bytes) -> bytes:
+    if payload[156:157] != tarfile.DIRTYPE:
+        raise AssertionError("fixture does not start with a directory")
+    metadata = _tar_metadata_member(
+        tarfile.GNUTYPE_LONGNAME,
+        b"safe/file.txt\0SYNTHETIC-HIDDEN",
+    )
+    changed = payload[:512] + metadata + payload[512:]
+    return _mutate_first_tar_header(
+        changed,
+        size_field=f"{len(metadata):011o}\0".encode("ascii"),
+    )
+
+
+def _prepend_gnu_longname_header(payload: bytes, member_name: str) -> bytes:
+    hidden_suffix = b"\0SYNTHETIC-LONGNAME-TRAILER"
+    longname = member_name.encode("utf-8") + hidden_suffix
+    info = tarfile.TarInfo("././@LongLink")
+    info.type = tarfile.GNUTYPE_LONGNAME
+    info.mode = 0o644
+    info.uid = info.gid = 0
+    info.uname = info.gname = ""
+    info.size = len(longname)
+    header = info.tobuf(format=tarfile.GNU_FORMAT)
+    padded = longname.ljust(((len(longname) + 511) // 512) * 512, b"\0")
+    return header + padded + payload
+
+
+def _gzip_tar_payload(payload: bytes, *, mtime: int = WHEEL_EPOCH) -> bytes:
+    output = io.BytesIO()
+    with gzip.GzipFile(
+        fileobj=output,
+        mode="wb",
+        filename="",
+        compresslevel=9,
+        mtime=mtime,
+    ) as stream:
+        stream.write(payload)
+    return output.getvalue()
+
+
 def _mutate_local_zip(payload: bytes, mutation: str) -> bytes:
     changed = bytearray(payload)
     if changed[:4] != b"PK\x03\x04":
@@ -471,6 +644,25 @@ class CommonArchiveTests(unittest.TestCase):
             with self.assertRaises(ReleaseArchiveError):
                 extract_regular_tar(overridden, root / "override-out", expected_global_comment="commit-sha")
 
+            hidden = root / "hidden-global.tar"
+            regular = _tar_bytes(
+                [("safe/file.txt", b"safe\n", 0o644, tarfile.REGTYPE)]
+            )
+            hidden.write_bytes(
+                _prepend_tar_metadata_header(
+                    regular,
+                    tarfile.XGLTYPE,
+                    b"22 comment=commit-sha\n\0SYNTHETIC-HIDDEN",
+                )
+            )
+            with self.assertRaises(ReleaseArchiveError):
+                extract_regular_tar(
+                    hidden,
+                    root / "hidden-out",
+                    expected_global_comment="commit-sha",
+                )
+            self.assertFalse((root / "hidden-out").exists())
+
     def test_tar_rejects_unsafe_duplicate_link_special_mode_and_archive_data(self) -> None:
         regular = ("safe/file.txt", b"safe\n", 0o644, tarfile.REGTYPE)
         cases = {
@@ -507,6 +699,170 @@ class CommonArchiveTests(unittest.TestCase):
                     extract_regular_tar(artifact, destination)
                 self.assertEqual(raised.exception.code, code)
                 self.assertFalse(destination.exists())
+
+    def test_tar_extractors_reject_non_regular_isfile_types_before_destination_access(self) -> None:
+        original = _tar_bytes([("safe/file.txt", b"safe\n", 0o644, tarfile.REGTYPE)])
+        for typeflag in (tarfile.GNUTYPE_SPARSE, tarfile.CONTTYPE):
+            payload = _mutate_first_tar_header(original, typeflag=typeflag)
+            self.assertEqual(payload[156:157], typeflag)
+            for api in ("path", "payload"):
+                with self.subTest(typeflag=typeflag, api=api), TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    artifact = root / "artifact.tar"
+                    artifact.write_bytes(payload)
+                    destination = root / "out"
+                    with self.assertRaises(ReleaseArchiveError) as raised:
+                        if api == "path":
+                            extract_regular_tar(artifact, destination)
+                        else:
+                            extract_regular_tar_payload(payload, destination)
+                    self.assertEqual(raised.exception.code, "unsupported_member")
+                    self.assertFalse(destination.exists())
+
+    def test_generic_tar_extractor_accepts_legacy_regular_type(self) -> None:
+        original = _tar_bytes([("safe/file.txt", b"safe\n", 0o644, tarfile.REGTYPE)])
+        payload = _mutate_first_tar_header(original, typeflag=tarfile.AREGTYPE)
+        with TemporaryDirectory() as directory:
+            destination = Path(directory) / "out"
+            extract_regular_tar_payload(payload, destination)
+            self.assertEqual((destination / "safe/file.txt").read_bytes(), b"safe\n")
+
+    def test_generic_tar_extractor_accepts_git_checksum_encoding(self) -> None:
+        payload = bytearray(
+            _tar_bytes(
+                [("safe/file.txt", b"safe\n", 0o644, tarfile.REGTYPE)]
+            )
+        )
+        header = payload[:512]
+        _git_tar_checksum(header)
+        payload[:512] = header
+        with TemporaryDirectory() as directory:
+            destination = Path(directory) / "out"
+            extract_regular_tar_payload(bytes(payload), destination)
+            self.assertEqual(
+                (destination / "safe/file.txt").read_bytes(),
+                b"safe\n",
+            )
+
+    def test_tar_extractors_reject_nonzero_padding_and_regular_linkname(self) -> None:
+        original = _tar_bytes([("safe/file.txt", b"safe\n", 0o644, tarfile.REGTYPE)])
+        mutations = {
+            "padding": _mutate_first_tar_header(
+                original,
+                padding_marker=b"SYNTHETIC-PADDING-MARKER",
+            ),
+            "linkname": _mutate_first_tar_header(
+                original,
+                linkname=b"SYNTHETIC-LINKNAME-MARKER",
+            ),
+            "reserved-tail": _mutate_first_tar_header(
+                original,
+                reserved_tail=b"SYNTHETIC",
+            ),
+        }
+        for mutation, payload in mutations.items():
+            for api in ("path", "payload"):
+                with self.subTest(mutation=mutation, api=api), TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    artifact = root / "artifact.tar"
+                    artifact.write_bytes(payload)
+                    destination = root / "out"
+                    with self.assertRaises(ReleaseArchiveError) as raised:
+                        if api == "path":
+                            extract_regular_tar(artifact, destination)
+                        else:
+                            extract_regular_tar_payload(payload, destination)
+                    self.assertEqual(raised.exception.code, "invalid_archive")
+                    self.assertFalse(destination.exists())
+
+    def test_tar_extractors_reject_consumed_gnu_longname_header(self) -> None:
+        original = _tar_bytes([("safe/file.txt", b"safe\n", 0o644, tarfile.REGTYPE)])
+        payload = _prepend_gnu_longname_header(original, "safe/file.txt")
+        with tarfile.open(fileobj=io.BytesIO(payload), mode="r:") as archive:
+            self.assertEqual([info.name for info in archive.getmembers()], ["safe/file.txt"])
+        for api in ("path", "payload"):
+            with self.subTest(api=api), TemporaryDirectory() as directory:
+                root = Path(directory)
+                artifact = root / "artifact.tar"
+                artifact.write_bytes(payload)
+                destination = root / "out"
+                with self.assertRaises(ReleaseArchiveError) as raised:
+                    if api == "path":
+                        extract_regular_tar(artifact, destination)
+                    else:
+                        extract_regular_tar_payload(payload, destination)
+                self.assertEqual(raised.exception.code, "unsupported_member")
+                self.assertFalse(destination.exists())
+
+    def test_tar_extractors_reject_all_consumed_metadata_and_hidden_header_bytes(self) -> None:
+        regular = _tar_bytes(
+            [("safe/file.txt", b"safe\n", 0o644, tarfile.REGTYPE)]
+        )
+        directory_first = _tar_bytes(
+            [
+                ("safe/", b"", 0o755, tarfile.DIRTYPE),
+                ("safe/file.txt", b"safe\n", 0o644, tarfile.REGTYPE),
+            ]
+        )
+        mutations = {
+            f"pax-{typeflag.decode('ascii')}": _prepend_tar_metadata_header(
+                regular,
+                typeflag,
+            )
+            for typeflag in (
+                tarfile.XGLTYPE,
+                tarfile.XHDTYPE,
+                tarfile.SOLARIS_XHDTYPE,
+            )
+        }
+        mutations["name-nul-tail"] = _mutate_first_tar_header(
+            regular,
+            name_tail=b"SYNTHETIC-HIDDEN",
+        )
+        mutations["directory-size-skip"] = _hide_metadata_behind_directory_size(
+            directory_first
+        )
+
+        for mutation, payload in mutations.items():
+            with tarfile.open(fileobj=io.BytesIO(payload), mode="r:") as archive:
+                self.assertTrue(archive.getmembers())
+            for api in ("path", "payload"):
+                with self.subTest(mutation=mutation, api=api), TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    artifact = root / "artifact.tar"
+                    artifact.write_bytes(payload)
+                    destination = root / "out"
+                    with self.assertRaises(ReleaseArchiveError):
+                        if api == "path":
+                            extract_regular_tar(artifact, destination)
+                        else:
+                            extract_regular_tar_payload(payload, destination)
+                    self.assertFalse(destination.exists())
+
+    def test_negative_tar_size_is_rejected_without_hanging(self) -> None:
+        payload = _mutate_first_tar_header(
+            _tar_bytes(
+                [("safe/file.txt", b"safe\n", 0o644, tarfile.REGTYPE)]
+            ),
+            size_field=b"-0000001001\0",
+        )
+        program = (
+            "import sys\n"
+            "from scripts.release_archives import ReleaseArchiveError, validate_tar_framing\n"
+            "try:\n"
+            "    validate_tar_framing(sys.stdin.buffer.read())\n"
+            "except ReleaseArchiveError:\n"
+            "    raise SystemExit(0)\n"
+            "raise SystemExit(1)\n"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", program],
+            input=payload,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode())
 
     def test_tar_rejects_leading_zero_block_before_valid_members(self) -> None:
         with TemporaryDirectory() as directory:
@@ -550,6 +906,23 @@ class CommonArchiveTests(unittest.TestCase):
                 artifact.write_bytes(_mutate_local_zip(valid, mutation))
                 with self.assertRaises(ReleaseArchiveError):
                     extract_regular_zip(artifact, root / "out")
+
+    def test_zip_extractors_reject_bytes_after_member_deflate_eof(self) -> None:
+        original = _zip_bytes([("safe/file.txt", b"safe\n", stat.S_IFREG | 0o644)])
+        payload = _add_trailing_bytes_to_last_deflate_stream(original)
+        for api in ("path", "payload"):
+            with self.subTest(api=api), TemporaryDirectory() as directory:
+                root = Path(directory)
+                artifact = root / "artifact.zip"
+                artifact.write_bytes(payload)
+                destination = root / "out"
+                with self.assertRaises(ReleaseArchiveError) as raised:
+                    if api == "path":
+                        extract_regular_zip(artifact, destination)
+                    else:
+                        extract_regular_zip_payload(payload, destination)
+                self.assertEqual(raised.exception.code, "invalid_archive")
+                self.assertFalse(destination.exists())
 
     def test_zip_rejects_unsafe_duplicate_link_special_mode_and_archive_data(self) -> None:
         regular = ("safe/file.txt", b"safe\n", stat.S_IFREG | 0o644)
@@ -981,6 +1354,29 @@ class WheelContractTests(unittest.TestCase):
             artifact = root / "header-only.whl"
             _write_wheel(artifact, order, payloads)
             validate_wheel(artifact, source, "0.1.0", WHEEL_EPOCH)
+
+    def test_wheel_path_and_payload_validators_reject_bytes_after_deflate_eof(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _make_wheel_source(root)
+            snapshot = release_archives._capture_path_source(
+                source,
+                ["src/threadroot", "README.md", "LICENSE"],
+            )
+            order, payloads = _wheel_payloads(source)
+            artifact = root / "framing.whl"
+            _write_wheel(artifact, order, payloads)
+            payload = _add_trailing_bytes_to_last_deflate_stream(artifact.read_bytes())
+            artifact.write_bytes(payload)
+            for api in ("path", "payload"):
+                with self.subTest(api=api):
+                    with self.assertRaises(ReleaseArchiveError) as raised:
+                        if api == "path":
+                            validate_wheel(artifact, source, "0.1.0", WHEEL_EPOCH)
+                        else:
+                            validate_wheel_payload(payload, snapshot, "0.1.0", WHEEL_EPOCH)
+                    self.assertEqual(raised.exception.code, "invalid_archive")
+
     def test_wheel_requires_exact_source_metadata_entry_point_license_and_record(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1035,6 +1431,166 @@ class WheelContractTests(unittest.TestCase):
 
 
 class SdistContractTests(unittest.TestCase):
+    def test_sdist_path_and_payload_validators_require_canonical_regular_type(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _make_sdist_source(root)
+            snapshot = release_archives._capture_path_source(
+                source,
+                [*release_archives.SDIST_ROOTS, ".gitignore", "pyproject.toml"],
+            )
+            valid = root / "valid.tar.gz"
+            _write_sdist(valid, _sdist_entries(source))
+            raw_tar = gzip.decompress(valid.read_bytes())
+            for typeflag in (
+                tarfile.GNUTYPE_SPARSE,
+                tarfile.CONTTYPE,
+                tarfile.AREGTYPE,
+            ):
+                payload = _gzip_tar_payload(
+                    _mutate_first_tar_header(raw_tar, typeflag=typeflag)
+                )
+                artifact = root / f"type-{typeflag.hex()}.tar.gz"
+                artifact.write_bytes(payload)
+                for api in ("path", "payload"):
+                    with self.subTest(typeflag=typeflag, api=api):
+                        with self.assertRaises(ReleaseArchiveError) as raised:
+                            if api == "path":
+                                validate_sdist(artifact, source, "0.1.0", WHEEL_EPOCH)
+                            else:
+                                validate_sdist_payload(
+                                    payload,
+                                    snapshot,
+                                    "0.1.0",
+                                    WHEEL_EPOCH,
+                                )
+                        self.assertEqual(raised.exception.code, "unsupported_member")
+
+    def test_sdist_path_and_payload_validators_reject_unowned_tar_header_and_padding_bytes(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _make_sdist_source(root)
+            snapshot = release_archives._capture_path_source(
+                source,
+                [*release_archives.SDIST_ROOTS, ".gitignore", "pyproject.toml"],
+            )
+            valid = root / "valid.tar.gz"
+            _write_sdist(valid, _sdist_entries(source))
+            raw_tar = gzip.decompress(valid.read_bytes())
+            mutations = {
+                "padding": _mutate_first_tar_header(
+                    raw_tar,
+                    padding_marker=b"SYNTHETIC-PADDING-MARKER",
+                ),
+                "linkname": _mutate_first_tar_header(
+                    raw_tar,
+                    linkname=b"SYNTHETIC-LINKNAME-MARKER",
+                ),
+                "reserved-tail": _mutate_first_tar_header(
+                    raw_tar,
+                    reserved_tail=b"SYNTHETIC",
+                ),
+            }
+            for mutation, changed_tar in mutations.items():
+                payload = _gzip_tar_payload(changed_tar)
+                artifact = root / f"{mutation}.tar.gz"
+                artifact.write_bytes(payload)
+                for api in ("path", "payload"):
+                    with self.subTest(mutation=mutation, api=api):
+                        with self.assertRaises(ReleaseArchiveError) as raised:
+                            if api == "path":
+                                validate_sdist(artifact, source, "0.1.0", WHEEL_EPOCH)
+                            else:
+                                validate_sdist_payload(
+                                    payload,
+                                    snapshot,
+                                    "0.1.0",
+                                    WHEEL_EPOCH,
+                                )
+                        self.assertEqual(raised.exception.code, "invalid_archive")
+
+    def test_sdist_path_and_payload_validators_reject_consumed_gnu_longname_header(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _make_sdist_source(root)
+            snapshot = release_archives._capture_path_source(
+                source,
+                [*release_archives.SDIST_ROOTS, ".gitignore", "pyproject.toml"],
+            )
+            valid = root / "valid.tar.gz"
+            _write_sdist(valid, _sdist_entries(source))
+            raw_tar = gzip.decompress(valid.read_bytes())
+            with tarfile.open(fileobj=io.BytesIO(raw_tar), mode="r:") as archive:
+                first_name = archive.getmembers()[0].name
+            changed_tar = _prepend_gnu_longname_header(raw_tar, first_name)
+            with tarfile.open(fileobj=io.BytesIO(changed_tar), mode="r:") as archive:
+                self.assertEqual(archive.getmembers()[0].name, first_name)
+            payload = _gzip_tar_payload(changed_tar)
+            artifact = root / "gnu-longname.tar.gz"
+            artifact.write_bytes(payload)
+            for api in ("path", "payload"):
+                with self.subTest(api=api):
+                    with self.assertRaises(ReleaseArchiveError) as raised:
+                        if api == "path":
+                            validate_sdist(artifact, source, "0.1.0", WHEEL_EPOCH)
+                        else:
+                            validate_sdist_payload(
+                                payload,
+                                snapshot,
+                                "0.1.0",
+                                WHEEL_EPOCH,
+                            )
+                    self.assertEqual(raised.exception.code, "unsupported_member")
+
+    def test_sdist_validators_reject_consumed_metadata_and_hidden_header_bytes(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _make_sdist_source(root)
+            snapshot = release_archives._capture_path_source(
+                source,
+                [*release_archives.SDIST_ROOTS, ".gitignore", "pyproject.toml"],
+            )
+            valid = root / "valid.tar.gz"
+            _write_sdist(valid, _sdist_entries(source))
+            raw_tar = gzip.decompress(valid.read_bytes())
+            mutations = {
+                f"pax-{typeflag.decode('ascii')}": _prepend_tar_metadata_header(
+                    raw_tar,
+                    typeflag,
+                )
+                for typeflag in (
+                    tarfile.XGLTYPE,
+                    tarfile.XHDTYPE,
+                    tarfile.SOLARIS_XHDTYPE,
+                )
+            }
+            mutations["name-nul-tail"] = _mutate_first_tar_header(
+                raw_tar,
+                name_tail=b"SYNTHETIC-HIDDEN",
+            )
+
+            for mutation, changed_tar in mutations.items():
+                payload = _gzip_tar_payload(changed_tar)
+                artifact = root / f"{mutation}.tar.gz"
+                artifact.write_bytes(payload)
+                for api in ("path", "payload"):
+                    with self.subTest(mutation=mutation, api=api):
+                        with self.assertRaises(ReleaseArchiveError):
+                            if api == "path":
+                                validate_sdist(
+                                    artifact,
+                                    source,
+                                    "0.1.0",
+                                    WHEEL_EPOCH,
+                                )
+                            else:
+                                validate_sdist_payload(
+                                    payload,
+                                    snapshot,
+                                    "0.1.0",
+                                    WHEEL_EPOCH,
+                                )
+
     def test_sdist_requires_exact_allowlisted_source_and_generated_metadata(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1081,6 +1637,42 @@ class SdistContractTests(unittest.TestCase):
 
 
 class HostZipContractTests(unittest.TestCase):
+    def test_host_zip_path_and_payload_validators_reject_bytes_after_deflate_eof(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = _make_host_source(root)
+            snapshot = release_archives._capture_path_source(
+                source,
+                [
+                    item.as_posix()
+                    for item in (
+                        *build_release.COMMON_ROOTS,
+                        build_release.MARKETPLACE,
+                        *build_release.HOST_MANIFESTS.values(),
+                    )
+                ],
+            )
+            output = root / "artifacts"
+            with patch.object(build_release, "REPOSITORY_ROOT", source):
+                valid = {
+                    host: build_archive(host, output)
+                    for host in ("claude", "codex")
+                }
+            for host, original in valid.items():
+                payload = _add_trailing_bytes_to_last_deflate_stream(
+                    original.read_bytes()
+                )
+                artifact = root / f"{host}-framing.zip"
+                artifact.write_bytes(payload)
+                for api in ("path", "payload"):
+                    with self.subTest(host=host, api=api):
+                        with self.assertRaises(ReleaseArchiveError) as raised:
+                            if api == "path":
+                                validate_host_zip(artifact, source, host)
+                            else:
+                                validate_host_zip_payload(payload, snapshot, host)
+                        self.assertEqual(raised.exception.code, "invalid_archive")
+
     def test_host_zip_requires_native_manifest_canonical_metadata_order_and_source_parity(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
 import errno
+import gzip
 import hashlib
 import json
 import os
@@ -19,7 +20,18 @@ from scripts.release_artifacts import (
     expected_asset_names,
 )
 from scripts import release_archives
-from tests.test_release_archives import WHEEL_EPOCH, _make_release_source, _make_sdist_source, _sdist_entries, _write_sdist
+from tests.test_release_archives import (
+    WHEEL_EPOCH,
+    _add_trailing_bytes_to_last_deflate_stream,
+    _gzip_tar_payload,
+    _make_release_source,
+    _make_sdist_source,
+    _prepend_tar_metadata_header,
+    _sdist_entries,
+    _wheel_payloads,
+    _write_sdist,
+    _write_wheel,
+)
 
 
 class ArtifactSetTests(unittest.TestCase):
@@ -116,13 +128,17 @@ def _promote_test_candidate(root: Path, artifacts: ArtifactSet) -> None:
 
 
 @contextmanager
-def _canonical_environment():
+def _canonical_environment(epoch: int = 123):
     class Distribution:
         def __init__(self, name: str, version: str) -> None:
             self.metadata = {"Name": name}
             self.version = version
 
-    environment = {**release_artifacts.EXPECTED_ENVIRONMENT, "SOURCE_DATE_EPOCH": "123", "PATH": "/synthetic/bin"}
+    environment = {
+        **release_artifacts.EXPECTED_ENVIRONMENT,
+        "SOURCE_DATE_EPOCH": str(epoch),
+        "PATH": "/synthetic/bin",
+    }
     with ExitStack() as stack:
         stack.enter_context(patch.dict(os.environ, environment, clear=True))
         stack.enter_context(patch.object(release_artifacts.platform, "system", return_value="Linux"))
@@ -764,6 +780,142 @@ class PromotionIdentityTests(unittest.TestCase):
 
 
 class BuildAndVerifyTests(unittest.TestCase):
+    def test_byte_identical_malformed_archives_fail_before_promotion(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_a = _make_source(root / "a")
+            source_b = _make_source(root / "b")
+            output = root / "output"
+            wheel = root / "valid.whl"
+            order, payloads = _wheel_payloads(source_a)
+            _write_wheel(wheel, order, payloads)
+            malformed = _add_trailing_bytes_to_last_deflate_stream(
+                wheel.read_bytes()
+            )
+
+            def build(
+                source: Path,
+                candidate: Path,
+                work: Path,
+                epoch: int,
+                **kwargs: object,
+            ) -> None:
+                candidate.mkdir(parents=True, exist_ok=True)
+                for name in expected_asset_names("0.1.0"):
+                    payload = malformed if name.endswith(".whl") else name.encode()
+                    (candidate / name).write_bytes(payload)
+
+            with (
+                _canonical_environment(WHEEL_EPOCH),
+                patch.object(
+                    release_artifacts,
+                    "_build_one_source",
+                    side_effect=build,
+                ),
+                patch.object(release_artifacts, "validate_sdist_payload"),
+                patch.object(release_artifacts, "validate_host_zip_payload"),
+                patch.object(release_artifacts, "_replay_sdist"),
+                patch.object(release_artifacts, "_scan"),
+                patch.object(
+                    release_artifacts,
+                    "extract_regular_zip_payload",
+                    side_effect=_fake_extract,
+                ),
+                patch.object(
+                    release_artifacts,
+                    "extract_regular_tar_payload",
+                    side_effect=_fake_extract,
+                ),
+                self.assertRaisesRegex(
+                    ReleaseArtifactError,
+                    "invalid ZIP compressed boundary",
+                ),
+            ):
+                release_artifacts.build_and_verify(
+                    source_a,
+                    source_b,
+                    output,
+                    "a" * 40,
+                    WHEEL_EPOCH,
+                )
+
+            wheel_name = expected_asset_names("0.1.0")[0]
+            self.assertEqual(
+                (output / "candidate-a" / wheel_name).read_bytes(),
+                (output / "candidate-b" / wheel_name).read_bytes(),
+            )
+            self.assertFalse((output / "selected").exists())
+            self.assertFalse((output / "selected.pending").exists())
+            self.assertFalse((output / "evidence/build.json").exists())
+
+    def test_byte_identical_sdist_with_hidden_metadata_fails_before_evidence(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_a = _make_source(root / "a")
+            source_b = _make_source(root / "b")
+            output = root / "output"
+            valid = root / "valid.tar.gz"
+            _write_sdist(valid, _sdist_entries(source_a))
+            malformed = _gzip_tar_payload(
+                _prepend_tar_metadata_header(
+                    gzip.decompress(valid.read_bytes()),
+                    b"g",
+                )
+            )
+
+            def build(
+                source: Path,
+                candidate: Path,
+                work: Path,
+                epoch: int,
+                **kwargs: object,
+            ) -> None:
+                candidate.mkdir(parents=True, exist_ok=True)
+                for name in expected_asset_names("0.1.0"):
+                    payload = malformed if name.endswith(".tar.gz") else name.encode()
+                    (candidate / name).write_bytes(payload)
+
+            with (
+                _canonical_environment(WHEEL_EPOCH),
+                patch.object(
+                    release_artifacts,
+                    "_build_one_source",
+                    side_effect=build,
+                ),
+                patch.object(release_artifacts, "validate_wheel_payload"),
+                patch.object(release_artifacts, "validate_host_zip_payload"),
+                patch.object(release_artifacts, "_replay_sdist"),
+                patch.object(release_artifacts, "_scan"),
+                patch.object(
+                    release_artifacts,
+                    "extract_regular_zip_payload",
+                    side_effect=_fake_extract,
+                ),
+                patch.object(
+                    release_artifacts,
+                    "extract_regular_tar_payload",
+                    side_effect=_fake_extract,
+                ),
+                self.assertRaises(ReleaseArtifactError),
+            ):
+                release_artifacts.build_and_verify(
+                    source_a,
+                    source_b,
+                    output,
+                    "a" * 40,
+                    WHEEL_EPOCH,
+                )
+
+            sdist_name = expected_asset_names("0.1.0")[1]
+            self.assertEqual(
+                (output / "candidate-a" / sdist_name).read_bytes(),
+                (output / "candidate-b" / sdist_name).read_bytes(),
+            )
+            self.assertFalse((output / "selected").exists())
+            self.assertFalse((output / "selected.pending").exists())
+            self.assertFalse((output / "evidence/build.json").exists())
+            self.assertFalse((output / "evidence/SHA256SUMS").exists())
+
     def test_lock_requires_exactly_one_approved_option(self) -> None:
         with TemporaryDirectory() as directory:
             lock = Path(directory) / "release.txt"
