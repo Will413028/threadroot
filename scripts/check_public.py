@@ -11,7 +11,8 @@ import re
 import stat
 import sys
 import tarfile
-from typing import BinaryIO
+from typing import BinaryIO, TextIO
+import unicodedata
 import zipfile
 import zlib
 
@@ -78,13 +79,24 @@ def _active_terms(denied_terms: tuple[str, ...] | list[str]) -> tuple[str, ...]:
 
 
 def _sanitize_display(value: str, denied_terms: tuple[str, ...]) -> str:
-    for term in denied_terms:
+    active_terms = _active_terms(denied_terms)
+    for term in active_terms:
         value = value.replace(term, "[redacted]")
-    sanitized = "".join(
-        {"\n": r"\n", "\r": r"\r", "\t": r"\t"}.get(character, character)
-        for character in value
-    )
-    if any(term and term in sanitized for term in denied_terms):
+    characters: list[str] = []
+    short_escapes = {"\n": r"\n", "\r": r"\r", "\t": r"\t"}
+    for character in value:
+        if character in short_escapes:
+            characters.append(short_escapes[character])
+        elif unicodedata.category(character) in {"Cc", "Cf", "Zl", "Zp"}:
+            codepoint = ord(character)
+            if codepoint <= 0xFFFF:
+                characters.append(f"\\u{codepoint:04x}")
+            else:
+                characters.append(f"\\U{codepoint:08x}")
+        else:
+            characters.append(character)
+    sanitized = "".join(characters)
+    if any(term in sanitized for term in active_terms):
         return ""
     return sanitized
 
@@ -803,11 +815,22 @@ def _render(finding: Finding) -> str:
     return f"{location}: {finding.code}: {finding.message}"
 
 
+def _write_public_line(
+    value: str,
+    denied_terms: tuple[str, ...],
+    stream: TextIO,
+) -> None:
+    sanitized = _sanitize_display(value, denied_terms)
+    if sanitized != "":
+        print(sanitized, file=stream)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--denylist", type=Path)
     parser.add_argument("paths", nargs="*", type=Path)
     args = parser.parse_args(argv)
+    denied_terms: tuple[str, ...] = ()
     try:
         denied_terms = _read_denylist(args.denylist)
         paths = args.paths or [Path(".")]
@@ -827,10 +850,10 @@ def main(argv: list[str] | None = None) -> int:
             findings.extend(scanned)
         findings.sort(key=_sort_key)
     except (OSError, UnicodeError, PublicScanError):
-        print("public scan failed", file=sys.stderr)
+        _write_public_line("public scan failed", denied_terms, sys.stderr)
         return 2
     for finding in findings:
-        print(_render(finding))
+        _write_public_line(_render(finding), denied_terms, sys.stdout)
     return 1 if findings else 0
 
 

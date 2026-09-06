@@ -45,6 +45,19 @@ def credential_line() -> str:
     return "api" + "_key = synthetic-value"
 
 
+def run_public_cli(*arguments: str | Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).parents[1] / "scripts/check_public.py"),
+            *(str(argument) for argument in arguments),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 def damage_first_zip_member(path: Path) -> None:
     with zipfile.ZipFile(path) as archive:
         info = archive.infolist()[0]
@@ -256,6 +269,83 @@ class PublicSafetyTests(unittest.TestCase):
                 self.assertEqual(findings[0].code, "denied_term")
                 self.assertNotIn(denied, findings[0].path)
                 self.assertNotIn(denied, repr(findings))
+
+    def test_filesystem_finding_paths_escape_unsafe_unicode(self) -> None:
+        cases = (
+            ("newline", "\n", r"\n"),
+            ("carriage-return", "\r", r"\r"),
+            ("tab", "\t", r"\t"),
+            ("bell", "\x07", r"\u0007"),
+            ("escape", "\x1b", r"\u001b"),
+            ("delete", "\x7f", r"\u007f"),
+            ("soft-hyphen", "\u00ad", r"\u00ad"),
+            ("bidi-override", "\u202e", r"\u202e"),
+            ("bidi-isolate", "\u2066", r"\u2066"),
+            ("line-separator", "\u2028", r"\u2028"),
+            ("paragraph-separator", "\u2029", r"\u2029"),
+        )
+        for label, unsafe, escaped in cases:
+            with self.subTest(character=label), TemporaryDirectory() as directory:
+                target = Path(directory) / f"unsafe{unsafe}.txt"
+                target.write_text(private_key_header() + "\n", encoding="utf-8")
+
+                findings = scan_path(target)
+                completed = run_public_cli(target)
+
+                self.assertEqual(
+                    [(finding.code, finding.path, finding.line) for finding in findings],
+                    [("private_key", f"unsafe{escaped}.txt", 1)],
+                )
+                self.assertNotIn(unsafe, findings[0].path)
+                self.assertEqual(completed.returncode, 1)
+                self.assertEqual(completed.stderr, "")
+                self.assertEqual(
+                    completed.stdout,
+                    f"unsafe{escaped}.txt:1: private_key: "
+                    "private-key header detected\n",
+                )
+                self.assertNotIn(unsafe, completed.stdout.removesuffix("\n"))
+
+    def test_zip_member_finding_paths_escape_unsafe_unicode(self) -> None:
+        cases = (
+            ("bell", "\x07", r"\u0007"),
+            ("escape", "\x1b", r"\u001b"),
+            ("delete", "\x7f", r"\u007f"),
+            ("soft-hyphen", "\u00ad", r"\u00ad"),
+            ("bidi-override", "\u202e", r"\u202e"),
+            ("bidi-isolate", "\u2066", r"\u2066"),
+            ("line-separator", "\u2028", r"\u2028"),
+            ("paragraph-separator", "\u2029", r"\u2029"),
+        )
+        with TemporaryDirectory() as directory:
+            artifact = Path(directory) / "unsafe-names.zip"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                for label, unsafe, _escaped in cases:
+                    archive.writestr(
+                        f"notes/{label}-{unsafe}.txt",
+                        private_key_header() + "\n",
+                    )
+
+            findings = scan_path(artifact)
+            completed = run_public_cli(artifact)
+
+        self.assertCountEqual(
+            [(finding.code, finding.path, finding.line) for finding in findings],
+            [
+                (
+                    "private_key",
+                    f"unsafe-names.zip!notes/{label}-{escaped}.txt",
+                    1,
+                )
+                for label, _unsafe, escaped in cases
+            ],
+        )
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(completed.stderr, "")
+        self.assertEqual(len(completed.stdout.splitlines()), len(cases))
+        for _label, unsafe, escaped in cases:
+            self.assertNotIn(unsafe, completed.stdout)
+            self.assertIn(escaped, completed.stdout)
 
     def test_denied_term_is_detected_in_each_filesystem_path_component(self) -> None:
         denied = "Synthetic " + "Juniper Works"
@@ -1134,6 +1224,137 @@ class PublicSafetyTests(unittest.TestCase):
                 self.assertIn("denied_term", completed.stdout)
                 self.assertNotIn(denied, completed.stdout)
                 self.assertNotIn(denied, completed.stderr)
+
+    def test_cli_sanitizes_terms_in_finding_code_and_message(self) -> None:
+        for denied in ("denied", "term", "detected"):
+            with self.subTest(denied=denied), TemporaryDirectory() as directory:
+                root = Path(directory)
+                target = root / "finding.txt"
+                target.write_text(denied + "\n", encoding="utf-8")
+                denylist = root / "denylist.txt"
+                denylist.write_text(denied + "\n", encoding="utf-8")
+
+                completed = run_public_cli(
+                    "--denylist",
+                    denylist,
+                    target,
+                )
+
+                self.assertEqual(completed.returncode, 1)
+                self.assertEqual(completed.stderr, "")
+                self.assertNotEqual(completed.stdout, "")
+                self.assertNotIn(denied, completed.stdout)
+
+    def test_cli_sanitizes_multi_input_prefix_and_numeric_locations(self) -> None:
+        cases = (
+            ("input-prefix", "input", 1, 1),
+            ("input-index", "2", 2, 1),
+            ("line-number", "7", 1, 7),
+        )
+        for label, denied, selected_index, line_number in cases:
+            with self.subTest(case=label), TemporaryDirectory() as directory:
+                root = Path(directory)
+                targets = [root / "first.txt", root / "second.txt"]
+                for target in targets:
+                    target.write_text("safe\n", encoding="utf-8")
+                targets[selected_index - 1].write_text(
+                    "safe\n" * (line_number - 1) + private_key_header() + "\n",
+                    encoding="utf-8",
+                )
+                denylist = root / "denylist.txt"
+                denylist.write_text(denied + "\n", encoding="utf-8")
+
+                completed = run_public_cli(
+                    "--denylist",
+                    denylist,
+                    *targets,
+                )
+
+                self.assertEqual(completed.returncode, 1)
+                self.assertEqual(completed.stderr, "")
+                self.assertNotEqual(completed.stdout, "")
+                self.assertNotIn(denied, completed.stdout)
+
+    def test_cli_sanitizes_terms_spanning_rendered_components(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "finding.txt"
+            target.write_text(private_key_header() + "\n", encoding="utf-8")
+            denied = "txt:1"
+            denylist = root / "denylist.txt"
+            denylist.write_text(denied + "\n", encoding="utf-8")
+
+            completed = run_public_cli(
+                "--denylist",
+                denylist,
+                target,
+            )
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(completed.stderr, "")
+        self.assertNotEqual(completed.stdout, "")
+        self.assertNotIn(denied, completed.stdout)
+
+    def test_cli_suppresses_line_if_redaction_creates_another_denied_term(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "unsafe\x1b.txt"
+            target.write_text("denied\n", encoding="utf-8")
+            denied_terms = ("redacted", "denied")
+            denylist = root / "denylist.txt"
+            denylist.write_text("\n".join(denied_terms) + "\n", encoding="utf-8")
+
+            completed = run_public_cli(
+                "--denylist",
+                denylist,
+                target,
+            )
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(completed.stdout, "")
+        self.assertEqual(completed.stderr, "")
+        for denied in denied_terms:
+            self.assertNotIn(denied, completed.stdout)
+            self.assertNotIn(denied, completed.stderr)
+        self.assertNotIn("\x1b", completed.stdout)
+        self.assertNotIn("\x1b", completed.stderr)
+
+    def test_cli_sanitizes_generic_failure_output_with_denylist(self) -> None:
+        cases = (
+            (("failed",), "public scan [redacted]\n"),
+            (("redacted", "failed"), ""),
+        )
+        for denied_terms, expected_stderr in cases:
+            with self.subTest(denied_terms=denied_terms), TemporaryDirectory() as directory:
+                root = Path(directory)
+                denylist = root / "denylist.txt"
+                denylist.write_text("\n".join(denied_terms) + "\n", encoding="utf-8")
+
+                completed = run_public_cli(
+                    "--denylist",
+                    denylist,
+                    root / "missing.txt",
+                )
+
+                self.assertEqual(completed.returncode, 2)
+                self.assertEqual(completed.stdout, "")
+                self.assertEqual(completed.stderr, expected_stderr)
+                for denied in denied_terms:
+                    self.assertNotIn(denied, completed.stderr)
+
+    def test_cli_safe_ordinary_finding_remains_readable(self) -> None:
+        with TemporaryDirectory() as directory:
+            target = Path(directory) / "ordinary.txt"
+            target.write_text(private_key_header() + "\n", encoding="utf-8")
+
+            completed = run_public_cli(target)
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(completed.stderr, "")
+        self.assertEqual(
+            completed.stdout,
+            "ordinary.txt:1: private_key: private-key header detected\n",
+        )
 
     def test_cli_disambiguates_same_basename_inputs(self) -> None:
         with TemporaryDirectory() as directory:
