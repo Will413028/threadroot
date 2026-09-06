@@ -34,8 +34,6 @@ python -m zipfile -l dist/threadroot-codex-0.1.0.zip
 
 The wheel contains the CLI. The source distribution contains the public source tree. Each host ZIP contains the shared skills, templates, public entry documents, marketplace catalog, and only that host's native manifest.
 
-For an offline verification wave, use an already-installed `build` environment with setuptools `>=69` and run `python -m build --no-isolation`. Do not install missing build tools or interpreters through the network without separate authorization. Verify updated shared skill bytes in both archives and new safety/claim tests in the source distribution; versions, runtime dependencies and manifests are unchanged by claim.
-
 Use a disposable virtual environment for the wheel smoke test:
 
 ```bash
@@ -55,6 +53,26 @@ threadroot claim --path daily/2042-04-03.md --vault ./synthetic-vault --json --a
 ```
 
 Require pure preview (target absent), then one empty regular reservation. Parse exactly the six result keys `ok`, `command`, `applied`, `vault`, `changes`, `issues`: success has `ok=true`, `command=claim`, the diagnosed vault, no issues, and one `create_file` change for the exact target (`planned`/`applied=false` in preview, `completed`/`applied=true` in apply). Repeat apply and require exit `5` with unchanged bytes. Claim never receives note text or creates parents; unsafe paths return `4`, filesystem failures and post-planning collisions return `6`.
+
+## Canonical release build
+
+Hatchling is the PEP 517 build backend. Keep `python -m build` as the ordinary compatibility-inspection command.
+
+For a canonical maintainer build, run this exact sequence from a clean checkout:
+
+```bash
+threadroot_release_output="$(mktemp -d)"
+python3 -m scripts.build_verified_release \
+  --commit "$(git rev-parse HEAD)" \
+  --output "$threadroot_release_output"
+find "$threadroot_release_output/build/selected" -maxdepth 1 -type f -print | sort
+```
+
+The canonical builder's provisioning phase is network-enabled and may pull the digest-pinned image and hash-approved wheels. The artifact container then runs with exact `--network none`.
+
+The output root must be outside the repository and must be missing or empty. Failures retain the candidate/evidence directories for inspection. Use a new output root for a complete retry so the preserved evidence remains inspectable.
+
+Docker is not an end-user or runtime requirement. It is required only for maintainers running the canonical release build.
 
 ## Public-safety scans
 

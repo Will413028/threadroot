@@ -30,3 +30,10 @@ jobs:
       - run: python scripts/build_release.py --output dist
       - run: python scripts/check_public.py .
       - run: python scripts/check_public.py dist
+
+  release-artifacts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: python3 -m scripts.build_verified_release --commit "$GITHUB_SHA" --output "$RUNNER_TEMP/threadroot-release"

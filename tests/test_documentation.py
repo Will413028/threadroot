@@ -36,10 +36,10 @@ EXPECTED_SKILLS = {
     "second-brain-setup",
     "weekly-review",
 }
-EXPECTED_ACTIONS = {
+EXPECTED_TEST_ACTIONS = [
     "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
     "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
-}
+]
 EXPECTED_CI_COMMANDS = [
     "python -m pip install --upgrade pip build",
     "python -m unittest discover -s tests -v",
@@ -50,6 +50,10 @@ EXPECTED_CI_COMMANDS = [
     "python scripts/check_public.py .",
     "python scripts/check_public.py dist",
 ]
+EXPECTED_RELEASE_COMMAND = (
+    'python3 -m scripts.build_verified_release --commit "$GITHUB_SHA" '
+    '--output "$RUNNER_TEMP/threadroot-release"'
+)
 
 
 def _section(markdown: str, heading: str) -> str:
@@ -70,6 +74,19 @@ def _inline_matrix_values(workflow: str, key: str) -> list[str]:
     if match is None:
         raise AssertionError(f"missing inline matrix key: {key}")
     return [value.strip().strip('"\'') for value in match.group(1).split(",")]
+
+
+def _yaml_mapping_body(document: str, key: str, indent: int) -> str:
+    spaces = " " * indent
+    match = re.search(
+        rf"^{spaces}{re.escape(key)}:\s*$\n"
+        rf"(?P<body>.*?)(?=^{spaces}[A-Za-z0-9_-]+:\s*(?:#.*)?$|\Z)",
+        document,
+        re.MULTILINE | re.DOTALL,
+    )
+    if match is None:
+        raise AssertionError(f"missing YAML mapping: {key}")
+    return match.group("body")
 
 
 def _non_overwrite_contract_errors(section: str) -> list[str]:
@@ -317,29 +334,135 @@ class DocumentationTests(unittest.TestCase):
         workflow_path = Path(".github/workflows/ci.yml")
         self.assertTrue(workflow_path.is_file(), "missing CI workflow")
         workflow = workflow_path.read_text(encoding="utf-8")
-        actions = re.findall(r"^\s+- uses:\s*(\S+)", workflow, re.MULTILINE)
+        jobs = _yaml_mapping_body(workflow, "jobs", 0)
+        self.assertEqual(
+            re.findall(r"^  ([A-Za-z0-9_-]+):\s*$", jobs, re.MULTILINE),
+            ["test", "release-artifacts"],
+        )
+        test_job = _yaml_mapping_body(jobs, "test", 2)
+        release_job = _yaml_mapping_body(jobs, "release-artifacts", 2)
+        test_actions = re.findall(
+            r"^\s+- uses:\s*(\S+)", test_job, re.MULTILINE
+        )
+        release_actions = re.findall(
+            r"^\s+- uses:\s*(\S+)", release_job, re.MULTILINE
+        )
 
-        self.assertEqual(set(actions), EXPECTED_ACTIONS)
-        self.assertEqual(len(actions), len(EXPECTED_ACTIONS))
-        for action in actions:
+        self.assertEqual(test_actions, EXPECTED_TEST_ACTIONS)
+        for action in test_actions:
             with self.subTest(action=action):
                 self.assertRegex(action, r"@[0-9a-f]{40}$")
 
-        self.assertEqual(
-            _inline_matrix_values(workflow, "os"),
-            ["ubuntu-latest", "macos-latest"],
+        matrix_os = _inline_matrix_values(test_job, "os")
+        matrix_python = _inline_matrix_values(test_job, "python")
+        self.assertEqual(matrix_os, ["ubuntu-latest", "macos-latest"])
+        self.assertEqual(matrix_python, ["3.11", "3.12", "3.13", "3.14"])
+        self.assertEqual(len(matrix_os) * len(matrix_python), 8)
+        self.assertRegex(test_job, r"(?m)^      fail-fast:\s*false\s*$")
+        self.assertRegex(
+            test_job,
+            r"(?m)^    runs-on:\s*\$\{\{\s*matrix\.os\s*\}\}\s*$",
+        )
+        self.assertRegex(
+            test_job,
+            r"(?m)^          python-version:\s*\$\{\{\s*matrix\.python\s*\}\}\s*$",
         )
         self.assertEqual(
-            _inline_matrix_values(workflow, "python"),
-            ["3.11", "3.12", "3.13", "3.14"],
-        )
-        self.assertIn("fail-fast: false", workflow)
-        self.assertIn("contents: read", workflow)
-        self.assertEqual(
-            re.findall(r"^\s+- run:\s*(.+)$", workflow, re.MULTILINE),
+            re.findall(r"^\s+- run:\s*(.+)$", test_job, re.MULTILINE),
             EXPECTED_CI_COMMANDS,
         )
-        self.assertRegex(workflow, r"(?m)^\s+PYTHONPATH:\s*src:\.\s*$")
+        self.assertRegex(test_job, r"(?m)^\s+PYTHONPATH:\s*src:\.\s*$")
+
+        self.assertEqual(
+            release_actions,
+            ["actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"],
+        )
+        self.assertRegex(release_actions[0], r"@[0-9a-f]{40}$")
+        self.assertEqual(
+            re.findall(r"^\s+- run:\s*(.+)$", release_job, re.MULTILINE),
+            [EXPECTED_RELEASE_COMMAND],
+        )
+        self.assertEqual(
+            re.findall(
+                r"^    (runs-on|timeout-minutes):\s*(.+?)\s*$",
+                release_job,
+                re.MULTILINE,
+            ),
+            [("runs-on", "ubuntu-24.04"), ("timeout-minutes", "30")],
+        )
+        self.assertEqual(
+            re.findall(r"^    ([A-Za-z0-9_-]+):", release_job, re.MULTILINE),
+            ["runs-on", "timeout-minutes", "steps"],
+        )
+        self.assertEqual(
+            re.findall(r"^      - ([A-Za-z0-9_-]+):", release_job, re.MULTILINE),
+            ["uses", "run"],
+        )
+        self.assertEqual(
+            re.findall(r"^        ([A-Za-z0-9_-]+):", release_job, re.MULTILINE),
+            [],
+        )
+        self.assertNotRegex(release_job, r"(?m)^    permissions:")
+
+        permissions = _yaml_mapping_body(workflow, "permissions", 0)
+        self.assertEqual(
+            re.findall(
+                r"^  ([A-Za-z0-9_-]+):\s*(\S+)\s*$", permissions, re.MULTILINE
+            ),
+            [("contents", "read")],
+        )
+
+    def test_canonical_release_build_is_documented(self) -> None:
+        testing = Path("docs/testing.md").read_text(encoding="utf-8")
+        section = _section(testing, "Canonical release build")
+        expected_commands = "\n".join(
+            (
+                'threadroot_release_output="$(mktemp -d)"',
+                "python3 -m scripts.build_verified_release \\",
+                '  --commit "$(git rev-parse HEAD)" \\',
+                '  --output "$threadroot_release_output"',
+                'find "$threadroot_release_output/build/selected" '
+                "-maxdepth 1 -type f -print | sort",
+            )
+        )
+
+        self.assertEqual(
+            re.findall(
+                r"^```bash\s*$\n(.*?)^```\s*$",
+                section,
+                re.MULTILINE | re.DOTALL,
+            ),
+            [expected_commands + "\n"],
+        )
+        for statement in (
+            "Hatchling is the PEP 517 build backend.",
+            "Keep `python -m build` as the ordinary compatibility-inspection command.",
+            "The canonical builder's provisioning phase is network-enabled and may pull the digest-pinned image and hash-approved wheels.",
+            "The artifact container then runs with exact `--network none`.",
+            "The output root must be outside the repository and must be missing or empty.",
+            "Failures retain the candidate/evidence directories for inspection.",
+            "Docker is not an end-user or runtime requirement.",
+        ):
+            with self.subTest(statement=statement):
+                self.assertIn(statement, section)
+        self.assertNotRegex(testing, r"(?i)setuptools\s+`?>=69`?")
+
+    def test_superseded_release_plan_points_to_reproducible_plan_before_first_task(
+        self,
+    ) -> None:
+        old_plan = Path(
+            "docs/superpowers/plans/2026-09-05-threadroot-v0.1.0-release-readiness.md"
+        ).read_text(encoding="utf-8")
+        first_task = re.search(r"^### Task\b", old_plan, re.MULTILINE)
+        self.assertIsNotNone(first_task, "superseded plan has no task heading")
+        prefix = old_plan[: first_task.start()]
+
+        self.assertRegex(
+            prefix,
+            r"\[[^]]+]\(2026-09-05-threadroot-reproducible-release-build\.md\)",
+        )
+        self.assertIn("Tasks 5-12", prefix)
+        self.assertIn("must not be executed", prefix)
 
 
 if __name__ == "__main__":
