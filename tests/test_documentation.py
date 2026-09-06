@@ -356,7 +356,11 @@ def _run_release_plan_block(
         "/private/tmp/threadroot-v010-",
         f"{directory.as_posix()}/threadroot-v010-",
     )
-    run_environment = os.environ.copy()
+    run_environment = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith("threadroot_")
+    }
     run_environment.update(environment)
     run_environment["PATH"] = f"{fake_bin}{os.pathsep}{run_environment['PATH']}"
     run_environment["THREADROOT_TEST_CALL_LOG"] = str(call_log)
@@ -438,6 +442,27 @@ def _write_public_release(destination: Path, selected: Path) -> None:
         "tag_name": "v0.1.0",
     }
     destination.write_text(json.dumps(release), encoding="utf-8")
+
+
+def _write_task_10_host_fake(fake_bin: Path, command: str) -> None:
+    _write_executable(
+        fake_bin / command,
+        f"""#!/bin/bash
+set -euo pipefail
+if test "$*" = "--version"; then
+  printf '%s 1.0.0\\n' {command!r}
+elif test "$*" = "plugin list --json"; then
+  printf '%s\\n' '{{"plugins":["threadroot@threadroot"]}}'
+fi
+""",
+    )
+
+
+def _write_task_10_checksum(path: Path) -> None:
+    path.with_suffix(".before").write_text(
+        f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path}\n",
+        encoding="utf-8",
+    )
 
 
 class DocumentationTests(unittest.TestCase):
@@ -763,19 +788,234 @@ class DocumentationTests(unittest.TestCase):
                     with self.assertRaises(AssertionError):
                         self.test_ci_has_exact_matrix_pins_and_validation_commands()
 
-    def test_tasks_7_through_12_bash_blocks_start_in_strict_mode(self) -> None:
+    def test_tasks_7_through_12_bash_blocks_have_locked_counts_and_syntax(
+        self,
+    ) -> None:
         plan = REPRODUCIBLE_RELEASE_PLAN.read_text(encoding="utf-8")
 
-        for task_number in range(7, 13):
+        expected_counts = {7: 4, 8: 3, 9: 4, 10: 7, 11: 3, 12: 3}
+
+        for task_number, expected_count in expected_counts.items():
             blocks = re.findall(
                 r"^```bash\s*$\n(.*?)^```\s*$",
                 _release_plan_task(plan, task_number),
                 re.MULTILINE | re.DOTALL,
             )
-            self.assertTrue(blocks, f"Task {task_number} has no Bash blocks")
+            self.assertEqual(
+                len(blocks),
+                expected_count,
+                f"Task {task_number} Bash block count changed",
+            )
             for block_number, block in enumerate(blocks, start=1):
                 with self.subTest(task=task_number, block=block_number):
                     self.assertEqual(block.splitlines()[0], "set -euo pipefail")
+
+                    syntax = subprocess.run(
+                        ["/bin/bash", "-n"],
+                        input=block,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(
+                        syntax.returncode,
+                        0,
+                        syntax.stdout + syntax.stderr,
+                    )
+
+    def test_task_10_cli_smoke_validation_runs_in_a_fresh_shell(self) -> None:
+        plan = REPRODUCIBLE_RELEASE_PLAN.read_text(encoding="utf-8")
+        block = _release_plan_bash_block(plan, 10, 3, 1)
+
+        with TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            fake_bin, call_log = _fake_release_commands(directory)
+            state_root = directory / "threadroot-v010-release-state-20260905"
+            final_root = directory / "final"
+            smoke_root = final_root / "cli-smoke"
+            smoke_home = smoke_root / "home"
+            smoke_xdg = smoke_root / "xdg"
+            smoke_vault = smoke_root / "vault"
+            state_root.mkdir()
+            smoke_home.mkdir(parents=True)
+            smoke_xdg.mkdir()
+            (smoke_vault / "daily").mkdir(parents=True)
+            (smoke_vault / "daily" / "2042-04-03.md").write_bytes(b"")
+            (state_root / "final-root.txt").write_text(
+                f"{final_root}\n", encoding="utf-8"
+            )
+            sentinel = smoke_root / "sentinel.txt"
+            sentinel.write_text("unrelated sentinel\n", encoding="utf-8")
+            _write_task_10_checksum(sentinel)
+
+            document_names = (
+                "init-preview.json",
+                "init-apply.json",
+                "doctor.json",
+                "claim-preview.json",
+                "claim-apply.json",
+                "claim-repeat.json",
+            )
+            commands = ("init", "init", "doctor", "claim", "claim", "claim")
+            applied = (False, True, False, False, True, False)
+            for index, (name, command, was_applied) in enumerate(
+                zip(document_names, commands, applied, strict=True)
+            ):
+                (smoke_root / name).write_text(
+                    json.dumps(
+                        {
+                            "ok": index != 5,
+                            "command": command,
+                            "applied": was_applied,
+                            "vault": str(smoke_vault),
+                            "changes": [],
+                            "issues": (
+                                [] if index != 5 else [{"code": "target.conflict"}]
+                            ),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            result = _run_release_plan_block(
+                block,
+                directory,
+                fake_bin,
+                call_log,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue((smoke_root / "vault-pristine").is_dir())
+
+    def test_task_10_host_validation_runs_in_a_fresh_shell(self) -> None:
+        plan = REPRODUCIBLE_RELEASE_PLAN.read_text(encoding="utf-8")
+        block = _release_plan_bash_block(plan, 10, 4, 1)
+
+        with TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            fake_bin, call_log = _fake_release_commands(directory)
+            _write_task_10_host_fake(fake_bin, "claude")
+            _write_task_10_host_fake(fake_bin, "codex")
+            state_root = directory / "threadroot-v010-release-state-20260905"
+            final_root = directory / "final"
+            smoke_root = final_root / "cli-smoke"
+            host_root = final_root / "host-smoke"
+            state_root.mkdir()
+            smoke_root.mkdir(parents=True)
+            for name in (
+                "claude-bundle",
+                "codex-bundle",
+                "claude-home",
+                "claude-config",
+                "claude-cache",
+                "codex-home",
+                "codex-config",
+                "codex-data",
+                "codex-cache",
+                "codex-state",
+                "claude-tmp",
+                "codex-tmp",
+            ):
+                (host_root / name).mkdir(parents=True)
+            (state_root / "final-root.txt").write_text(
+                f"{final_root}\n", encoding="utf-8"
+            )
+
+            result = _run_release_plan_block(
+                block,
+                directory,
+                fake_bin,
+                call_log,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(
+                (smoke_root / "claude-version.txt").read_text(encoding="utf-8"),
+                "claude 1.0.0\n",
+            )
+            self.assertEqual(
+                (smoke_root / "codex-version.txt").read_text(encoding="utf-8"),
+                "codex 1.0.0\n",
+            )
+            self.assertTrue((host_root / "claude-list-installed.json").is_file())
+            self.assertTrue((host_root / "codex-list-installed.json").is_file())
+
+    def test_task_10_uninstall_runs_in_a_fresh_shell(self) -> None:
+        plan = REPRODUCIBLE_RELEASE_PLAN.read_text(encoding="utf-8")
+        block = _release_plan_bash_block(plan, 10, 5)
+
+        with TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            fake_bin, call_log = _fake_release_commands(directory)
+            _write_task_10_host_fake(fake_bin, "claude")
+            _write_task_10_host_fake(fake_bin, "codex")
+            state_root = directory / "threadroot-v010-release-state-20260905"
+            final_root = directory / "final"
+            smoke_root = final_root / "cli-smoke"
+            smoke_vault = smoke_root / "vault"
+            host_root = final_root / "host-smoke"
+            state_root.mkdir()
+            (state_root / "final-root.txt").write_text(
+                f"{final_root}\n", encoding="utf-8"
+            )
+            wheel_python = final_root / "wheel-smoke-venv" / "bin" / "python"
+            wheel_python.parent.mkdir(parents=True)
+            _write_executable(
+                wheel_python,
+                """#!/bin/bash
+set -euo pipefail
+if test "$*" = "-m pip uninstall -y threadroot"; then
+  exit 0
+fi
+if test "$*" = "-c import threadroot"; then
+  exit 1
+fi
+exit 97
+""",
+            )
+            (smoke_vault / "daily").mkdir(parents=True)
+            (smoke_vault / "daily" / "2042-04-03.md").write_bytes(b"")
+            (smoke_root / "vault-pristine" / "daily").mkdir(parents=True)
+            (smoke_root / "vault-pristine" / "daily" / "2042-04-03.md").write_bytes(
+                b""
+            )
+            sentinel = smoke_root / "sentinel.txt"
+            sentinel.write_text("unrelated sentinel\n", encoding="utf-8")
+            _write_task_10_checksum(sentinel)
+            for name in ("claude-bundle", "codex-bundle"):
+                bundle = host_root / name
+                pristine = host_root / f"{name}-pristine"
+                bundle.mkdir(parents=True)
+                pristine.mkdir()
+                (bundle / "manifest.txt").write_text("same\n", encoding="utf-8")
+                (pristine / "manifest.txt").write_text(
+                    "same\n", encoding="utf-8"
+                )
+            for name in (
+                "claude-home",
+                "claude-config",
+                "claude-cache",
+                "codex-home",
+                "codex-config",
+                "codex-data",
+                "codex-cache",
+                "codex-state",
+                "claude-tmp",
+                "codex-tmp",
+            ):
+                (host_root / name).mkdir(parents=True)
+
+            result = _run_release_plan_block(
+                block,
+                directory,
+                fake_bin,
+                call_log,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue((host_root / "claude-list-removed.json").is_file())
+            self.assertTrue((host_root / "codex-list-removed.json").is_file())
+            self.assertTrue((smoke_root / "sentinel.after-uninstall").is_file())
 
     def test_task_7_binding_rejects_candidate_commit_without_writing_authority(
         self,

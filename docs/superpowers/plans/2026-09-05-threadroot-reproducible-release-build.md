@@ -2041,6 +2041,14 @@ aborting the surrounding verification shell. Validate all six JSON files with:
 
 ```bash
 set -euo pipefail
+threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
+threadroot_final_root="$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
+test -n "$threadroot_final_root"
+test -d "$threadroot_final_root"
+threadroot_smoke_root="$threadroot_final_root/cli-smoke"
+threadroot_smoke_home="$threadroot_smoke_root/home"
+threadroot_smoke_xdg="$threadroot_smoke_root/xdg"
+threadroot_smoke_vault="$threadroot_smoke_root/vault"
 python3 - \
   "$threadroot_smoke_root/init-preview.json" \
   "$threadroot_smoke_root/init-apply.json" \
@@ -2094,7 +2102,6 @@ set -euo pipefail
 threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
 threadroot_final_root="$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
 threadroot_selected="$threadroot_final_root/build/selected"
-threadroot_smoke_root="$threadroot_final_root/cli-smoke"
 command -v claude >/dev/null
 command -v codex >/dev/null
 threadroot_host_root="$threadroot_final_root/host-smoke"
@@ -2152,6 +2159,26 @@ native command forms exactly:
 
 ```bash
 set -euo pipefail
+threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
+threadroot_final_root="$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
+test -n "$threadroot_final_root"
+test -d "$threadroot_final_root"
+threadroot_smoke_root="$threadroot_final_root/cli-smoke"
+threadroot_host_root="$threadroot_final_root/host-smoke"
+threadroot_claude_bundle="$threadroot_host_root/claude-bundle"
+threadroot_codex_bundle="$threadroot_host_root/codex-bundle"
+threadroot_claude_home="$threadroot_host_root/claude-home"
+threadroot_claude_config="$threadroot_host_root/claude-config"
+threadroot_claude_cache="$threadroot_host_root/claude-cache"
+threadroot_codex_home="$threadroot_host_root/codex-home"
+threadroot_codex_config="$threadroot_host_root/codex-config"
+threadroot_codex_data="$threadroot_host_root/codex-data"
+threadroot_codex_cache="$threadroot_host_root/codex-cache"
+threadroot_codex_state="$threadroot_host_root/codex-state"
+threadroot_claude_tmp="$threadroot_host_root/claude-tmp"
+threadroot_codex_tmp="$threadroot_host_root/codex-tmp"
+command -v claude >/dev/null
+command -v codex >/dev/null
 threadroot_claude() {
   env -i \
     PATH="$PATH" \
@@ -2210,13 +2237,57 @@ Uninstall `threadroot` only from the fresh wheel virtual environment and remove
 only the disposable host registrations created in Step 4 through these native
 forms under the identical isolated environments:
 
-If this step runs in a new shell, reload `threadroot_final_root`,
-`threadroot_smoke_root`, and every `threadroot_host_*` path from Step 4 and
-redeclare the exact `threadroot_claude` and `threadroot_codex` functions before
-running:
+The block reloads `threadroot_final_root`, derives `threadroot_smoke_root` and
+every `threadroot_host_*` path, and redeclares the exact `threadroot_claude` and
+`threadroot_codex` functions so it is safe to run in a new shell:
 
 ```bash
 set -euo pipefail
+threadroot_state_root="/private/tmp/threadroot-v010-release-state-20260905"
+threadroot_final_root="$(tr -d '\n' < "$threadroot_state_root/final-root.txt")"
+test -n "$threadroot_final_root"
+test -d "$threadroot_final_root"
+threadroot_smoke_root="$threadroot_final_root/cli-smoke"
+threadroot_smoke_vault="$threadroot_smoke_root/vault"
+threadroot_host_root="$threadroot_final_root/host-smoke"
+threadroot_claude_bundle="$threadroot_host_root/claude-bundle"
+threadroot_codex_bundle="$threadroot_host_root/codex-bundle"
+threadroot_claude_home="$threadroot_host_root/claude-home"
+threadroot_claude_config="$threadroot_host_root/claude-config"
+threadroot_claude_cache="$threadroot_host_root/claude-cache"
+threadroot_codex_home="$threadroot_host_root/codex-home"
+threadroot_codex_config="$threadroot_host_root/codex-config"
+threadroot_codex_data="$threadroot_host_root/codex-data"
+threadroot_codex_cache="$threadroot_host_root/codex-cache"
+threadroot_codex_state="$threadroot_host_root/codex-state"
+threadroot_claude_tmp="$threadroot_host_root/claude-tmp"
+threadroot_codex_tmp="$threadroot_host_root/codex-tmp"
+command -v claude >/dev/null
+command -v codex >/dev/null
+threadroot_claude() {
+  env -i \
+    PATH="$PATH" \
+    HOME="$threadroot_claude_home" \
+    TMPDIR="$threadroot_claude_tmp" \
+    CLAUDE_CONFIG_DIR="$threadroot_claude_config" \
+    CLAUDE_CODE_PLUGIN_CACHE_DIR="$threadroot_claude_cache" \
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+    LC_ALL=C.UTF-8 \
+    claude "$@"
+}
+threadroot_codex() {
+  env -i \
+    PATH="$PATH" \
+    HOME="$threadroot_codex_home" \
+    TMPDIR="$threadroot_codex_tmp" \
+    CODEX_HOME="$threadroot_codex_config" \
+    XDG_CONFIG_HOME="$threadroot_codex_config" \
+    XDG_DATA_HOME="$threadroot_codex_data" \
+    XDG_CACHE_HOME="$threadroot_codex_cache" \
+    XDG_STATE_HOME="$threadroot_codex_state" \
+    LC_ALL=C.UTF-8 \
+    codex "$@"
+}
 "$threadroot_final_root/wheel-smoke-venv/bin/python" \
   -m pip uninstall -y threadroot
 threadroot_claude plugin remove threadroot@threadroot --scope user
