@@ -1,7 +1,7 @@
 # Threadroot Release Authority Closure Design
 
 **Date:** 2026-09-06
-**Status:** Approved by Will on 2026-09-06; implementation plan drafted
+**Status:** Implemented and verified; canonical rebuild authorization pending
 **Amends:** `2026-09-05-threadroot-v0.1.0-release-readiness-design.md`
 
 ## Purpose
