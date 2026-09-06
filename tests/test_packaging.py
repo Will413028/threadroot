@@ -11,6 +11,33 @@ def load_json(path: str) -> dict[str, object]:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+EXPECTED_PROJECT_URLS = {
+    "Homepage": "https://github.com/Will413028/threadroot",
+    "Repository": "https://github.com/Will413028/threadroot",
+    "Issues": "https://github.com/Will413028/threadroot/issues",
+}
+
+
+EXPECTED_SDIST_ROOTS = [
+    ".claude-plugin",
+    ".codex-plugin",
+    ".dockerignore",
+    "AGENTS.md",
+    "CONTRIBUTING.md",
+    "LICENSE",
+    "README.md",
+    "SECURITY.md",
+    "docs",
+    "requirements",
+    "scripts",
+    "skills",
+    "src/threadroot",
+    "templates",
+    "tests",
+    "tools/release",
+]
+
+
 EXPECTED_CLAUDE_MANIFEST = {
     "name": "threadroot",
     "version": "0.1.0",
@@ -92,6 +119,29 @@ EXPECTED_MARKETPLACE_CATALOG = {
 
 
 class ManifestTests(unittest.TestCase):
+    def test_python_packaging_has_one_hatchling_authority(self) -> None:
+        metadata = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            metadata["build-system"],
+            {
+                "requires": ["hatchling>=1.32,<2"],
+                "build-backend": "hatchling.build",
+            },
+        )
+        self.assertEqual(metadata["project"]["license-files"], ["LICENSE"])
+        self.assertNotIn("setuptools", metadata.get("tool", {}))
+        self.assertFalse(Path("MANIFEST.in").exists())
+        self.assertIs(metadata["tool"]["hatch"]["build"]["reproducible"], True)
+        self.assertEqual(
+            metadata["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"],
+            ["src/threadroot"],
+        )
+        self.assertEqual(
+            metadata["tool"]["hatch"]["build"]["targets"]["sdist"]["only-include"],
+            EXPECTED_SDIST_ROOTS,
+        )
+
     def test_version_matches_python_package_metadata(self) -> None:
         project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]
         claude = load_json(".claude-plugin/plugin.json")
@@ -107,6 +157,14 @@ class ManifestTests(unittest.TestCase):
             },
             {"0.1.0"},
         )
+
+    def test_project_urls_match_public_repository(self) -> None:
+        project = tomllib.loads(
+            Path("pyproject.toml").read_text(encoding="utf-8")
+        )["project"]
+
+        self.assertEqual(project["urls"], EXPECTED_PROJECT_URLS)
+        self.assertEqual(project["dependencies"], [])
 
     def test_claude_manifest_matches_exact_contract(self) -> None:
         self.assertEqual(

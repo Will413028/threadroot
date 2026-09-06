@@ -30,3 +30,20 @@ jobs:
       - run: python scripts/build_release.py --output dist
       - run: python scripts/check_public.py .
       - run: python scripts/check_public.py dist
+
+  release-artifacts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: |
+          set -euo pipefail
+          attempt_root="$(mktemp -d)"
+          attempt_root="$(cd "$attempt_root" && pwd -P)"
+          candidate_root="$attempt_root/candidate"
+          authority_record="$attempt_root/authority.json"
+          success_receipt="$attempt_root/success.json"
+          release_commit="$(git rev-parse HEAD)"
+          python3 -B -m scripts.build_verified_release --commit "$release_commit" --output "$candidate_root" --authority-record "$authority_record"
+          python3 -B -m scripts.release_candidate record-success --authority-record "$authority_record" --expected-commit "$release_commit" --success-receipt "$success_receipt"
+          python3 -B -m scripts.release_candidate verify-success --authority-record "$authority_record" --expected-commit "$release_commit" --success-receipt "$success_receipt"
