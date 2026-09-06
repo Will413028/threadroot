@@ -1334,7 +1334,7 @@ os.execv(os.environ["THREADROOT_REAL_PYTHON"],
             (5, 0, 5, "codex plugin remove", ""),
             (5, 0, 6, "codex plugin marketplace remove", ""),
         )
-        for step, block, count, mutator, qualifier in cases:
+        for index, (step, block, count, mutator, qualifier) in enumerate(cases):
             with self.subTest(step=step, count=count, mutator=mutator):
                 case = ReleaseAuthorityFlowTests()
                 case.setUp()
@@ -1347,6 +1347,13 @@ os.execv(os.environ["THREADROOT_REAL_PYTHON"],
                                if line.startswith(mutator) and qualifier in line]
                     self.assertEqual(len(effects), 1 if (step, count) == (3, 7) else 0,
                                      case.calls())
+                    block_effects = {item[3:5] for item in cases if item[:2] == (step, block)}
+                    actual_preceding = [effect for line in case.calls().splitlines()
+                                        for effect in block_effects
+                                        if line.startswith(effect[0]) and effect[1] in line]
+                    expected_preceding = [item[3:5] for item in cases[:index]
+                                          if item[:2] == (step, block)]
+                    self.assertEqual(actual_preceding, expected_preceding, case.calls())
                     self.assertEqual(case.calls().count("release_candidate verify-success"), count,
                                      result.stdout + result.stderr)
                 finally:

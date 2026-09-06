@@ -2136,9 +2136,10 @@ python3 -B -m scripts.release_candidate verify-success \
   --success-receipt "$threadroot_state_root/final-success.json"
 ```
 
-If the private denylist is available, rerun the last command with
-`--denylist` and its already-approved absolute path without printing it.
-Require zero findings.
+If the private denylist is available, rerun the scanner command
+`python3 -B scripts/check_public.py` above with `--denylist` and its
+already-approved absolute path without printing it. Require zero findings,
+then rerun the final paired `verify-success` command above.
 
 - [ ] **Step 2: Install the selected wheel offline**
 
@@ -2591,10 +2592,6 @@ threadroot_codex() {
     LC_ALL=C.UTF-8 \
     codex "$@"
 }
-python3 -B -m scripts.release_candidate verify-success \
-  --authority-record "$threadroot_state_root/final-authority.json" \
-  --expected-commit "$threadroot_release_commit" \
-  --success-receipt "$threadroot_state_root/final-success.json"
 python3 -B -m scripts.release_candidate verify-success \
   --authority-record "$threadroot_state_root/final-authority.json" \
   --expected-commit "$threadroot_release_commit" \
