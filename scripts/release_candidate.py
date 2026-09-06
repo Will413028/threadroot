@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager, ExitStack
+import ctypes
 import hashlib
 import json
 import os
@@ -8,6 +10,7 @@ from pathlib import Path, PurePosixPath
 import re
 import stat
 import subprocess
+import secrets
 from typing import Any
 
 from scripts.release_archives import ReleaseArchiveError, _load_tar_members_payload
@@ -18,6 +21,7 @@ MAX_FILE_SIZE = 64 * 1024 * 1024
 MAX_TOTAL_FILE_SIZE = 512 * 1024 * 1024
 MAX_PATH_BYTES = 4096
 MAX_MANIFEST_SIZE = 8 * 1024 * 1024
+MAX_RECORD_SIZE = 16 * 1024
 MAX_UNSIGNED_64 = (1 << 64) - 1
 MIN_SIGNED_64 = -(1 << 63)
 MAX_SIGNED_64 = (1 << 63) - 1
@@ -425,3 +429,311 @@ def _verify_candidate_manifest(candidate_root: Path, commit: str) -> None:
     second = _capture_candidate(candidate_root)
     if second != first:
         raise _fail()
+
+
+def _absolute_path(value: object) -> Path:
+    if not isinstance(value, (str, Path)):
+        raise _fail()
+    raw = str(value)
+    if (not raw or len(raw.encode("utf-8", errors="surrogatepass")) > MAX_PATH_BYTES
+            or any(ord(c) < 32 or ord(c) == 127 or 0xD800 <= ord(c) <= 0xDFFF for c in raw)):
+        raise _fail()
+    path = Path(raw)
+    if not path.is_absolute() or str(path) != raw or ".." in path.parts:
+        raise _fail()
+    return path
+
+
+def _directory_identity(metadata: os.stat_result) -> dict[str, object]:
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise _fail()
+    return dict(device=metadata.st_dev, inode=metadata.st_ino, uid=metadata.st_uid,
+                gid=metadata.st_gid, mode=_mode(metadata))
+
+
+@contextmanager
+def _held_directory(path: Path):
+    """Hold every real ancestor and detect renames or permission drift."""
+    path = _absolute_path(path)
+    with ExitStack() as stack:
+        fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        stack.callback(os.close, fd)
+        bindings = []
+        for part in path.parts[1:]:
+            parent = fd
+            fd, before = _open_dir_at(parent, part)
+            stack.callback(os.close, fd)
+            bindings.append((parent, part, fd, _directory_identity(before)))
+        def check():
+            for parent, part, child, identity in bindings:
+                if (_directory_identity(os.fstat(child)) != identity
+                        or _directory_identity(os.stat(part, dir_fd=parent, follow_symlinks=False)) != identity):
+                    raise _fail()
+        check()
+        yield fd, check
+        check()
+
+
+def _repository_root() -> Path:
+    result = subprocess.run(["git", "rev-parse", "--show-toplevel"], check=True, capture_output=True, text=True)
+    return Path(result.stdout.strip()).resolve(strict=True)
+
+
+def validate_authority_path(destination: Path, candidate_root: Path, *, missing: bool = True) -> Path:
+    """Read-only external-path preflight, reusable before Docker provisioning."""
+    try:
+        destination = _absolute_path(destination)
+        candidate_root = _absolute_path(candidate_root)
+        parent = destination.parent.resolve(strict=True)
+        canonical = parent / destination.name
+        for excluded in (_repository_root(), candidate_root.resolve(strict=False)):
+            if canonical == excluded or canonical.is_relative_to(excluded):
+                raise _fail()
+        with _held_directory(parent):
+            if missing and os.path.lexists(canonical):
+                raise _fail()
+        return canonical
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        raise _fail() from error
+
+
+@dataclass(frozen=True)
+class _HeldFile:
+    path: Path
+    fd: int
+    parent_fd: int
+    metadata: os.stat_result
+    payload: bytes
+
+    def check(self) -> None:
+        if (_identity(os.fstat(self.fd)) != _identity(self.metadata)
+                or _identity(os.stat(self.path.name, dir_fd=self.parent_fd, follow_symlinks=False)) != _identity(self.metadata)):
+            raise _fail()
+
+
+@contextmanager
+def _hold_file(path: Path, *, mode: int, maximum_size: int):
+    path = _absolute_path(path)
+    with _held_directory(path.parent) as (parent_fd, check_parent):
+        before = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                or stat.S_IMODE(before.st_mode) != mode or not 1 <= before.st_size <= maximum_size):
+            raise _fail()
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        try:
+            if _identity(os.fstat(fd)) != _identity(before):
+                raise _fail()
+            chunks, total = [], 0
+            while chunk := os.read(fd, min(1024 * 1024, maximum_size + 1)):
+                total += len(chunk)
+                if total > maximum_size:
+                    raise _fail()
+                chunks.append(chunk)
+            if total != before.st_size:
+                raise _fail()
+            held = _HeldFile(path, fd, parent_fd, before, b"".join(chunks))
+            held.check()
+            yield held
+            held.check()
+            check_parent()
+        finally:
+            os.close(fd)
+
+
+def _rename_exclusive(parent_fd: int, pending: str, leaf: str) -> None:
+    library = ctypes.CDLL(None, use_errno=True)
+    if os.uname().sysname == "Linux" and hasattr(library, "renameat2"):
+        function, flags = library.renameat2, 1
+    elif os.uname().sysname == "Darwin" and hasattr(library, "renameatx_np"):
+        function, flags = library.renameatx_np, 0x4
+    else:
+        raise _fail()
+    function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    function.restype = ctypes.c_int
+    if function(parent_fd, os.fsencode(pending), parent_fd, os.fsencode(leaf), flags) != 0:
+        raise _fail()
+
+
+def _publish_exclusive(destination: Path, payload: bytes, *, final_mode: int, maximum_size: int) -> None:
+    try:
+        destination = _absolute_path(destination)
+        if not 1 <= len(payload) <= maximum_size:
+            raise _fail()
+        with _held_directory(destination.parent) as (parent, check_parent):
+            pending = f".{destination.name}.{secrets.token_hex(16)}.pending"
+            fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
+            try:
+                view = memoryview(payload)
+                while view:
+                    written = os.write(fd, view)
+                    if written <= 0:
+                        raise _fail()
+                    view = view[written:]
+                os.fchmod(fd, final_mode)
+                os.fsync(fd)
+                before = os.fstat(fd)
+                if _identity(os.stat(pending, dir_fd=parent, follow_symlinks=False)) != _identity(before):
+                    raise _fail()
+                check_parent()
+                _rename_exclusive(parent, pending, destination.name)
+                os.fsync(parent)
+                with _hold_file(destination, mode=final_mode, maximum_size=maximum_size) as held:
+                    # Rename may update ctime; all other identity fields and bytes must survive.
+                    if (_identity(held.metadata)[:-1] != _identity(before)[:-1] or held.payload != payload
+                            or _identity(os.fstat(fd)) != _identity(held.metadata)):
+                        raise _fail()
+            finally:
+                os.close(fd)
+    except (OSError, ValueError) as error:
+        raise _fail() from error
+
+
+def _strict_document(payload: bytes, maximum_size: int) -> dict[str, Any]:
+    if not 1 <= len(payload) <= maximum_size:
+        raise _fail()
+    try:
+        value = json.loads(payload.decode("utf-8"), object_pairs_hook=_duplicate_rejector)
+        if type(value) is not dict or _canonical_json(value) != payload:
+            raise _fail()
+        return value
+    except (UnicodeError, ValueError, RecursionError) as error:
+        raise _fail() from error
+
+
+def _file_identity(held: _HeldFile) -> dict[str, object]:
+    meta = held.metadata
+    return dict(device=meta.st_dev, inode=meta.st_ino, uid=meta.st_uid, gid=meta.st_gid,
+                mode=_mode(meta), nlink=meta.st_nlink, size=meta.st_size,
+                mtime_ns=meta.st_mtime_ns, ctime_ns=meta.st_ctime_ns,
+                sha256=hashlib.sha256(held.payload).hexdigest())
+
+
+def _parse_record(payload: bytes, expected_commit: str) -> dict[str, Any]:
+    data = _strict_document(payload, MAX_RECORD_SIZE)
+    if (set(data) != {"schema", "candidate", "candidate_root", "commit", "manifest"}
+            or type(expected_commit) is not str or not _COMMIT.fullmatch(expected_commit)
+            or data["commit"] != expected_commit):
+        raise _fail()
+    _integer(data["schema"], 1, 1)
+    _absolute_path(data["candidate_root"])
+    for name in ("candidate", "manifest"):
+        item = data[name]
+        keys = {"device", "inode", "uid", "gid", "mode"}
+        if name == "manifest":
+            keys |= {"nlink", "size", "mtime_ns", "ctime_ns", "sha256"}
+        if type(item) is not dict or set(item) != keys:
+            raise _fail()
+        for key in ("device", "inode", "uid", "gid"):
+            _integer(item[key], 0, MAX_UNSIGNED_64)
+        if type(item["mode"]) is not str or not _MODE.fullmatch(item["mode"]):
+            raise _fail()
+        if name == "manifest":
+            if item["mode"] != "0444" or type(item["sha256"]) is not str or not _DIGEST.fullmatch(item["sha256"]):
+                raise _fail()
+            _integer(item["size"], 1, MAX_MANIFEST_SIZE)
+            _integer(item["nlink"], 1, 1)
+            for key in ("mtime_ns", "ctime_ns"):
+                _integer(item[key], MIN_SIGNED_64, MAX_SIGNED_64)
+    return data
+
+
+def _require_artifact_evidence(root: Path, snapshot: CandidateSnapshot, commit: str) -> None:
+    from scripts.release_artifacts import BASE_IMAGE, EXPECTED_PACKAGES
+    names = ("threadroot-0.1.0-py3-none-any.whl", "threadroot-0.1.0.tar.gz",
+             "threadroot-claude-0.1.0.zip", "threadroot-codex-0.1.0.zip")
+    approved = None
+    for group in ("candidate-a", "candidate-b", "selected"):
+        prefix = f"build/{group}/"
+        entries = [entry for entry in snapshot.entries if entry.path.startswith(prefix)]
+        if {entry.path[len(prefix):] for entry in entries} != set(names):
+            raise _fail()
+        by_name = {entry.path[len(prefix):]: entry for entry in entries}
+        current = []
+        for name in names:
+            entry = by_name[name]
+            if entry.kind != "file" or entry.mode != "0644" or entry.nlink != 1:
+                raise _fail()
+            current.append(dict(name=name, sha256=entry.sha256, size=entry.size))
+        if approved is not None and current != approved:
+            raise _fail()
+        approved = current
+    with _hold_file(root / "build/evidence/build.json", mode=0o644, maximum_size=MAX_FILE_SIZE) as build:
+        data = _strict_document(build.payload, MAX_FILE_SIZE)
+        if set(data) != {"schema", "commit", "source_date_epoch", "platform", "python", "base_image",
+                         "builder_definition_sha256", "packages", "artifacts"}:
+            raise _fail()
+        _integer(data["schema"], 1, 1)
+        epoch = _integer(data["source_date_epoch"], 0, MAX_SIGNED_64)
+        expected_epoch = int(subprocess.run(["git", "show", "-s", "--format=%ct", commit],
+                                            check=True, capture_output=True, text=True).stdout.strip())
+        if (data["commit"] != commit or epoch != expected_epoch or data["platform"] != "linux/amd64"
+                or data["python"] != "3.14.7" or data["base_image"] != BASE_IMAGE
+                or data["packages"] != EXPECTED_PACKAGES or data["artifacts"] != approved):
+            raise _fail()
+        digest = data["builder_definition_sha256"]
+        if type(digest) is not str or not _DIGEST.fullmatch(digest):
+            raise _fail()
+        for item in data["artifacts"]:
+            _integer(item["size"], 0, MAX_FILE_SIZE)
+        sums = "".join(f"{item['sha256']}  {item['name']}\n" for item in sorted(approved, key=lambda item: item["name"])).encode()
+        with _hold_file(root / "build/evidence/SHA256SUMS", mode=0o644, maximum_size=MAX_FILE_SIZE) as held:
+            if held.payload != sums:
+                raise _fail()
+
+
+def _verify_held_record(record: _HeldFile, expected_commit: str) -> Path:
+    """Complete verifier using caller-held record bytes; never reopen its trust."""
+    data = _parse_record(record.payload, expected_commit)
+    root = _absolute_path(data["candidate_root"])
+    if root.resolve(strict=True) != root:
+        raise _fail()
+    if validate_authority_path(record.path, root, missing=False) != record.path:
+        raise _fail()
+    with _held_directory(root) as (root_fd, check_root):
+        if _directory_identity(os.fstat(root_fd)) != data["candidate"]:
+            raise _fail()
+        with _hold_file(root / MANIFEST_RELATIVE, mode=0o444, maximum_size=MAX_MANIFEST_SIZE) as manifest:
+            if _file_identity(manifest) != data["manifest"]:
+                raise _fail()
+            recorded = _parse_manifest(manifest.payload, expected_commit)
+            first = _capture_candidate(root)
+            if first != recorded:
+                raise _fail()
+            _require_git_sources(first, expected_commit)
+            _require_artifact_evidence(root, first, expected_commit)
+            if _capture_candidate(root) != first:
+                raise _fail()
+            check_root()
+            manifest.check()
+            record.check()
+    return root
+
+
+def verify_candidate(authority_record: Path, expected_commit: str) -> Path:
+    try:
+        path = _absolute_path(authority_record)
+        path = path.parent.resolve(strict=True) / path.name
+        with _hold_file(path, mode=0o400, maximum_size=MAX_RECORD_SIZE) as record:
+            return _verify_held_record(record, expected_commit)
+    except (OSError, ValueError, TypeError, KeyError, RecursionError, subprocess.SubprocessError) as error:
+        raise _fail() from error
+
+
+def bind_candidate(candidate_root: Path, commit: str, authority_record: Path) -> None:
+    try:
+        root = _absolute_path(candidate_root)
+        if root.resolve(strict=True) != root:
+            raise _fail()
+        destination = validate_authority_path(authority_record, root)
+        with _held_directory(root) as (root_fd, check_root):
+            identity = _directory_identity(os.fstat(root_fd))
+            _write_candidate_manifest(root, commit)
+            with _hold_file(root / MANIFEST_RELATIVE, mode=0o444, maximum_size=MAX_MANIFEST_SIZE) as manifest:
+                payload = _canonical_json(dict(schema=1, candidate=identity, candidate_root=str(root),
+                                               commit=commit, manifest=_file_identity(manifest)))
+                _parse_record(payload, commit)
+                check_root()
+                _publish_exclusive(destination, payload, final_mode=0o400, maximum_size=MAX_RECORD_SIZE)
+                verify_candidate(destination, commit)
+    except (OSError, ValueError, TypeError, KeyError, RecursionError, subprocess.SubprocessError) as error:
+        raise _fail() from error
