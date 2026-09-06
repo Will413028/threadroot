@@ -1,187 +1,511 @@
 from __future__ import annotations
 
+import ast
+import builtins
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 import hashlib
+import importlib
+import inspect
+import io
+import os
 from pathlib import Path
-from tempfile import TemporaryDirectory
-import unittest
 import subprocess
-from unittest.mock import patch
+import sys
+from tempfile import TemporaryDirectory
+import types
+import unittest
+from unittest.mock import Mock, call, patch
 
-from scripts.build_verified_release import (
-    VerifiedReleaseError,
-    canonical_image_tag,
-    docker_run_argv,
-    main,
+from scripts import build_verified_release as entry
+
+
+SHA = "a" * 40
+IMAGE = "threadroot-release-builder:" + "0" * 64
+STATUS = ("status", "--porcelain=v1", "--untracked-files=all")
+RESOLVE = ("rev-parse", "--verify", SHA + "^{commit}")
+KIND = ("cat-file", "-t", SHA)
+EPOCH = ("show", "-s", "--format=%ct", SHA)
+PERIMETER = "docker artifact perimeter is incomplete"
+CONTEXT = dict(image=IMAGE, source_a=Path("/outside/source-a"),
+               source_b=Path("/outside/source-b"), output=Path("/outside/build"),
+               commit=SHA, epoch=123, uid=501, gid=20, denylist=None)
+EXPECTED_RUNNER_FILES = (
+    ".dockerignore", "requirements/release.txt", "tools/release/Dockerfile",
+    "pyproject.toml", "scripts/build_verified_release.py", "scripts/release_archives.py",
+    "scripts/release_artifacts.py", "scripts/build_release.py", "scripts/check_public.py",
 )
 
 
+@contextmanager
+def outer_fixture(*, git_values=None, parity=True):
+    """Keep filesystem effects real; isolate Git, extraction, and Docker."""
+    with TemporaryDirectory() as directory, ExitStack() as stack:
+        root = Path(directory)
+        repository = root / "repository"
+        repository.mkdir()
+        events = []
+        answers = {STATUS: "", RESOLVE: SHA + "\n", KIND: "commit\n", EPOCH: "123\n"}
+        answers.update(git_values or {})
+
+        def git(*args):
+            events.append(("git", args))
+            return answers[args]
+
+        def archive(commit):
+            events.append(("archive", commit))
+            return b"synthetic git archive"
+
+        def extract(payload, destination, *, expected_global_comment):
+            destination.mkdir(parents=True)
+            (destination / "tools/release").mkdir(parents=True)
+            (destination / "requirements").mkdir()
+            (destination / "tools/release/Dockerfile").write_bytes(b"FROM pinned\n")
+            (destination / "requirements/release.txt").write_bytes(b"lock\n")
+
+        # Reload binds today's eager import to the dependency seam. A future
+        # function-local import uses exactly the same seam, without a new target.
+        extractor = stack.enter_context(patch("scripts.release_archives.extract_regular_tar_payload", side_effect=extract))
+        importlib.reload(entry)
+        stack.enter_context(patch.object(entry, "REPOSITORY", repository))
+        fixture = types.SimpleNamespace(root=root, repository=repository, output=root / "output",
+            events=events, extractor=extractor,
+            git=stack.enter_context(patch.object(entry, "_git", side_effect=git)),
+            parity=stack.enter_context(patch.object(entry, "_runner_bytes_match", return_value=parity)),
+            archive=stack.enter_context(patch.object(entry, "_archive_commit", side_effect=archive)),
+            run=stack.enter_context(patch.object(entry.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", ""))))
+        stack.enter_context(patch.object(entry.os, "getuid", return_value=501, create=True))
+        stack.enter_context(patch.object(entry.os, "getgid", return_value=20, create=True))
+        try:
+            yield fixture
+        finally:
+            stack.close()
+            importlib.reload(entry)
+
+
+def invoke(args):
+    stdout, stderr = io.StringIO(), io.StringIO()
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        status = entry.main(args)
+    return status, stdout.getvalue(), stderr.getvalue()
+
+
+def outer_args(fixture, **changes):
+    values = {"commit": SHA, "output": str(fixture.output), **changes}
+    return [item for key, value in values.items() for item in ("--" + key, str(value))]
+
+
+def validate(argv, context):
+    # Support the intended bound validator and today's legacy implementation
+    # without making private parameter ordering a tested public contract.
+    if "image" in inspect.signature(entry._validate_docker_run_argv).parameters:
+        entry._validate_docker_run_argv(argv, **context)
+    else:
+        entry._validate_docker_run_argv(argv)
+
+
 class VerifiedReleaseTests(unittest.TestCase):
-    def test_image_tag_depends_on_dockerfile_and_lock_bytes(self) -> None:
+    def assert_rejected(self, fixture, args, message, *, no_git=False):
+        result = invoke(args)
+        with self.subTest(check="public error"):
+            self.assertEqual(result, (1, "", message + "\n"))
+        with self.subTest(check="no archive/extraction/subprocess/output"):
+            fixture.archive.assert_not_called()
+            fixture.extractor.assert_not_called()
+            fixture.run.assert_not_called()
+            if no_git:
+                fixture.git.assert_not_called()
+            self.assertFalse(fixture.output.exists())
+
+    def test_image_tag_depends_on_dockerfile_and_lock_bytes(self):
         with TemporaryDirectory() as directory:
-            root = Path(directory)
-            dockerfile = root / "Dockerfile"
-            lock = root / "release.txt"
+            dockerfile, lock = Path(directory) / "Dockerfile", Path(directory) / "release.txt"
             dockerfile.write_bytes(b"FROM pinned\n")
             lock.write_bytes(b"build==1.6.0\n")
-            first = canonical_image_tag(dockerfile, lock)
+            self.assertEqual(entry.canonical_image_tag(dockerfile, lock),
+                "threadroot-release-builder:" + hashlib.sha256(b"FROM pinned\n\0build==1.6.0\n").hexdigest())
+            first = entry.canonical_image_tag(dockerfile, lock)
             lock.write_bytes(b"build==1.6.1\n")
-            second = canonical_image_tag(dockerfile, lock)
-        self.assertRegex(first, r"^threadroot-release-builder:[0-9a-f]{64}$")
-        self.assertNotEqual(first, second)
+            second = entry.canonical_image_tag(dockerfile, lock)
+            dockerfile.write_bytes(b"FROM other\n")
+            self.assertNotEqual(first, second)
+            self.assertNotEqual(second, entry.canonical_image_tag(dockerfile, lock))
 
-    def test_docker_run_is_offline_read_only_and_unprivileged(self) -> None:
-        argv = docker_run_argv(
-            image="threadroot-release-builder:" + "0" * 64,
-            source_a=Path("/outside/source-a"), source_b=Path("/outside/source-b"),
-            output=Path("/outside/build"), commit="a" * 40, epoch=123,
-            uid=501, gid=20, denylist=None,
-        )
-        self.assertEqual(argv[argv.index("--network") + 1], "none")
-        self.assertIn("--read-only", argv)
-        self.assertEqual(argv.count("--cap-drop"), 1)
-        self.assertIn("ALL", argv)
-        self.assertIn("no-new-privileges", argv)
-        self.assertNotIn("--privileged", argv)
+    def test_docker_run_is_offline_read_only_and_unprivileged(self):
+        argv = entry.docker_run_argv(**CONTEXT)
+        self.assertEqual(argv[:20], ["docker", "run", "--rm", "--platform", "linux/amd64",
+            "--network", "none", "--read-only", "--cap-drop", "ALL", "--security-opt",
+            "no-new-privileges", "--pids-limit", "256", "--tmpfs",
+            "/tmp:rw,nosuid,nodev,noexec,size=512m", "--user", "501:20", "--workdir", "/source-a"])
+        self.assertEqual([argv[i + 1] for i, value in enumerate(argv) if value == "--env"],
+            ["THREADROOT_CANONICAL_BUILD=1", "SOURCE_DATE_EPOCH=123", "TZ=UTC", "LC_ALL=C.UTF-8",
+             "LANG=C.UTF-8", "PYTHONHASHSEED=0", "PYTHONDONTWRITEBYTECODE=1", "HOME=/tmp"])
 
-    def test_docker_run_exactly_establishes_artifact_identity_perimeter(self) -> None:
-        argv = docker_run_argv("threadroot-release-builder:" + "0" * 64,
-                                Path("/outside/source-a"), Path("/outside/source-b"),
-                                Path("/outside/build"), "a" * 40, 123, 501, 20, None)
-        mounts = [value for index, value in enumerate(argv) if argv[index - 1] == "--mount"]
-        self.assertEqual(mounts, [
-            "type=bind,src=/outside/source-a,dst=/source-a,readonly",
-            "type=bind,src=/outside/source-b,dst=/source-b,readonly",
-            "type=bind,src=/outside/build,dst=/release-output",
-        ])
-        self.assertEqual(argv.count("--read-only"), 1)
-        self.assertEqual(argv.count("--network"), 1)
-        self.assertEqual(argv.count("--cap-drop"), 1)
-        self.assertEqual(argv.count("--security-opt"), 1)
-        self.assertIn("--user", argv)
-        self.assertIn("--workdir", argv)
+    def test_docker_run_exactly_establishes_artifact_identity_perimeter(self):
+        for denylist in (None, Path("/outside/denylist")):
+            with self.subTest(denylist=denylist):
+                context = {**CONTEXT, "denylist": denylist}
+                argv = entry.docker_run_argv(**context)
+                mounts = [argv[i + 1] for i, value in enumerate(argv) if value == "--mount"]
+                expected = ["type=bind,src=/outside/source-a,dst=/source-a,readonly",
+                    "type=bind,src=/outside/source-b,dst=/source-b,readonly",
+                    "type=bind,src=/outside/build,dst=/release-output"]
+                if denylist:
+                    expected += ["type=bind,src=/outside/denylist,dst=/run/threadroot/denylist,readonly"]
+                self.assertEqual(mounts, expected)
+                self.assertEqual(sum(not mount.endswith(",readonly") for mount in mounts), 1)
+                self.assertEqual(argv[argv.index(IMAGE):], [IMAGE, "python", "-m", "scripts.build_verified_release",
+                    "--inside", "--source-a", "/source-a", "--source-b", "/source-b", "--output",
+                    "/release-output", "--commit", SHA, "--epoch", "123"] +
+                    (["--denylist", "/run/threadroot/denylist"] if denylist else []))
+                validate(argv, context)
 
-    def test_security_option_mutations_fail_closed_before_run(self) -> None:
-        from scripts.build_verified_release import _validate_docker_run_argv
-        argv = docker_run_argv("image", Path("/outside/source-a"), Path("/outside/source-b"),
-                               Path("/outside/build"), "a" * 40, 1, 1, 1, None)
-        mutations = []
-        for option in ("--read-only", "--network", "--cap-drop", "--security-opt", "--user", "--workdir"):
-            mutated = list(argv)
-            mutated.remove(option)
-            mutations.append(mutated)
-        for mutated in mutations:
-            with self.assertRaises(VerifiedReleaseError):
-                _validate_docker_run_argv(mutated)
+    def test_perimeter_mutations_reject_exactly(self):
+        for denylist in (None, Path("/outside/denylist")):
+            context = {**CONTEXT, "denylist": denylist}
+            baseline = entry.docker_run_argv(**context)
+            pairs = {"--platform", "--network", "--cap-drop", "--security-opt", "--pids-limit",
+                     "--tmpfs", "--user", "--workdir", "--env", "--mount", "--source-a",
+                     "--source-b", "--output", "--commit", "--epoch", "--denylist"}
+            mutations = []
+            index = 0
+            while index < len(baseline):
+                width = 2 if baseline[index] in pairs else 1
+                group = baseline[index:index + width]
+                for operation in ("delete", "duplicate", "change"):
+                    replacement = [] if operation == "delete" else group * 2 if operation == "duplicate" else [*group[:-1], "wrong"]
+                    mutations.append((f"{index}-{group[0]}-{operation}", baseline[:index] + replacement + baseline[index + width:]))
+                if group[0] == "--mount":
+                    mount = group[1]
+                    for field in ("src", "dst"):
+                        changed = [field + "=/wrong" if value.startswith(field + "=") else value for value in mount.split(",")]
+                        mutations.append((f"{index}-{field}", baseline[:index + 1] + [",".join(changed)] + baseline[index + 2:]))
+                    changed = mount.removesuffix(",readonly") if mount.endswith(",readonly") else mount + ",readonly"
+                    mutations.append((f"{index}-readonly", baseline[:index + 1] + [changed] + baseline[index + 2:]))
+                index += width
+            for user in ("0:20", "501:0", "0:0", "502:20"):
+                changed = list(baseline)
+                changed[baseline.index("--user") + 1] = user
+                mutations.append(("user-" + user, changed))
+            image_index = baseline.index(IMAGE)
+            mutations.extend([
+                ("extra-readonly", baseline[:image_index] + ["--mount", "type=bind,src=/etc,dst=/etc,readonly"] + baseline[image_index:]),
+                ("extra-tail", baseline + ["--unexpected"]),
+                ("denylist-presence", entry.docker_run_argv(**{**context, "denylist": None if denylist else Path("/outside/denylist")})),
+            ])
+            for name, changed in mutations:
+                with self.subTest(denylist=denylist, mutation=name):
+                    self.assertNotEqual(changed, baseline)
+                    try:
+                        validate(changed, context)
+                    except entry.VerifiedReleaseError as error:
+                        self.assertEqual(str(error), PERIMETER)
+                    except Exception as error:
+                        self.fail(f"validator leaked {type(error).__name__}, expected stable perimeter error")
+                    else:
+                        self.fail("unsafe perimeter accepted")
 
-    def test_requires_full_commit_and_absolute_output_outside_repository(self) -> None:
-        self.assertEqual(main(["--commit", "bad", "--output", "relative"]), 1)
+    def test_main_checks_perimeter_before_docker_provisioning(self):
+        with outer_fixture() as fixture:
+            original = entry.docker_run_argv
+            def unsafe(*args, **kwargs):
+                return original(*args, **kwargs) + ["--unexpected"]
+            with patch.object(entry, "docker_run_argv", side_effect=unsafe) as builder:
+                result = invoke(outer_args(fixture))
+            builder.assert_called_once()
+            with self.subTest(check="message"):
+                self.assertEqual(result, (1, "", PERIMETER + "\n"))
+            fixture.run.assert_not_called()
 
-    def test_rejects_docker_mount_delimiters_and_control_characters(self) -> None:
-        with self.assertRaises(VerifiedReleaseError):
-            docker_run_argv("image", Path("/outside/a,b"), Path("/outside/b"),
-                            Path("/outside/build"), "a" * 40, 1, 1, 1, None)
-        with self.assertRaises(VerifiedReleaseError):
-            docker_run_argv("image", Path("/outside/a\n"), Path("/outside/b"),
-                            Path("/outside/build"), "a" * 40, 1, 1, 1, None)
+    def test_requires_full_commit_and_absolute_output_outside_repository(self):
+        for changes, message in (({"commit": "bad"}, "commit must be a full 40-character SHA"),
+                                 ({"output": "relative"}, "output must be absolute and outside repository")):
+            with self.subTest(changes=changes), outer_fixture() as fixture:
+                self.assert_rejected(fixture, outer_args(fixture, **changes), message, no_git=True)
 
-    def test_rejects_dirty_tracked_or_untracked_repository_state(self) -> None:
-        with patch("scripts.build_verified_release._git", return_value=" M tracked"):
-            self.assertEqual(main(["--commit", "a" * 40, "--output", "/outside/release"]), 1)
+    def test_rejects_nonempty_output_and_symlink_output(self):
+        for kind in ("inside", "final-symlink", "intermediate-symlink", "nonempty"):
+            with self.subTest(kind=kind), outer_fixture() as fixture:
+                candidate = fixture.output
+                message = "output must be absolute and outside repository"
+                if kind == "inside":
+                    candidate = fixture.repository / "release"
+                elif kind == "final-symlink":
+                    candidate = fixture.root / "link"
+                    candidate.symlink_to(fixture.repository, target_is_directory=True)
+                elif kind == "intermediate-symlink":
+                    link = fixture.root / "link"
+                    link.symlink_to(fixture.repository, target_is_directory=True)
+                    candidate = link / "release"
+                else:
+                    candidate = fixture.root / "occupied"
+                    candidate.mkdir()
+                    (candidate / "sentinel").write_bytes(b"keep")
+                    message = "output must be missing or empty"
+                self.assert_rejected(fixture, outer_args(fixture, output=candidate), message, no_git=True)
+                if kind == "nonempty":
+                    self.assertEqual((candidate / "sentinel").read_bytes(), b"keep")
+                elif kind != "final-symlink":
+                    self.assertFalse(candidate.exists())
 
-    def test_rejects_nonempty_output_and_symlink_output(self) -> None:
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            output = root / "output"
-            output.mkdir()
-            (output / "existing").write_text("x", encoding="utf-8")
-            self.assertEqual(main(["--commit", "a" * 40, "--output", str(output)]), 1)
+    def test_rejects_dirty_tracked_or_untracked_repository_state(self):
+        for dirty in (" M tracked\n", "?? untracked\n"):
+            with self.subTest(dirty=dirty), outer_fixture(git_values={STATUS: dirty}) as fixture:
+                self.assert_rejected(fixture, outer_args(fixture), "repository must be clean")
+                self.assertEqual(fixture.git.call_args_list, [call(*STATUS)])
+                fixture.parity.assert_not_called()
 
-    def test_rejects_symlink_output(self) -> None:
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            target = root / "target"
-            target.mkdir()
-            output = root / "output"
-            output.symlink_to(target, target_is_directory=True)
-            self.assertEqual(main(["--commit", "a" * 40, "--output", str(output)]), 1)
+    def test_commit_resolution_and_object_type_reject_before_runner(self):
+        for values, message, calls in (({RESOLVE: "b" * 40 + "\n"}, "commit must resolve to itself", [STATUS, RESOLVE]),
+                                      ({KIND: "tree\n"}, "commit must identify a commit object", [STATUS, RESOLVE, KIND])):
+            with self.subTest(values=values), outer_fixture(git_values=values) as fixture:
+                self.assert_rejected(fixture, outer_args(fixture), message)
+                with self.subTest(check="no runner"):
+                    fixture.parity.assert_not_called()
+                self.assertEqual(fixture.git.call_args_list, [call(*args) for args in calls])
 
-    def test_exports_exact_commit_twice_without_links_or_unsafe_names(self) -> None:
-        with patch("scripts.build_verified_release._archive_commit") as archive:
-            self.assertEqual(main(["--commit", "a" * 40, "--output", "/outside/release"]), 1)
-            self.assertLessEqual(archive.call_count, 2)
+    def test_runner_files_must_match_the_selected_commit(self):
+        with outer_fixture(parity=False) as fixture:
+            accesses = []
+            real_import = builtins.__import__
+            real_import_module = importlib.import_module
 
-    def test_outer_success_exports_twice_and_runs_exact_build_then_run(self) -> None:
-        with TemporaryDirectory() as directory:
-            output = Path(directory) / "release"
-            def extract(_payload: bytes, destination: Path, **_kwargs: object) -> None:
-                destination.mkdir(parents=True)
-                (destination / "tools/release").mkdir(parents=True)
-                (destination / "requirements").mkdir()
-                (destination / "tools/release/Dockerfile").write_bytes(b"FROM pinned\n")
-                (destination / "requirements/release.txt").write_bytes(b"lock\n")
-            def git(*args: str) -> str:
-                if args[0] == "status":
-                    return ""
-                if args[0] == "cat-file":
-                    return "commit\n"
-                return "123\n"
-            with patch("scripts.build_verified_release._git", side_effect=git), \
-                 patch("scripts.build_verified_release._runner_bytes_match", return_value=True), \
-                 patch("scripts.build_verified_release._archive_commit", return_value=b"archive") as archive, \
-                 patch("scripts.build_verified_release.extract_regular_tar_payload", side_effect=extract), \
-                 patch("scripts.build_verified_release.canonical_image_tag", return_value="image"), \
-                 patch("scripts.build_verified_release.subprocess.run") as run:
-                self.assertEqual(main(["--commit", "a" * 40, "--output", str(output)]), 0)
-            self.assertEqual(archive.call_count, 2)
-            self.assertEqual(run.call_args_list[0].args[0][:5], ["docker", "build", "--platform", "linux/amd64", "--pull"])
-            self.assertEqual(run.call_args_list[1].args[0][0:8], ["docker", "run", "--rm", "--platform", "linux/amd64", "--network", "none", "--read-only"])
-            self.assertTrue((output / "build").is_dir())
+            def is_runner(name):
+                return name.rsplit(".", 1)[-1] in {"release_archives", "release_artifacts"}
 
-    def test_docker_failure_sanitizes_host_paths_and_does_not_echo_argv(self) -> None:
-        from argparse import Namespace
-        from scripts.build_verified_release import _sanitized_failure
-        error = subprocess.CalledProcessError(1, ["docker", "run"], output="/outside/private-denylist", stderr="/outside/release")
-        message = _sanitized_failure(error, Namespace(output="/outside/release", denylist="/outside/private-denylist"))
-        self.assertNotIn("private-denylist", message)
-        self.assertNotIn("/outside/release", message)
-        self.assertIn("[output]", message)
-        self.assertIn("[denylist]", message)
+            def watch_import(name, globals=None, locals=None, fromlist=(), level=0):
+                if is_runner(name) or (name == "scripts" and any(is_runner(item) for item in fromlist)):
+                    accesses.append(("import", name, fromlist))
+                return real_import(name, globals, locals, fromlist, level)
 
-    def test_runner_files_must_match_the_selected_commit(self) -> None:
-        with patch("scripts.build_verified_release._runner_bytes_match", return_value=False):
-            self.assertEqual(main(["--commit", "a" * 40, "--output", "/outside/release"]), 1)
+            def watch_import_module(name, package=None):
+                if is_runner(name):
+                    accesses.append(("import_module", name))
+                return real_import_module(name, package)
 
-    def test_docker_build_uses_exact_platform_dockerfile_and_export_context(self) -> None:
-        from scripts.build_verified_release import _docker_build_argv
-        argv = _docker_build_argv("image", Path("/outside/source-a"))
-        self.assertEqual(argv, ["docker", "build", "--platform", "linux/amd64", "--pull",
-                                "--file", "/outside/source-a/tools/release/Dockerfile",
-                                "--tag", "image", "/outside/source-a"])
+            class WatchedModule(types.ModuleType):
+                def __getattribute__(self, name):
+                    if name in {"extract_regular_tar_payload", "build_and_verify"}:
+                        accesses.append(("attribute", name))
+                    return super().__getattribute__(name)
 
-    def test_optional_denylist_is_mounted_read_only_without_entering_argv_logs(self) -> None:
-        argv = docker_run_argv("image", Path("/outside/source-a"), Path("/outside/source-b"),
-                               Path("/outside/build"), "a" * 40, 1, 1, 1,
-                               Path("/outside/private-denylist"))
-        self.assertIn("dst=/run/threadroot/denylist,readonly", " ".join(argv))
-        self.assertNotIn("private-denylist", argv)
+            archives = WatchedModule("scripts.release_archives")
+            archives.extract_regular_tar_payload = fixture.extractor
+            artifacts = WatchedModule("scripts.release_artifacts")
+            artifacts.build_and_verify = Mock()
+            # Only invoke is instrumented: fixture imports and recorder setup
+            # cannot masquerade as current-tree runner use by main. Patching
+            # both cache and package attributes also covers cached module access.
+            with patch.dict(sys.modules, {"scripts.release_archives": archives, "scripts.release_artifacts": artifacts}), \
+                 patch.object(sys.modules["scripts"], "release_archives", archives), \
+                 patch.object(sys.modules["scripts"], "release_artifacts", artifacts, create=True), \
+                 patch("builtins.__import__", side_effect=watch_import), \
+                 patch("importlib.import_module", side_effect=watch_import_module):
+                result = invoke(outer_args(fixture))
+            self.assertEqual(result, (1, "", "runner files differ from selected commit\n"))
+            self.assertEqual(accesses, [])
+            fixture.parity.assert_called_once_with(SHA)
+            fixture.archive.assert_not_called()
+            fixture.extractor.assert_not_called()
+            fixture.run.assert_not_called()
+            self.assertFalse(fixture.output.exists())
+        tree = ast.parse(Path(entry.__file__).read_text())
+        modules = []
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                modules.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                module = ("scripts." if node.level else "") + (node.module or "")
+                modules.append(module.rstrip("."))
+                modules.extend(f"{module.rstrip('.')}.{alias.name}" for alias in node.names)
+        self.assertFalse(any(name == module or name.startswith(module + ".")
+            for name in modules for module in ("scripts.release_archives", "scripts.release_artifacts")), modules)
 
-    def test_denylist_host_path_must_be_absolute(self) -> None:
-        with self.assertRaises(VerifiedReleaseError):
-            docker_run_argv("image", Path("/outside/source-a"), Path("/outside/source-b"),
-                            Path("/outside/build"), "a" * 40, 1, 1, 1, Path("denylist"))
+    def test_runner_parity_reads_exact_nine_files_and_compares_each_git_blob(self):
+        self.assertEqual(entry.RUNNER_FILES, EXPECTED_RUNNER_FILES)
+        repository = Path("/synthetic/repository")
+        payloads = {name: f"synthetic runner {index}\n".encode() for index, name in enumerate(EXPECTED_RUNNER_FILES)}
+        expected_reads = [call(repository / name) for name in EXPECTED_RUNNER_FILES]
+        expected_git = [call(["git", "show", f"{SHA}:{name}"], cwd=repository,
+                             check=True, capture_output=True) for name in EXPECTED_RUNNER_FILES]
+        for mismatch in (None, *EXPECTED_RUNNER_FILES):
+            with self.subTest(mismatch=mismatch):
+                def read(path):
+                    return payloads[path.relative_to(repository).as_posix()]
 
-    def test_inside_paths_reject_before_lazy_task4_import(self) -> None:
-        with patch.dict("os.environ", {"THREADROOT_CANONICAL_BUILD": "1"}, clear=True), \
-             patch.dict("sys.modules", {"scripts.release_artifacts": None}):
-            self.assertEqual(main(["--inside", "--source-a", "/bad", "--source-b", "/source-b",
-                                   "--output", "/release-output", "--commit", "a" * 40, "--epoch", "1"]), 1)
+                def git(argv, **kwargs):
+                    name = argv[2].split(":", 1)[1]
+                    return subprocess.CompletedProcess(argv, 0,
+                        b"different committed bytes" if name == mismatch else payloads[name], b"")
 
-    def test_inside_mode_requires_container_sentinel_and_calls_build_and_verify(self) -> None:
-        with patch.dict("os.environ", {}, clear=True):
-            self.assertEqual(main(["--inside", "--source-a", "/source-a",
-                                   "--source-b", "/source-b", "--output",
-                                   "/release-output", "--commit", "a" * 40,
-                                   "--epoch", "1"]), 1)
+                with patch.object(entry, "REPOSITORY", repository), \
+                     patch.object(entry, "_read_regular", side_effect=read) as reads, \
+                     patch.object(entry.subprocess, "run", side_effect=git) as run:
+                    self.assertIs(entry._runner_bytes_match(SHA), mismatch is None)
+                if mismatch is None:
+                    self.assertEqual(reads.call_args_list, expected_reads)
+                    self.assertEqual(run.call_args_list, expected_git)
+                else:
+                    # A mismatch may short-circuit or finish read-only checks;
+                    # either way it must inspect the actual mismatched pair.
+                    index = EXPECTED_RUNNER_FILES.index(mismatch)
+                    self.assertIn(expected_reads[index], reads.call_args_list)
+                    self.assertIn(expected_git[index], run.call_args_list)
+                    self.assertEqual(reads.call_args_list, expected_reads[:len(reads.call_args_list)])
+                    self.assertEqual(run.call_args_list, expected_git[:len(run.call_args_list)])
+
+    def test_host_identity_rejects_unsupported_or_nonpositive_before_export_or_docker(self):
+        cases = [("missing-uid", "getuid", None), ("missing-gid", "getgid", None),
+                 ("zero-uid", "getuid", 0), ("zero-gid", "getgid", 0),
+                 ("negative-uid", "getuid", -1), ("negative-gid", "getgid", -1)]
+        for name, accessor, value in cases:
+            with self.subTest(case=name), outer_fixture() as fixture:
+                fixture.output = fixture.root / name
+                if value is None:
+                    delattr(entry.os, accessor)
+                    message = "host UID/GID is unsupported"
+                else:
+                    getattr(entry.os, accessor).return_value = value
+                    message = "host UID/GID must be positive"
+                self.assert_rejected(fixture, outer_args(fixture), message)
+
+    def test_rejects_docker_mount_delimiters_and_control_characters(self):
+        for field in ("source_a", "source_b", "output", "denylist"):
+            for character in (",", "\0", "\n", "\r", "\x7f", "\x81"):
+                with self.subTest(field=field, character=repr(character)):
+                    with self.assertRaises(entry.VerifiedReleaseError) as raised:
+                        entry.docker_run_argv(**{**CONTEXT, field: Path("/outside/bad" + character + "path")})
+                    self.assertEqual(str(raised.exception), "unsafe host path")
+        for field in ("output", "denylist"):
+            with self.subTest(public_field=field), outer_fixture() as fixture:
+                self.assert_rejected(fixture, outer_args(fixture, **{field: str(fixture.root / "bad,path")}),
+                                     "unsafe host path", no_git=True)
+
+    def test_denylist_invalid_objects_reject_via_main_before_export_or_docker(self):
+        for kind in ("relative", "missing", "symlink", "directory", "fifo", "hardlink"):
+            with self.subTest(kind=kind), outer_fixture() as fixture:
+                denylist = fixture.root / "denylist"
+                if kind == "relative":
+                    denylist.write_bytes(b"synthetic")
+                    denylist = Path(os.path.relpath(denylist, Path.cwd()))
+                    self.assertFalse(denylist.is_absolute())
+                    self.assertTrue(denylist.is_file())
+                elif kind == "symlink":
+                    target = fixture.root / "target"
+                    target.write_bytes(b"synthetic")
+                    denylist.symlink_to(target)
+                elif kind == "directory":
+                    denylist.mkdir()
+                elif kind == "fifo":
+                    os.mkfifo(denylist)
+                elif kind == "hardlink":
+                    denylist.write_bytes(b"synthetic")
+                    os.link(denylist, fixture.root / "second-name")
+                    self.assertGreater(denylist.stat().st_nlink, 1)
+                self.assert_rejected(fixture, outer_args(fixture, denylist=denylist),
+                                     "denylist is missing or unsafe")
+
+    def test_exports_exact_commit_twice_without_links_or_unsafe_names(self):
+        for existing in (False, True):
+            with self.subTest(empty_output=existing), outer_fixture() as fixture:
+                if existing:
+                    fixture.output.mkdir()
+                status, _, stderr = invoke(outer_args(fixture))
+                self.assertEqual((status, stderr), (0, ""))
+                self.assertEqual(fixture.archive.call_args_list, [call(SHA), call(SHA)])
+                self.assertEqual(fixture.extractor.call_args_list, [
+                    call(b"synthetic git archive", fixture.output / "source-a", expected_global_comment=SHA),
+                    call(b"synthetic git archive", fixture.output / "source-b", expected_global_comment=SHA)])
+                self.assertTrue((fixture.output / "build").is_dir())
+                self.assertIn(("git", RESOLVE), fixture.events)
+                self.assertLess(fixture.events.index(("git", RESOLVE)), fixture.events.index(("archive", SHA)))
+
+    def test_docker_build_uses_exact_platform_dockerfile_and_export_context(self):
+        with outer_fixture() as fixture:
+            status, _, stderr = invoke(outer_args(fixture))
+            self.assertEqual((status, stderr), (0, ""))
+            source = fixture.output / "source-a"
+            image = "threadroot-release-builder:" + hashlib.sha256(b"FROM pinned\n\0lock\n").hexdigest()
+            self.assertEqual(fixture.run.call_count, 2)
+            self.assertEqual(fixture.run.call_args_list[0], call(["docker", "build", "--platform", "linux/amd64", "--pull",
+                "--file", str(source / "tools/release/Dockerfile"), "--tag", image, str(source)],
+                check=True, capture_output=True, text=True))
+            self.assertEqual(fixture.run.call_args_list[1].args[0][:2], ["docker", "run"])
+
+    def test_optional_denylist_is_mounted_read_only_without_entering_argv_logs(self):
+        with outer_fixture() as fixture:
+            denylist = fixture.root / "private-denylist-name"
+            denylist.write_bytes(b"SYNTHETIC_SECRET_TOKEN")
+            denylist.chmod(0o644)  # Host trust does not require mode 0444.
+            self.assertEqual(denylist.stat().st_nlink, 1)
+            result = invoke(outer_args(fixture, denylist=denylist))
+            with self.subTest(check="status"):
+                self.assertEqual(result, (0, "verified release completed\n", ""))
+            argv = fixture.run.call_args_list[-1].args[0]
+            mounts = [argv[i + 1] for i, value in enumerate(argv) if value == "--mount"]
+            self.assertEqual(len(mounts), 4)
+            self.assertEqual(mounts[-1], f"type=bind,src={denylist},dst=/run/threadroot/denylist,readonly")
+            self.assertEqual(argv[argv.index("--denylist"):], ["--denylist", "/run/threadroot/denylist"])
+
+    def test_child_output_is_projected_to_fixed_status_and_exact_path_labels(self):
+        for denylisted in (False, True):
+            for phase in ("success", "builder", "artifact phase"):
+                with self.subTest(denylist=denylisted, phase=phase), outer_fixture() as fixture:
+                    denylist = fixture.root / "private-denylist-name"
+                    denylist.write_bytes(b"SYNTHETIC_SECRET_TOKEN")
+                    paths = [fixture.repository, fixture.output / "source-a", fixture.output / "source-b", fixture.output]
+                    labels = "[repository] [source-a] [source-b] [output]"
+                    if denylisted:
+                        paths.append(denylist)
+                        labels += " [denylist]"
+                    raw = "SYNTHETIC_SECRET_TOKEN private-denylist-name /secret/path ENV=credential " + " ".join(map(str, paths))
+                    def child(argv, **kwargs):
+                        if phase == "builder" or (phase == "artifact phase" and argv[1] == "run"):
+                            raise subprocess.CalledProcessError(1, ["docker", "ARGV_SECRET"], output=raw, stderr=raw)
+                        return subprocess.CompletedProcess(argv, 0, raw, raw)
+                    fixture.run.side_effect = child
+                    result = invoke(outer_args(fixture, **({"denylist": denylist} if denylisted else {})))
+                    if phase == "success":
+                        self.assertEqual(result, (0, "verified release completed " + labels + "\n", ""))
+                    else:
+                        self.assertEqual(result, (1, "", "verified release " + phase + " failed " + labels + "\n"))
+
+    def test_child_projection_emits_only_observed_labels_with_specific_paths_first(self):
+        for observed in ("source-a", "none"):
+            with self.subTest(observed=observed), outer_fixture() as fixture:
+                raw = "SYNTHETIC_SECRET_TOKEN /secret/path ENV=credential"
+                if observed == "source-a":
+                    raw += " " + str(fixture.output / "source-a")
+                fixture.run.return_value = subprocess.CompletedProcess([], 0, raw, raw)
+                suffix = " [source-a]" if observed == "source-a" else ""
+                self.assertEqual(invoke(outer_args(fixture)), (0, "verified release completed" + suffix + "\n", ""))
+
+    def test_inside_mode_requires_container_sentinel_and_calls_build_and_verify(self):
+        args = ["--inside", "--source-a", "/source-a", "--source-b", "/source-b", "--output",
+                "/release-output", "--commit", SHA, "--epoch", "123"]
+        fake = types.ModuleType("scripts.release_artifacts")
+        fake.build_and_verify = Mock()
+        real_import = builtins.__import__
+        imported = []
+        def watch_import(name, *args, **kwargs):
+            if name == "scripts.release_artifacts":
+                imported.append(name)
+            return real_import(name, *args, **kwargs)
+        with patch.dict("sys.modules", {"scripts.release_artifacts": fake}), patch("builtins.__import__", side_effect=watch_import), patch.object(entry.subprocess, "run") as run:
+            for field in (None, "--source-a", "--source-b", "--output"):
+                with self.subTest(field=field), patch.dict(os.environ, {} if field is None else {"THREADROOT_CANONICAL_BUILD": "1"}, clear=True):
+                    changed = list(args)
+                    if field:
+                        changed[changed.index(field) + 1] = "/wrong"
+                    message = "canonical container sentinel is required" if field is None else "noncanonical container paths"
+                    self.assertEqual(invoke(changed), (1, "", message + "\n"))
+                    self.assertEqual(imported, [])
+                    fake.build_and_verify.assert_not_called()
+                    run.assert_not_called()
+            fake.build_and_verify.reset_mock()
+            with patch.dict(os.environ, {"THREADROOT_CANONICAL_BUILD": "1"}, clear=True):
+                self.assertEqual(invoke(args), (0, "", ""))
+            fake.build_and_verify.assert_called_once_with(Path("/source-a"), Path("/source-b"), Path("/release-output"), SHA, 123, None)
+            self.assertEqual(imported, ["scripts.release_artifacts"])
 
 
 if __name__ == "__main__":

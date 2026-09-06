@@ -8,9 +8,7 @@ import re
 import stat
 import subprocess
 import sys
-import tempfile
-
-from scripts.release_archives import extract_regular_tar_payload
+import unicodedata
 
 
 class VerifiedReleaseError(RuntimeError):
@@ -27,8 +25,22 @@ RUNNER_FILES = (
 
 def _reject_path(value: str | Path) -> None:
     text = os.fspath(value)
-    if any(ord(char) < 32 for char in text) or "," in text:
+    if any(unicodedata.category(char) in {"Cc", "Cf"} for char in text) or "," in text:
         raise VerifiedReleaseError("unsafe host path")
+
+
+def _validate_identity(uid: int, gid: int) -> None:
+    if any(type(value) is not int or value <= 0 for value in (uid, gid)):
+        raise VerifiedReleaseError("host UID/GID must be positive")
+
+
+def _host_identity() -> tuple[int, int]:
+    getuid, getgid = getattr(os, "getuid", None), getattr(os, "getgid", None)
+    if not callable(getuid) or not callable(getgid):
+        raise VerifiedReleaseError("host UID/GID is unsupported")
+    uid, gid = getuid(), getgid()
+    _validate_identity(uid, gid)
+    return uid, gid
 
 
 def _read_regular(path: Path) -> bytes:
@@ -58,9 +70,10 @@ def _mount(path: Path, destination: str, readonly: bool = True) -> str:
     return f"type=bind,src={path},dst={destination}" + (",readonly" if readonly else "")
 
 
-def docker_run_argv(image: str, source_a: Path, source_b: Path, output: Path,
-                    commit: str, epoch: int, uid: int, gid: int,
-                    denylist: Path | None) -> list[str]:
+def _canonical_run_argv(image: str, source_a: Path, source_b: Path, output: Path,
+                        commit: str, epoch: int, uid: int, gid: int,
+                        denylist: Path | None) -> list[str]:
+    _validate_identity(uid, gid)
     if not re.fullmatch(r"[0-9a-f]{40}", commit) or epoch < 0:
         raise VerifiedReleaseError("invalid commit or epoch")
     if denylist is not None:
@@ -84,31 +97,22 @@ def docker_run_argv(image: str, source_a: Path, source_b: Path, output: Path,
     return argv
 
 
+def docker_run_argv(image: str, source_a: Path, source_b: Path, output: Path,
+                    commit: str, epoch: int, uid: int, gid: int,
+                    denylist: Path | None) -> list[str]:
+    return _canonical_run_argv(image, source_a, source_b, output, commit, epoch, uid, gid, denylist)
+
+
 def _docker_build_argv(image: str, source_a: Path) -> list[str]:
     return ["docker", "build", "--platform", "linux/amd64", "--pull", "--file",
             str(source_a / "tools/release/Dockerfile"), "--tag", image, str(source_a)]
 
 
-def _validate_docker_run_argv(argv: list[str]) -> None:
-    if argv[:4] != ["docker", "run", "--rm", "--platform"] or argv[4] != "linux/amd64":
-        raise VerifiedReleaseError("docker artifact perimeter is incomplete")
-    for option in ("--read-only", "--network", "--cap-drop", "--security-opt", "--user", "--workdir", "--pids-limit", "--tmpfs"):
-        if argv.count(option) != 1:
-            raise VerifiedReleaseError("docker artifact perimeter is incomplete")
-    if argv[argv.index("--network") + 1] != "none" or argv[argv.index("--cap-drop") + 1] != "ALL":
-        raise VerifiedReleaseError("docker artifact perimeter is incomplete")
-    if argv[argv.index("--security-opt") + 1] != "no-new-privileges" or "--privileged" in argv:
-        raise VerifiedReleaseError("docker artifact perimeter is incomplete")
-    if argv[argv.index("--pids-limit") + 1] != "256" or argv[argv.index("--tmpfs") + 1] != "/tmp:rw,nosuid,nodev,noexec,size=512m":
-        raise VerifiedReleaseError("docker artifact perimeter is incomplete")
-    if argv[argv.index("--workdir") + 1] != "/source-a":
-        raise VerifiedReleaseError("docker artifact perimeter is incomplete")
-    mounts = [value for index, value in enumerate(argv) if index and argv[index - 1] == "--mount"]
-    if len(mounts) not in {3, 4} or not any("dst=/release-output" in value and ",readonly" not in value for value in mounts):
-        raise VerifiedReleaseError("docker artifact perimeter is incomplete")
-    if sum(",readonly" not in value for value in mounts) != 1:
-        raise VerifiedReleaseError("docker artifact perimeter is incomplete")
-    if "python" not in argv or "-m" not in argv or "scripts.build_verified_release" not in argv or "--inside" not in argv:
+def _validate_docker_run_argv(argv: list[str], *, image: str, source_a: Path,
+                             source_b: Path, output: Path, commit: str, epoch: int,
+                             uid: int, gid: int, denylist: Path | None) -> None:
+    expected = _canonical_run_argv(image, source_a, source_b, output, commit, epoch, uid, gid, denylist)
+    if argv != expected:
         raise VerifiedReleaseError("docker artifact perimeter is incomplete")
 
 
@@ -137,6 +141,15 @@ def _safe_output(path: Path) -> None:
     _reject_path(path)
     if not path.is_absolute() or path.is_symlink() or path == REPOSITORY or REPOSITORY in path.parents:
         raise VerifiedReleaseError("output must be absolute and outside repository")
+    try:
+        parent = path.parent.resolve(strict=True)
+        repository = REPOSITORY.resolve(strict=True)
+        resolved = path.resolve()
+        if (not parent.is_dir() or not os.access(parent, os.W_OK | os.X_OK)
+                or resolved == repository or repository in resolved.parents):
+            raise OSError
+    except (OSError, RuntimeError):
+        raise VerifiedReleaseError("output must be absolute and outside repository") from None
     if path.exists() and (not path.is_dir() or any(path.iterdir())):
         raise VerifiedReleaseError("output must be missing or empty")
 
@@ -145,6 +158,8 @@ def _validate_host_denylist(path: Path | None) -> None:
     if path is None:
         return
     _reject_path(path)
+    if not path.is_absolute():
+        raise VerifiedReleaseError("denylist is missing or unsafe")
     try:
         metadata = path.lstat()
     except OSError as error:
@@ -153,14 +168,35 @@ def _validate_host_denylist(path: Path | None) -> None:
         raise VerifiedReleaseError("denylist is missing or unsafe")
 
 
-def _sanitized_failure(error: subprocess.CalledProcessError, args: argparse.Namespace) -> str:
-    text = " ".join(str(value) for value in (error.stdout, error.stderr) if value)
-    labels = ((str(REPOSITORY), "[repository]"), (str(Path(args.output)), "[output]"))
-    if args.denylist:
-        labels += ((str(Path(args.denylist)), "[denylist]"),)
-    for source, label in labels:
-        text = text.replace(source, label)
-    return text or "verified release subprocess failed"
+def _observed_labels(stdout: object, stderr: object,
+                     paths: tuple[tuple[str, str], ...]) -> set[str]:
+    # Child detail is untrusted. Only a lossy projection onto fixed labels can
+    # leave this function; never retain raw words, argv, or exception repr.
+    text = "\n".join(value if isinstance(value, str) else value.decode("utf-8", errors="replace")
+                     for value in (stdout, stderr) if isinstance(value, (str, bytes)))
+    observed = set()
+    for source, label in sorted(paths, key=lambda item: len(item[0]), reverse=True):
+        if source in text:
+            observed.add(label)
+            text = text.replace(source, "\0")
+    return observed
+
+
+def _public_status(message: str, observed: set[str],
+                   paths: tuple[tuple[str, str], ...]) -> str:
+    return " ".join([message, *(label for _, label in paths if label in observed)])
+
+
+def _run_docker(argv: list[str], phase: str,
+                paths: tuple[tuple[str, str], ...]) -> set[str]:
+    try:
+        result = subprocess.run(argv, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as error:
+        labels = _observed_labels(error.stdout, error.stderr, paths)
+        raise VerifiedReleaseError(_public_status(f"verified release {phase} failed", labels, paths)) from None
+    except OSError:
+        raise VerifiedReleaseError(f"verified release {phase} failed") from None
+    return _observed_labels(result.stdout, result.stderr, paths)
 
 
 def _inside(args: argparse.Namespace) -> int:
@@ -174,8 +210,13 @@ def _inside(args: argparse.Namespace) -> int:
     return 0
 
 
+class _PublicArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise VerifiedReleaseError("invalid command line arguments")
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="build_verified_release")
+    parser = _PublicArgumentParser(prog="build_verified_release")
     parser.add_argument("--inside", action="store_true")
     parser.add_argument("--source-a")
     parser.add_argument("--source-b")
@@ -197,9 +238,14 @@ def main(argv: list[str] | None = None) -> int:
             raise VerifiedReleaseError("epoch is outer-controlled")
         if not re.fullmatch(r"[0-9a-f]{40}", args.commit):
             raise VerifiedReleaseError("commit must be a full 40-character SHA")
+        uid, gid = _host_identity()
         _safe_output(Path(args.output))
+        denylist = Path(args.denylist) if args.denylist else None
+        _validate_host_denylist(denylist)
         if _git("status", "--porcelain=v1", "--untracked-files=all"):
             raise VerifiedReleaseError("repository must be clean")
+        if _git("rev-parse", "--verify", args.commit + "^{commit}").strip() != args.commit:
+            raise VerifiedReleaseError("commit must resolve to itself")
         if _git("cat-file", "-t", args.commit).strip() != "commit":
             raise VerifiedReleaseError("commit must identify a commit object")
         if not _runner_bytes_match(args.commit):
@@ -210,29 +256,28 @@ def main(argv: list[str] | None = None) -> int:
         epoch = int(epoch_text)
         output = Path(args.output)
         source_a, source_b, build = output / "source-a", output / "source-b", output / "build"
-        _validate_host_denylist(Path(args.denylist) if args.denylist else None)
-        output.mkdir(parents=True, exist_ok=True)
+        from scripts.release_archives import extract_regular_tar_payload
+        output.mkdir(exist_ok=True)
         extract_regular_tar_payload(_archive_commit(args.commit), source_a, expected_global_comment=args.commit)
         extract_regular_tar_payload(_archive_commit(args.commit), source_b, expected_global_comment=args.commit)
         build.mkdir()
         image = canonical_image_tag(source_a / "tools/release/Dockerfile", source_a / "requirements/release.txt")
-        subprocess.run(_docker_build_argv(image, source_a),
-                       check=True, capture_output=True, text=True)
-        uid, gid = os.getuid(), os.getgid()
-        run_argv = docker_run_argv(image, source_a, source_b, build, args.commit, epoch, uid, gid,
-                                   Path(args.denylist) if args.denylist else None)
-        _validate_docker_run_argv(run_argv)
-        subprocess.run(run_argv,
-                       check=True, capture_output=True, text=True)
+        run_argv = docker_run_argv(image, source_a, source_b, build, args.commit, epoch, uid, gid, denylist)
+        _validate_docker_run_argv(run_argv, image=image, source_a=source_a, source_b=source_b,
+                                 output=build, commit=args.commit, epoch=epoch, uid=uid, gid=gid, denylist=denylist)
+        paths = ((str(REPOSITORY), "[repository]"), (str(source_a), "[source-a]"),
+                 (str(source_b), "[source-b]"), (str(output), "[output]"))
+        if denylist is not None:
+            paths += ((str(denylist), "[denylist]"),)
+        observed = _run_docker(_docker_build_argv(image, source_a), "builder", paths)
+        observed.update(_run_docker(run_argv, "artifact phase", paths))
+        print(_public_status("verified release completed", observed, paths))
         return 0
-    except subprocess.CalledProcessError as error:
-        print(_sanitized_failure(error, args), file=sys.stderr)
-        return 1
-    except OSError:
-        print("verified release subprocess failed", file=sys.stderr)
-        return 1
-    except Exception as error:
+    except VerifiedReleaseError as error:
         print(str(error), file=sys.stderr)
+        return 1
+    except Exception:
+        print("verified release subprocess failed", file=sys.stderr)
         return 1
 
 
